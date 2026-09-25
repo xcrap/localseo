@@ -49,6 +49,10 @@ export function CannibalizationTab({ site }: { site: Site }) {
       }),
     [data],
   );
+  // The backend caps the rows it sends; `total` counts every matching query.
+  const total = Math.max(Number(data?.total) || 0, rows.length);
+  // The threshold applies to each query's total impressions, not to single pages.
+  const thresholdScope = data?.minImpressionsAppliesTo || "query";
   const minValue = Number(minImpressions);
   const minParam = Number.isFinite(minValue) && minValue >= 0 ? Math.round(minValue) : undefined;
   const loading = status === "loading";
@@ -85,7 +89,7 @@ export function CannibalizationTab({ site }: { site: Site }) {
     body = (
       <ReportSection
         title="Queries with competing pages"
-        meta={`${formatNumber(rows.length)} ${rows.length === 1 ? "query" : "queries"} · ${formatRange(data.range)}${loading ? " · updating…" : ""}`}
+        meta={`${formatNumber(total)} ${total === 1 ? "query" : "queries"} · ${formatRange(data.range)}${loading ? " · updating…" : ""}`}
         action={
           rows.length ? (
             <Button type="button" size="sm" variant="ghost" className="text-xs text-muted-foreground hover:text-foreground" onClick={downloadPageCsv}>
@@ -94,9 +98,12 @@ export function CannibalizationTab({ site }: { site: Site }) {
           ) : undefined
         }
       >
-        <p className="mb-3 text-[13px] leading-5 text-muted-foreground">
-          Queries where two or more of your pages earn impressions. Split signals can hold both pages back; consolidate or differentiate them.
-        </p>
+        <div className="mb-3 space-y-1.5 text-[13px] leading-5 text-muted-foreground">
+          <p>
+            Queries where two or more of your pages each earn at least 10% of the query's impressions. Split signals can hold both pages back; consolidate or differentiate them.
+          </p>
+          {total > rows.length ? <p>Showing the {formatNumber(rows.length)} queries with the most impressions out of {formatNumber(total)}.</p> : null}
+        </div>
         {rows.length ? (
           <FilteredRows rows={rows} placeholder="Filter queries or URLs…" csvName="cannibalization-queries" csvColumns={queryCsvColumns} sortValues={cannibalizationSortValues}>
             {(visible) => (
@@ -157,7 +164,7 @@ export function CannibalizationTab({ site }: { site: Site }) {
             )}
           </FilteredRows>
         ) : (
-          <p className="text-sm text-muted-foreground">No query has more than one page above the impression threshold in this range.</p>
+          <p className="text-sm text-muted-foreground">No query with enough impressions has two or more pages each earning at least 10% of them in this range.</p>
         )}
       </ReportSection>
     );
@@ -172,7 +179,7 @@ export function CannibalizationTab({ site }: { site: Site }) {
           onApply={() => run({ startDate: range.startDate, endDate: range.endDate, minImpressions: minParam })}
           onReset={() => run({ minImpressions: minParam })}
         >
-          <Field label="Minimum impressions per page">
+          <Field label={`Minimum impressions per ${thresholdScope}`}>
             <Input type="number" min={0} value={minImpressions} onChange={(event) => setMinImpressions(event.target.value)} />
           </Field>
         </RangeControls>

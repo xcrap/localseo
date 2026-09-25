@@ -590,9 +590,11 @@ export function EmptyState({ title, text, action, icon }: { title: string; text:
 
 export type StatItem = {
   title: string;
+  /** A number animates; null, undefined, or "" shows "-"; an element renders as is. */
   value: unknown;
   icon?: any;
   detail?: ReactNode;
+  format?: (value: number) => string;
 };
 
 function prefersReducedMotion() {
@@ -623,13 +625,27 @@ export function useCountUp(target: number, duration = 1200) {
   return display;
 }
 
-export function CountUp({ value, format }: { value: unknown; format?: (value: number) => string }) {
+/** A real number to show, or null when the value is missing (null, undefined, "", non-numeric). */
+export function knownNumber(value: unknown): number | null {
+  if (value == null || typeof value === "boolean" || (typeof value === "string" && !value.trim())) return null;
   const number = Number(value);
-  const finite = Number.isFinite(number);
-  const display = useCountUp(finite ? number : 0);
-  if (!finite) return <>{formatNumber(value)}</>;
-  const rounded = Math.round(display);
-  return <>{format ? format(rounded) : formatNumber(rounded)}</>;
+  return Number.isFinite(number) ? number : null;
+}
+
+function fractionDigits(value: number) {
+  const match = /\.(\d+)$/.exec(String(value));
+  return match ? Math.min(3, match[1].length) : 0;
+}
+
+// Animates to a real number. A missing value renders "-", never 0; a text
+// value renders as is. Decimals the target carries (3.2, 12.45) are kept.
+export function CountUp({ value, format }: { value: unknown; format?: (value: number) => string }) {
+  const number = knownNumber(value);
+  const display = useCountUp(number ?? 0);
+  if (number === null) return <>{typeof value === "string" && value.trim() ? value : "-"}</>;
+  const digits = fractionDigits(number);
+  const shown = display === number ? number : Number(display.toFixed(digits));
+  return <>{format ? format(shown) : formatNumber(shown)}</>;
 }
 
 export function StatsBand({
@@ -657,7 +673,7 @@ export function StatsBand({
               {item.detail ? <InfoTip label={`About ${item.title}`}>{item.detail}</InfoTip> : null}
             </div>
             <div className="metric mt-1.5 text-[1.7rem] leading-none">
-              <CountUp value={item.value} />
+              {isValidElement(item.value) ? item.value : <CountUp value={item.value} format={item.format} />}
             </div>
           </div>
         ))}
@@ -750,7 +766,7 @@ export function JsonBlock({ value }: { value: unknown }) {
 }
 
 export function formatNumber(value: unknown) {
-  if (value == null || value === "") return "-";
+  if (value == null || (typeof value === "string" && !value.trim())) return "-";
   const number = Number(value);
   return Number.isFinite(number) ? new Intl.NumberFormat().format(number) : String(value);
 }
@@ -1114,7 +1130,8 @@ export function scanCoverageMetrics(scan: any, result: any = {}, summary: any = 
   const imageInventory = Array.isArray(result.imageInventory) ? result.imageInventory : [];
   const assets = Array.isArray(result.assets) ? result.assets : [];
   const parameterUrls = Array.isArray(result.parameterUrls) ? result.parameterUrls : [];
-  const sitemapUrls = Array.isArray(result.sitemap?.urls) ? result.sitemap.urls : [];
+  // The report stores at most 1,000 sitemap URLs; urlCount is the full total.
+  const storedSitemapUrls = Array.isArray(result.sitemap?.urls) ? result.sitemap.urls : null;
   const loadTimes = pages
     .map((page: any) => Number(page.loadMs))
     .filter((value: number) => Number.isFinite(value) && value >= 0)
@@ -1175,7 +1192,13 @@ export function scanCoverageMetrics(scan: any, result: any = {}, summary: any = 
     indexablePages: pages.length ? pages.filter((page: any) => page.indexable === true).length : indexablePages,
     nonIndexablePages: pages.length ? pages.filter((page: any) => page.indexable === false).length : nonIndexablePages,
     unknownIndexabilityPages,
-    sitemapUrls: maxCount(summary.sitemapUrls, sitemapUrls.length, pages.filter((page: any) => page.sitemapListed).length),
+    /** URLs listed across the sitemap files; null when the scan saved no sitemap evidence. */
+    sitemapUrls: knownNumber(result.sitemap?.urlCount) ?? (storedSitemapUrls ? storedSitemapUrls.length : null),
+    storedSitemapUrls: storedSitemapUrls ? storedSitemapUrls.length : null,
+    /** Sitemap URLs this crawl never fetched; null when the crawler did not report it. */
+    sitemapUrlsNotCrawled: knownNumber(result.sitemap?.notCrawledCount),
+    /** Crawled pages that a sitemap lists. */
+    sitemapListedPages: maxCount(summary.sitemapUrls, pages.filter((page: any) => page.sitemapListed).length),
     pagesMissingFromSitemap: summary.pagesMissingFromSitemap != null
       ? metricNumber(summary.pagesMissingFromSitemap)
       : pages.filter((page: any) => page.indexable === true && page.sitemapListed === false).length,

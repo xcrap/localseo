@@ -221,11 +221,17 @@ db.exec(`
     score INTEGER NOT NULL DEFAULT 0,
     pages_crawled INTEGER NOT NULL DEFAULT 0,
     issue_count INTEGER NOT NULL DEFAULT 0,
-    result_json TEXT,
     summary_json TEXT,
     error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- The full saved crawl result of a scan (several MB on large sites). Kept
+  -- out of the scans row so scan lists and status updates never page through it.
+  CREATE TABLE IF NOT EXISTS scan_results (
+    scan_id TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+    result_json TEXT
   );
 
   CREATE TABLE IF NOT EXISTS scan_issue_ignores (
@@ -432,12 +438,48 @@ const scanColumns = new Set(
   (db.prepare("PRAGMA table_info(scans)").all() as { name: string }[]).map((column) => column.name),
 );
 if (!scanColumns.has("summary_json")) {
-  // Small per-scan list summary. Existing rows are filled from result_json the
-  // first time scans are listed (src/scans.ts backfillScanSummaries).
+  // Small per-scan list summary. Existing rows are filled from the saved result
+  // the first time scans are listed (src/scans.ts backfillScanSummaries).
   db.exec("ALTER TABLE scans ADD COLUMN summary_json TEXT");
 }
-// Finds rows still waiting for a summary without reading past result_json.
+if (scanColumns.has("result_json")) {
+  moveScanResultsOutOfScans();
+}
+// Finds rows still waiting for a summary.
 db.exec("CREATE INDEX IF NOT EXISTS idx_scans_summary_missing ON scans(site_id, id) WHERE summary_json IS NULL");
+
+// Full scan results used to live in scans.result_json, ahead of the small list
+// columns, so every list query paged through megabytes of overflow. They move
+// to scan_results in one transaction: copy, verify every row arrived intact,
+// then drop the old column (or clear it where DROP COLUMN is unavailable).
+// Reruns are safe: nothing is copied twice and a migrated database is skipped.
+function moveScanResultsOutOfScans() {
+  const count = (sql: string) => (db.prepare(sql).get() as { count: number }).count;
+  transaction(() => {
+    const legacyRows = count("SELECT COUNT(*) AS count FROM scans WHERE result_json IS NOT NULL");
+    if (legacyRows) {
+      db.exec(`
+        INSERT INTO scan_results (scan_id, result_json)
+        SELECT id, result_json FROM scans WHERE result_json IS NOT NULL
+        ON CONFLICT(scan_id) DO UPDATE SET result_json = excluded.result_json
+      `);
+      const copied = count(`
+        SELECT COUNT(*) AS count FROM scans
+        JOIN scan_results ON scan_results.scan_id = scans.id
+        WHERE scans.result_json IS NOT NULL AND scan_results.result_json = scans.result_json
+      `);
+      if (copied !== legacyRows) {
+        throw new Error(`Moving saved scan results verified ${copied} of ${legacyRows} rows; ${dbPath} was left unchanged.`);
+      }
+    }
+    try {
+      db.exec("ALTER TABLE scans DROP COLUMN result_json");
+    } catch {
+      if (legacyRows) db.exec("UPDATE scans SET result_json = NULL WHERE result_json IS NOT NULL");
+    }
+    if (legacyRows) console.log(`Moved ${legacyRows} saved scan result(s) to the scan_results table.`);
+  });
+}
 
 // Columns added after the first release. Each is added once, in place, with a
 // default that keeps existing rows valid.
@@ -464,7 +506,15 @@ ensureColumn("sites", "scan_last_run_at", "TEXT");
 ensureColumn("scans", "scheduled", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("rank_runs", "scheduled", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("rank_runs", "notified_at", "TEXT");
+// Day of the month (1-31) a schedule was set on: monthly runs land on it,
+// clamped to shorter months. NULL (schedules set before this column) keeps
+// the day of the previous run.
+ensureColumn("sites", "scan_schedule_day", "INTEGER");
+ensureColumn("rank_trackers", "schedule_day", "INTEGER");
 ensureColumn("ai_jobs", "scan_id", "TEXT REFERENCES scans(id) ON DELETE SET NULL");
+// Whether the Codex job ran with web search. Jobs whose prompt carries crawled
+// page text (scan jobs, jobs built from `context`) run without it.
+ensureColumn("ai_jobs", "web_search", "INTEGER NOT NULL DEFAULT 1");
 // notified_at marks finished scans the scheduler has already checked for
 // notifications. Scans finished before this column existed count as checked,
 // so upgrading does not raise notices for old history.

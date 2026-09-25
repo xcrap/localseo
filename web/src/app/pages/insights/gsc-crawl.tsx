@@ -43,6 +43,13 @@ function rowCrawled(row: InsightRow) {
   return hasValue(row.status) || typeof row.indexable === "boolean";
 }
 
+// The backend lists at most 500 rows per section (highest impressions first);
+// `counts` carries the full total.
+function sectionTotal(data: GscCrawlInsights, key: GscCrawlSectionKey, rows: InsightRow[]) {
+  const count = Number(data.counts?.[key]);
+  return Number.isFinite(count) && count >= rows.length ? count : rows.length;
+}
+
 export function GscCrawlTab({ site }: { site: Site }) {
   const { status, data, error, query, run, retry } = useInsightQuery<GscCrawlQuery, GscCrawlInsights>(
     site.id,
@@ -135,14 +142,23 @@ export function GscCrawlTab({ site }: { site: Site }) {
         <MetricTileGrid>
           {sections.map((section) => {
             const rows = data.sections?.[section.key];
-            if (!Array.isArray(rows)) return <MetricTile key={section.key} label={section.title} value="—" hint="Not reported by the API" />;
-            return <MetricTile key={section.key} label={section.title} value={formatNumber(rows.length)} tone={rows.length ? "warn" : "default"} />;
+            if (!Array.isArray(rows)) return <MetricTile key={section.key} label={section.title} value="-" hint="Not reported by the API" />;
+            const total = sectionTotal(data, section.key, rows);
+            return (
+              <MetricTile
+                key={section.key}
+                label={section.title}
+                value={formatNumber(total)}
+                tone={total ? "warn" : "default"}
+                hint={total > rows.length ? `Top ${formatNumber(rows.length)} listed below` : undefined}
+              />
+            );
           })}
         </MetricTileGrid>
         {sections.map((section) => {
           const rows = data.sections?.[section.key];
           return Array.isArray(rows) ? (
-            <InsightSection key={section.key} title={section.title} why={section.why} rows={rows} scanId={scanId} />
+            <InsightSection key={section.key} title={section.title} why={section.why} rows={rows} total={sectionTotal(data, section.key, rows)} scanId={scanId} />
           ) : null;
         })}
         <CtrCurve rows={data.ctrCurve || []} />
@@ -158,11 +174,14 @@ export function GscCrawlTab({ site }: { site: Site }) {
   );
 }
 
-function InsightSection({ title, why, rows, scanId }: { title: string; why: string; rows: InsightRow[]; scanId: string }) {
+function InsightSection({ title, why, rows, total, scanId }: { title: string; why: string; rows: InsightRow[]; total: number; scanId: string }) {
+  // Columns follow the fields the backend sent: a section whose rows carry no
+  // `indexable` field (CTR outliers, pages the crawl missed) shows no badge.
   const columns = useMemo(
     () => ({
       status: rows.some((row) => hasValue(row.status)),
-      indexable: rows.some((row) => typeof row.indexable === "boolean" || Boolean(row.reason)),
+      indexable: rows.some((row) => "indexable" in row),
+      reason: rows.some((row) => Boolean(row.reason) && row.reason !== "indexable"),
       canonical: rows.some((row) => Boolean(row.canonical)),
       sitemap: rows.some((row) => typeof row.inSitemap === "boolean"),
       expectedCtr: rows.some((row) => hasValue(row.expectedCtr)),
@@ -179,18 +198,21 @@ function InsightSection({ title, why, rows, scanId }: { title: string; why: stri
     ];
     if (columns.expectedCtr) list.push({ label: "site_median_ctr_for_position", value: (row) => row.expectedCtr });
     if (columns.status) list.push({ label: "status", value: (row) => row.status });
-    if (columns.indexable) {
-      list.push({ label: "indexable", value: (row) => row.indexable });
-      list.push({ label: "reason", value: (row) => row.reason });
-    }
+    if (columns.indexable) list.push({ label: "indexable", value: (row) => row.indexable });
+    if (columns.reason) list.push({ label: "reason", value: (row) => row.reason });
     if (columns.canonical) list.push({ label: "canonical", value: (row) => row.canonical });
     if (columns.sitemap) list.push({ label: "in_sitemap", value: (row) => row.inSitemap });
     return list;
   }, [columns]);
 
   return (
-    <ReportSection title={title} meta={`${formatNumber(rows.length)} ${rows.length === 1 ? "page" : "pages"}`}>
+    <ReportSection title={title} meta={`${formatNumber(total)} ${total === 1 ? "page" : "pages"}`}>
       <p className="mb-3 text-[13px] leading-5 text-muted-foreground">{why}</p>
+      {total > rows.length ? (
+        <p className="mb-3 text-[13px] leading-5 text-muted-foreground">
+          Showing the {formatNumber(rows.length)} pages with the most impressions out of {formatNumber(total)}. Filters and the CSV cover these {formatNumber(rows.length)} rows only.
+        </p>
+      ) : null}
       {rows.length ? (
         <FilteredRows rows={rows} placeholder="Filter URLs…" csvName={title} csvColumns={csvColumns}>
           {(visible) => (
@@ -205,6 +227,7 @@ function InsightSection({ title, why, rows, scanId }: { title: string; why: stri
                   <SortableTableHead sortKey="position">Position</SortableTableHead>
                   {columns.status ? <SortableTableHead sortKey="status">Status</SortableTableHead> : null}
                   {columns.indexable ? <SortableTableHead sortKey="indexable">Indexable</SortableTableHead> : null}
+                  {columns.reason ? <SortableTableHead sortKey="reason">Why</SortableTableHead> : null}
                   {columns.canonical ? <SortableTableHead sortKey="canonical">Canonical</SortableTableHead> : null}
                   {columns.sitemap ? <SortableTableHead sortKey="inSitemap">Sitemap</SortableTableHead> : null}
                 </TableRow>
@@ -231,16 +254,18 @@ function InsightSection({ title, why, rows, scanId }: { title: string; why: stri
                     ) : null}
                     {columns.indexable ? (
                       <TableCell>
-                        <span className="inline-flex flex-wrap items-center gap-1.5">
-                          {typeof row.indexable === "boolean" ? (
-                            <Badge variant={row.indexable ? "good" : "bad"}>{row.indexable ? "Yes" : "No"}</Badge>
-                          ) : (
-                            <Badge variant="outline">Unknown</Badge>
-                          )}
-                          {row.reason && row.reason !== "indexable" ? (
-                            <span className="text-xs text-muted-foreground">{String(row.reason).replaceAll("-", " ")}</span>
-                          ) : null}
-                        </span>
+                        {typeof row.indexable === "boolean" ? (
+                          <Badge variant={row.indexable ? "good" : "bad"}>{row.indexable ? "Yes" : "No"}</Badge>
+                        ) : "indexable" in row ? (
+                          <Badge variant="outline">Unknown</Badge>
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </TableCell>
+                    ) : null}
+                    {columns.reason ? (
+                      <TableCell className="min-w-56 max-w-sm break-words text-xs text-muted-foreground">
+                        {row.reason && row.reason !== "indexable" ? row.reason : "-"}
                       </TableCell>
                     ) : null}
                     {columns.canonical ? <TableCell className="max-w-xs break-all text-xs text-muted-foreground">{row.canonical || "-"}</TableCell> : null}

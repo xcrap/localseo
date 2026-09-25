@@ -5,12 +5,12 @@ import { api, isNotFoundError } from "../../../api";
 import { Button, toast } from "@/components/ui";
 
 const PRIORITISE_TYPE = "scan.prioritize";
-const fallbackInstruction =
-  "Prioritise these technical SEO fixes by likely impact, effort and dependency order, using only the evidence below. Return concise markdown.";
 
 // Sends this scan's saved report context to a local Codex job that ranks the
 // fixes, then opens the AI lab on that job. The context comes from the scan
-// report itself; nothing is summarised or invented in the browser.
+// report itself; nothing is summarised or invented in the browser. The backend
+// fills the saved scan.prioritize template with it, so no text in the context
+// (a "$&" in a URL, say) is ever read as a replacement pattern.
 export function PrioritiseWithCodexButton({ scan }: { scan: any }) {
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
@@ -33,14 +33,9 @@ export function PrioritiseWithCodexButton({ scan }: { scan: any }) {
         toast.error("This scan has no report context to send to Codex.");
         return;
       }
-      const prompts = await api.aiPrompts().catch(() => []);
-      const template = String(prompts.find((prompt: any) => prompt.key === PRIORITISE_TYPE)?.template || "");
-      const prompt = template.includes("{{context}}")
-        ? template.replace("{{context}}", context)
-        : `${fallbackInstruction}\n\n${context}`;
       const job = await api.createAiJob({
         type: PRIORITISE_TYPE,
-        prompt,
+        context,
         siteId: scan.site_id || undefined,
         scanId: scan.id,
       });

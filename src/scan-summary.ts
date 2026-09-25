@@ -19,9 +19,11 @@ export function requireScan(scanId: string) {
 // The raw saved crawl evidence (pages, sitemap, limits) without ignore rules,
 // for analyses that do not read issues.
 function readScanEvidence(scanId: string) {
-  const row = get<any>("SELECT id, site_id, url, status, created_at, updated_at, result_json FROM scans WHERE id = ?", [
-    scanId,
-  ]);
+  const row = get<any>(
+    `SELECT scans.id, scans.site_id, scans.url, scans.status, scans.created_at, scans.updated_at, scan_results.result_json
+     FROM scans LEFT JOIN scan_results ON scan_results.scan_id = scans.id WHERE scans.id = ?`,
+    [scanId],
+  );
   if (!row) return null;
   const { result_json, ...rest } = row;
   return { ...rest, result: jsonParse<any>(result_json, null) };

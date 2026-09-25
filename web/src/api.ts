@@ -117,11 +117,17 @@ export type ScanIssueType = {
   fix: string;
 };
 
+export type ScanPageLink = {
+  anchor?: string;
+  /** aria-label, title, or image alt: the name of a link without text (image-only links). */
+  accessibleName?: string;
+};
+
 export type ScanPageDetail = {
   page: any;
   issues: any[];
-  inlinks: { from: string; anchor?: string; nofollow?: boolean }[];
-  outlinks: any[];
+  inlinks: (ScanPageLink & { from: string; nofollow?: boolean })[];
+  outlinks: (ScanPageLink & { href?: string; url?: string; rel?: string; type?: string; [key: string]: any })[];
   images: any[];
   previous: { url: string; changes: any[] } | null;
 };
@@ -190,7 +196,8 @@ export type GscStatus = {
   authError: string;
   /** The exact OAuth redirect URI to register in Google Cloud. */
   redirectUri: string;
-  connection: { siteId: string; siteUrl: string; accountEmail: string; expiresAt: string | number | null } | null;
+  /** accountEmail is optional: the connected state never depends on it. */
+  connection: { siteId: string; siteUrl: string; accountEmail?: string | null; expiresAt: string | number | null } | null;
 };
 
 export type GscBatch = {
@@ -276,7 +283,10 @@ export type GscCrawlInsights = {
   reason?: string;
   scan: { id: string; created_at: string } | null;
   gscRange: { startDate: string; endDate: string; source: "api" | "csv" | string } | null;
+  /** Each section lists at most 500 rows (highest impressions first); `counts` has the full totals. */
   sections: Partial<Record<GscCrawlSectionKey, InsightRow[]>>;
+  counts?: Partial<Record<GscCrawlSectionKey, number>>;
+  crawl?: { pages: number; maxPages: number | null; limitReached: boolean; sitemapFound: boolean };
   ctrCurve: { position: number; medianCtr: number | null; pages: number }[];
 };
 
@@ -292,6 +302,11 @@ export type CannibalizationInsights = {
   available: boolean;
   reason?: string;
   range: { startDate: string; endDate: string } | null;
+  source?: "api" | "csv" | string;
+  /** All matching queries; `rows` is capped (500). */
+  total?: number;
+  /** The minimum-impressions threshold applies to each query's total, not to single pages. */
+  minImpressionsAppliesTo?: "query" | string;
   rows: { query: string; totalImpressions: number; totalClicks: number; pages: CannibalizationPage[]; rankUrls: string[] }[];
 };
 
@@ -300,8 +315,14 @@ export type DecayMetrics = { clicks: number | null; impressions: number | null; 
 export type DecayInsights = {
   available: boolean;
   reason?: string;
+  /** Extra context from the backend, e.g. how missing pages were treated. */
+  note?: string | null;
   current: { startDate: string; endDate: string } | null;
   previous: { startDate: string; endDate: string } | null;
+  /** The two latest completed scans whose page changes fill `scanChanges`. */
+  scanComparison?: { scanId: string; baseScanId: string; available: boolean; reason: string | null } | null;
+  /** All decaying pages; `rows` is capped. */
+  total?: number;
   rows: {
     url: string;
     current: DecayMetrics;
@@ -337,6 +358,16 @@ export type AppNotification = {
 
 export type NotificationList = { rows: AppNotification[]; unreadCount: number };
 
+/** `data` of a scan-regression notification. Older rows carry a `regressions` object instead of the flat counts. */
+export type ScanRegressionNotificationData = {
+  scanId?: string;
+  baseScanId?: string | null;
+  pageRegressions?: number;
+  newHighIssues?: number;
+  newMediumIssues?: number;
+  regressions?: { total?: number; newHighIssues?: number; newMediumIssues?: number; [key: string]: unknown };
+};
+
 // Core Web Vitals: field data is Chrome UX Report (28-day real users), lab
 // data is one Lighthouse run. The two are never mixed.
 export type CwvStrategy = "mobile" | "desktop";
@@ -371,8 +402,17 @@ export type CwvResult = {
 
 export type CwvStatus = { keyConfigured: boolean; running: boolean; latest: CwvResult[]; runs: any[] };
 
+/**
+ * matched: a rule decided it. no-matching-rule: robots.txt was read and no rule
+ * matched. robots-missing: 4xx, so Google treats every URL as allowed.
+ * robots-unavailable: 5xx, 429, or no answer, so Google treats the site as disallowed.
+ */
+export type RobotsTestStatus = "matched" | "no-matching-rule" | "robots-missing" | "robots-unavailable";
+
 export type RobotsTestResult = {
   allowed: boolean;
+  status?: RobotsTestStatus;
+  error?: string;
   matchedRule: { type: string; path: string } | null;
   userAgentGroup: string | null;
   robotsUrl: string;
@@ -383,7 +423,8 @@ export type RobotsTestResult = {
 export type AiJob = {
   id: string;
   type: string;
-  prompt: string;
+  /** Left out of slim job rows (the dashboard's latest jobs). */
+  prompt?: string;
   status: string;
   message?: string;
   result_text?: string | null;
@@ -402,6 +443,24 @@ function queryString(params: Record<string, unknown>) {
   }
   const text = search.toString();
   return text ? `?${text}` : "";
+}
+
+// A full scan stores page issues once, in result.issues (keyed by issue.url, with
+// ignore flags applied). Attach them to each page row so page tables can read
+// page.issues, as the server did before issues stopped being copied per page.
+function withPageIssues(scan: any) {
+  const result = scan?.result;
+  if (!result || !Array.isArray(result.issues) || !Array.isArray(result.pages)) return scan;
+  const byUrl = new Map<string, any[]>();
+  for (const issue of result.issues) {
+    const rows = byUrl.get(issue.url) || [];
+    rows.push(issue);
+    byUrl.set(issue.url, rows);
+  }
+  return {
+    ...scan,
+    result: { ...result, pages: result.pages.map((page: any) => ({ ...page, issues: byUrl.get(page.url) || [] })) },
+  };
 }
 
 export const auth = {
@@ -502,7 +561,7 @@ export const api = {
     request<any>("/api/prompt-explorer", { method: "POST", body: JSON.stringify(body) }),
   allScans: () => request<ScanRow[]>("/api/scans"),
   scans: (siteId: string) => request<ScanRow[]>(`/api/sites/${siteId}/scans`),
-  scan: (id: string) => request<any>(`/api/scans/${id}`),
+  scan: (id: string) => request<any>(`/api/scans/${id}`).then(withPageIssues),
   scanPage: (id: string, url: string) =>
     request<ScanPageDetail>(`/api/scans/${id}/page?url=${encodeURIComponent(url)}`),
   compareScans: (id: string, baseId: string) =>
@@ -530,7 +589,8 @@ export const api = {
   /** With a site: that site's jobs plus jobs saved without a site. */
   aiJobs: (siteId?: string) => request<AiJob[]>(`/api/ai/jobs${queryString({ siteId })}`),
   aiJob: (id: string) => request<AiJob>(`/api/ai/jobs/${id}`),
-  createAiJob: (body: { type: string; prompt: string; siteId?: string; scanId?: string }) =>
+  /** With `context` and no prompt, the backend fills the saved template for `type`. */
+  createAiJob: (body: { type: string; prompt?: string; context?: string; siteId?: string; scanId?: string }) =>
     request<AiJob>("/api/ai/jobs", { method: "POST", body: JSON.stringify(body) }),
   gscStatus: (siteId: string) => request<GscStatus>(`/api/gsc/status/${siteId}`),
   /** Import and sync history: metadata and totals only. */

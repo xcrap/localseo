@@ -15,9 +15,19 @@ function SourceMeta({ source, extra }: { source?: string; extra?: ReactNode }) {
   );
 }
 
+// The backend returns between 5 and 100 suggestions per research run.
+const MIN_RESEARCH_LIMIT = 5;
+const MAX_RESEARCH_LIMIT = 100;
+
+function researchLimit(value: string) {
+  const number = Math.round(Number(value));
+  return Number.isFinite(number) && value.trim() ? Math.max(MIN_RESEARCH_LIMIT, Math.min(MAX_RESEARCH_LIMIT, number)) : 25;
+}
+
 export function KeywordsPage({ site }: { site: Site }) {
   const [query, setQuery] = useState(site.domain || "");
-  const [limit, setLimit] = useState(25);
+  // Raw text while typing ("1" on the way to "10"); clamped on blur and submit.
+  const [limitInput, setLimitInput] = useState("25");
   const [result, setResult] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
@@ -31,6 +41,8 @@ export function KeywordsPage({ site }: { site: Site }) {
     event.preventDefault();
     setLoading(true);
     try {
+      const limit = researchLimit(limitInput);
+      setLimitInput(String(limit));
       const data = await api.researchKeywords({ siteId: site.id, query, limit });
       setResult(data);
       setSelected(Object.fromEntries(data.rows.slice(0, 10).map((row) => [row.keyword, true])));
@@ -62,14 +74,12 @@ export function KeywordsPage({ site }: { site: Site }) {
           </Field>
           <Field label="Suggestion limit">
             <Input
-              value={limit}
+              value={limitInput}
               type="number"
-              min={1}
-              max={100}
-              onChange={(e) => {
-                const next = Number(e.target.value);
-                setLimit(e.target.value === "" || Number.isNaN(next) ? 1 : Math.max(1, Math.min(100, next)));
-              }}
+              min={MIN_RESEARCH_LIMIT}
+              max={MAX_RESEARCH_LIMIT}
+              onChange={(e) => setLimitInput(e.target.value)}
+              onBlur={() => setLimitInput(String(researchLimit(limitInput)))}
             />
           </Field>
           <Button disabled={loading || !query.trim()}><Search /> {loading ? "Researching" : "Research"}</Button>

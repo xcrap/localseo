@@ -6,6 +6,7 @@ import { serveStatic } from "hono/bun";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import {
+  beginLoginAttempt,
   clearLoginFailures,
   createOrReplaceAdmin,
   createSessionToken,
@@ -13,9 +14,7 @@ import {
   getAdminById,
   getAdminUserCount,
   getAuthConfig,
-  loginRetryAfterSeconds,
   publicUser,
-  recordLoginFailure,
   revokeSessionToken,
   secretsEqual,
   verifyPassword,
@@ -132,6 +131,22 @@ const appOrigins = new Set(
     `http://127.0.0.1:${port}`,
   ].filter((origin): origin is string => Boolean(origin)),
 );
+// Host names the API answers /api requests for: loopback plus the hosts of
+// APP_URL, API_URL, and API_HOST. A DNS-rebinding page (attacker.example
+// re-resolved to 127.0.0.1) sends its own name as both Host and Origin, so
+// without this list its Origin would match Host and pass as the app itself —
+// for example to create the first admin. The Vite dev proxy (changeOrigin)
+// sends the API_URL target as Host; the built app is same-origin.
+const allowedHostnames = new Set(
+  [
+    "localhost",
+    "127.0.0.1",
+    "[::1]",
+    hostnameOf(appUrl),
+    hostnameOf(apiUrl),
+    hostnameOf(`http://${apiHost.includes(":") && !apiHost.startsWith("[") ? `[${apiHost}]` : apiHost}`),
+  ].filter(Boolean),
+);
 const unsafeMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 // JSON routes accept only application/json bodies. HTML forms and "simple"
@@ -211,10 +226,24 @@ function portFromUrl(value?: string) {
   }
 }
 
+function hostnameOf(url: string) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function hostAllowed(host: string | undefined) {
+  return Boolean(host) && allowedHostnames.has(hostnameOf(`http://${host}`));
+}
+
+// The app's own origins, or the origin of the (allowlisted) Host it was served
+// from, e.g. a LAN address named in APP_URL or API_HOST.
 function isAppOrigin(c: any, origin: string) {
   if (appOrigins.has(origin)) return true;
   const host = c.req.header("host");
-  return Boolean(host) && (origin === `http://${host}` || origin === `https://${host}`);
+  return hostAllowed(host) && (origin === `http://${host}` || origin === `https://${host}`);
 }
 
 function currentUser(c: any) {
@@ -252,6 +281,17 @@ function safe(handler: (c: any) => Promise<Response> | Response) {
 function htmlEscape(value: string) {
   return value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
+
+// DNS rebinding guard: /api answers only the Host names in allowedHostnames.
+app.use("/api/*", async (c, next) => {
+  if (!hostAllowed(c.req.header("host"))) {
+    return c.json(
+      { error: "This server does not answer for that Host. Open the app at APP_URL, localhost, or 127.0.0.1." },
+      421,
+    );
+  }
+  await next();
+});
 
 // The browser app reaches the API same-origin: through the Vite proxy in
 // development and from the API itself in production. Production therefore
@@ -319,7 +359,8 @@ app.post(
     const email = String(body.email || "");
     const password = String(body.password || "");
     const remember = body.remember === true;
-    const retryAfter = loginRetryAfterSeconds(email);
+    // Counted before the password check, so parallel guesses share the limit.
+    const retryAfter = beginLoginAttempt(email);
     if (retryAfter) {
       c.header("Retry-After", String(retryAfter));
       return c.json(
@@ -329,7 +370,6 @@ app.post(
     }
     const user = getAdminByEmail(email);
     if (!user || !(await verifyPassword(user, password))) {
-      recordLoginFailure(email);
       return c.json({ error: "Unauthorized" }, 401);
     }
     clearLoginFailures(email);
@@ -436,7 +476,7 @@ async function startSavedSiteScan(c: any) {
   const candidateUrls = siteScanUrlCandidates(site);
   const url = await resolveSavedSiteScanUrl(site);
   if (!url) return c.json({ error: unreachableScanUrlError(site.domain).message }, 400);
-  const scan = await startScan(site.id, url);
+  const scan = await startScan(site.id, url, { reachable: true });
   return c.json({
     site: site.domain,
     scan,

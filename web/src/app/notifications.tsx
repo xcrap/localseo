@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AlertTriangle, Bell, BellRing, CheckCheck, FileWarning, Target, Trash2, TrendingDown } from "lucide-react";
-import { api, type AppNotification } from "../api";
+import { api, type AppNotification, type ScanRegressionNotificationData } from "../api";
 import { Button, Popover, PopoverContent, PopoverTrigger, Tooltip, TooltipContent, TooltipTrigger, toast } from "@/components/ui";
 import { cn } from "@/lib/utils";
-import { formatDate } from "./shared";
+import { formatDate, formatNumber, knownNumber } from "./shared";
 
 const POLL_MS = 60_000;
 const LIST_LIMIT = 30;
@@ -36,6 +36,25 @@ export function notificationPath(notification: AppNotification) {
   if (notification.type === "scan-failed" && scanId) return `/scans/${scanId}`;
   if (notification.type === "rank-run-problem") return "/rank";
   return scanId ? `/scans/${scanId}` : "/overview";
+}
+
+function plural(count: number, word: string) {
+  return `${formatNumber(count)} ${word}${count === 1 ? "" : "s"}`;
+}
+
+// Counts for a scan-regression notice, each labelled on its own: regressed
+// pages never include new issues. Older notices only stored a `regressions`
+// object whose total mixed pages and issues, so their page count stays unknown.
+function scanRegressionCounts(data: ScanRegressionNotificationData | null | undefined) {
+  const legacy = data?.regressions;
+  const pages = knownNumber(data?.pageRegressions);
+  const high = knownNumber(data?.newHighIssues) ?? knownNumber(legacy?.newHighIssues);
+  const medium = knownNumber(data?.newMediumIssues) ?? knownNumber(legacy?.newMediumIssues);
+  return [
+    pages !== null ? plural(pages, "regressed page") : "",
+    high ? plural(high, "new high issue") : "",
+    medium ? plural(medium, "new medium issue") : "",
+  ].filter(Boolean);
 }
 
 function desktopAlertsSupported() {
@@ -243,6 +262,7 @@ export function NotificationBell({
               {rows.map((row) => {
                 const Icon = typeIcons[row.type] || Bell;
                 const unread = !row.read_at;
+                const counts = row.type === "scan-regression" ? scanRegressionCounts(row.data) : [];
                 return (
                   <li key={row.id} className={cn("group flex items-start gap-2.5 px-3.5 py-2.5", unread ? "bg-primary/[0.04]" : "")}>
                     <Icon aria-hidden className={cn("mt-0.5 size-4 shrink-0", unread ? "text-primary" : "text-muted-foreground")} />
@@ -256,6 +276,7 @@ export function NotificationBell({
                         {row.title}
                       </span>
                       {row.body ? <span className="mt-0.5 line-clamp-2 block text-xs leading-5 text-muted-foreground">{row.body}</span> : null}
+                      {counts.length ? <span className="nums mt-0.5 block text-xs font-medium text-foreground/80">{counts.join(" · ")}</span> : null}
                       <span className="mt-1 block text-[11px] text-muted-foreground/80">
                         {row.site_name ? `${row.site_name} · ` : ""}
                         {formatDate(row.created_at)}

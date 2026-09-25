@@ -14,7 +14,15 @@ export type RedirectHop = {
 
 const redirectStatuses = new Set([301, 302, 303, 307, 308]);
 
-export async function fetchWithRedirectTrace(url: string, init: RequestInit = {}, maxRedirects = 128) {
+// stopBefore: a redirect whose target it accepts is not followed; the trace
+// ends with that target as finalUrl and `stoppedBefore` set, so the caller can
+// reuse a response it already has for that exact URL.
+export async function fetchWithRedirectTrace(
+  url: string,
+  init: RequestInit = {},
+  maxRedirects = 128,
+  stopBefore?: (targetUrl: string) => boolean,
+) {
   let currentUrl = url;
   const redirectChain: RedirectHop[] = [];
   const seen = new Set([currentUrl]);
@@ -109,10 +117,32 @@ export async function fetchWithRedirectTrace(url: string, init: RequestInit = {}
     }
 
     await response.body?.cancel().catch(() => undefined);
+    if (stopBefore?.(targetUrl)) {
+      return {
+        response,
+        finalUrl: targetUrl,
+        originalStatus: redirectChain[0].status,
+        finalStatus: response.status,
+        redirected: true,
+        redirectChain,
+        redirectLoop: false,
+        redirectError: "",
+        stoppedBefore: targetUrl,
+      };
+    }
     seen.add(targetUrl);
     currentUrl = targetUrl;
   }
 }
+
+// A final response the caller already holds for an exact URL.
+export type KnownResponse = {
+  status: number;
+  contentType: string;
+  contentLength: number | null;
+  contentEncoding: string;
+  xRobotsTag: string;
+};
 
 function charsetFromContentType(contentType: string) {
   const match = /charset=([^;]+)/i.exec(contentType || "");
@@ -187,19 +217,50 @@ type FetchTextOptions = {
   // Abort the request early, e.g. when the user cancels a running scan.
   signal?: AbortSignal;
   maxBytes?: number;
+  // A response already held for a redirect target: the redirect is recorded
+  // but the target is not downloaded again (the result has reused: true and
+  // an empty text).
+  knownResponse?: (url: string) => KnownResponse | undefined;
 };
 
 export async function fetchText(url: string, timeoutMs = 15000, options: FetchTextOptions = {}) {
   const maxBytes = options.maxBytes ?? MAX_BODY_BYTES;
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = options.signal ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
-  const trace = await fetchWithRedirectTrace(url, {
-    signal,
-    headers: {
-      "User-Agent": "LocalSEO/0.1 (+https://localhost)",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  const knownResponse = options.knownResponse;
+  const trace = await fetchWithRedirectTrace(
+    url,
+    {
+      signal,
+      headers: {
+        "User-Agent": "LocalSEO/0.1 (+https://localhost)",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
     },
-  });
+    undefined,
+    knownResponse ? (targetUrl) => Boolean(knownResponse(targetUrl)) : undefined,
+  );
+  const known = trace.stoppedBefore ? knownResponse?.(trace.stoppedBefore) : undefined;
+  if (known) {
+    return {
+      ok: known.status < 400,
+      status: trace.originalStatus,
+      finalStatus: known.status,
+      url: trace.finalUrl,
+      redirected: true,
+      redirectChain: trace.redirectChain,
+      redirectLoop: false,
+      redirectError: "",
+      contentType: known.contentType,
+      contentLength: known.contentLength,
+      contentEncoding: known.contentEncoding,
+      xRobotsTag: known.xRobotsTag,
+      retryAfter: "",
+      truncated: false,
+      text: "",
+      reused: true,
+    };
+  }
   const { response } = trace;
   const contentType = response.headers.get("content-type") || "";
   const raw = await readCappedBody(response, maxBytes);
@@ -221,6 +282,7 @@ export async function fetchText(url: string, timeoutMs = 15000, options: FetchTe
     // True when the body exceeded maxBytes; text then holds only a prefix.
     truncated: body.truncated,
     text: decodeBody(body.bytes, contentType),
+    reused: false,
   };
 }
 

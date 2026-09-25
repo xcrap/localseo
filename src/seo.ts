@@ -1,7 +1,7 @@
 import * as cheerio from "cheerio";
 import { randomUUID } from "node:crypto";
 import { parse as parseDomain } from "tldts";
-import { createAiJob, listAiJobs } from "./codex";
+import { createAiJob, recentAiJobs } from "./codex";
 import { type CsvRow, csvHasColumn, csvNumber, csvRow, csvText, normalizeCsvHeader, parseCsvRows } from "./csv";
 import { all, get, jsonParse, nowIso, run, transaction } from "./db";
 import { getConfigValue } from "./config";
@@ -1557,9 +1557,10 @@ function localScanPagesForDomain(siteId: string, domain: string, page: number, p
   const scope = `https://${domain}`;
   const scans = all<any>(
     `
-    SELECT * FROM scans
-    WHERE site_id = ? AND status = 'completed' AND result_json IS NOT NULL
-    ORDER BY updated_at DESC, created_at DESC
+    SELECT scans.id, scans.created_at, scans.updated_at, scan_results.result_json FROM scans
+    JOIN scan_results ON scan_results.scan_id = scans.id
+    WHERE scans.site_id = ? AND scans.status = 'completed' AND scan_results.result_json IS NOT NULL
+    ORDER BY scans.updated_at DESC, scans.created_at DESC
     LIMIT 10
     `,
     [siteId],
@@ -2610,9 +2611,12 @@ export function exportSavedKeywordsCsv(siteId: string) {
   ].join("\n");
 }
 
+// latestAiJobs holds the latest 10 jobs as small rows (open GET /api/ai/jobs
+// for prompts and results); aiJobCount counts every job in the same scope.
 export function dashboardSummary(siteId?: string) {
   const sites = listSites();
   const site = siteId ? getSite(siteId) || sites[0] : sites[0];
+  const aiJobs = recentAiJobs(site?.id);
   if (!site) {
     return {
       activeSite: null,
@@ -2626,11 +2630,12 @@ export function dashboardSummary(siteId?: string) {
       gscImportCount: 0,
       latestGscImport: null,
       latestScans: [],
-      latestAiJobs: listAiJobs(),
+      latestAiJobs: aiJobs.rows,
+      aiJobCount: aiJobs.total,
     };
   }
   const latestGscImport = get<any>(
-    "SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC LIMIT 1",
+    "SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
     [site.id],
   );
   return {
@@ -2671,6 +2676,11 @@ export function dashboardSummary(siteId?: string) {
           id: latestGscImport.id,
           siteUrl: latestGscImport.site_url,
           sourceName: latestGscImport.source_name,
+          // "api" for a Search Console sync, "csv" for an imported export.
+          source: latestGscImport.source === "api" ? "api" : "csv",
+          // The window it was synced or imported for; null when a CSV did not say.
+          startDate: latestGscImport.start_date ?? null,
+          endDate: latestGscImport.end_date ?? null,
           rowCount: latestGscImport.row_count,
           totals: jsonParse(latestGscImport.totals_json, {}),
           createdAt: latestGscImport.created_at,
@@ -2678,7 +2688,8 @@ export function dashboardSummary(siteId?: string) {
       : null,
     // Lite rows (no pages/issues); open GET /api/scans/:id for a full report.
     latestScans: listScans(site.id),
-    latestAiJobs: listAiJobs(site.id),
+    latestAiJobs: aiJobs.rows,
+    aiJobCount: aiJobs.total,
   };
 }
 

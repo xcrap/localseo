@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { api, type DecayInsights, type Site } from "../../../api";
 import { Badge, SortableTableHead, Table, TableBody, TableCell, TableHeader, TableRow } from "@/components/ui";
-import { recentDateRange, type DateRange } from "../../date-picker";
+import { GSC_FINAL_DATA_LAG_DAYS, recentDateRange, type DateRange } from "../../date-picker";
 import { FilteredRows, type CsvColumn } from "../../data-table";
 import { ReportSection, formatDateInput, formatNumber } from "../../shared";
 import { InsightError, InsightSkeleton, InsightUnavailable, InsightUrl, RangeControls, formatAvgPosition, formatCount, formatRange, hasValue, useInsightQuery } from "./common";
@@ -56,8 +56,8 @@ export function DecayTab({ site }: { site: Site }) {
     (next) => api.decayInsights(site.id, next),
     {},
   );
-  const [current, setCurrent] = useState<DateRange>(() => recentDateRange(28, 2));
-  const [previous, setPrevious] = useState<DateRange>(() => previousRangeBefore(recentDateRange(28, 2)));
+  const [current, setCurrent] = useState<DateRange>(() => recentDateRange(28, GSC_FINAL_DATA_LAG_DAYS));
+  const [previous, setPrevious] = useState<DateRange>(() => previousRangeBefore(recentDateRange(28, GSC_FINAL_DATA_LAG_DAYS)));
 
   useEffect(() => {
     if (query.currentStart) return;
@@ -67,6 +67,9 @@ export function DecayTab({ site }: { site: Site }) {
 
   const loading = status === "loading";
   const rows = data?.rows || [];
+  // The backend caps the rows it sends; `total` counts every decaying page.
+  const total = Math.max(Number(data?.total) || 0, rows.length);
+  const crawlNote = scanComparisonNote(data?.scanComparison);
 
   let body: ReactNode;
   if (status === "error") body = <InsightError message={error} onRetry={retry} />;
@@ -77,11 +80,14 @@ export function DecayTab({ site }: { site: Site }) {
       <ReportSection
         title="Clicks and impressions by page, period over period"
         description="Position delta is current minus previous: a positive number means the page moved down (worse)."
-        meta={`${formatNumber(rows.length)} ${rows.length === 1 ? "page" : "pages"} · ${formatRange(data.current)} vs ${formatRange(data.previous)}${loading ? " · updating…" : ""}`}
+        meta={`${formatNumber(total)} ${total === 1 ? "page" : "pages"} · ${formatRange(data.current)} vs ${formatRange(data.previous)}${loading ? " · updating…" : ""}`}
       >
-        <p className="mb-3 text-[13px] leading-5 text-muted-foreground">
-          Search Console clicks, impressions, and average position for each page in both periods, with the crawl changes saved between scans in these periods.
-        </p>
+        <div className="mb-3 space-y-1.5 text-[13px] leading-5 text-muted-foreground">
+          <p>Search Console clicks, impressions, and average position for each page in both periods, with the page changes between the site's two latest completed scans.</p>
+          {data.note ? <p>{data.note}</p> : null}
+          {crawlNote ? <p>{crawlNote}</p> : null}
+          {total > rows.length ? <p>Showing the {formatNumber(rows.length)} pages with the largest losses out of {formatNumber(total)}.</p> : null}
+        </div>
         {rows.length ? (
           <FilteredRows rows={rows} placeholder="Filter pages…" csvName="content-decay" csvColumns={decayCsvColumns} sortValues={decaySortValues}>
             {(visible) => (
@@ -114,7 +120,7 @@ export function DecayTab({ site }: { site: Site }) {
                         <Delta value={row.deltaPosition} higherIsBetter={false} format={(value) => value.toFixed(1)} />
                       </TableCell>
                       <TableCell className="min-w-56 max-w-sm">
-                        <ScanChanges changes={row.scanChanges || []} />
+                        <ScanChanges changes={row.scanChanges || []} compared={data.scanComparison?.available === true} />
                       </TableCell>
                     </TableRow>
                   ))}
@@ -186,8 +192,25 @@ function Delta({ value, higherIsBetter, format }: { value: number | null; higher
   );
 }
 
-function ScanChanges({ changes }: { changes: ScanChange[] }) {
-  if (!changes.length) return <span className="text-muted-foreground">-</span>;
+// The crawl-change column says "No changes" only when the site's two latest
+// scans were compared; otherwise it stays "-" and this note says why.
+function scanComparisonNote(scanComparison: DecayInsights["scanComparison"]) {
+  if (scanComparison === undefined) return "";
+  if (!scanComparison) return "Crawl changes need two completed scans of this site; run another scan to compare pages.";
+  if (scanComparison.available) return "";
+  const reason =
+    scanComparison.reason === "incompatible-version"
+      ? "the older scan uses earlier crawl semantics"
+      : scanComparison.reason === "scope-changed"
+        ? "the two scans used different page limits"
+        : scanComparison.reason || "no comparable crawl evidence";
+  return `Crawl changes are unavailable: the two latest scans could not be compared (${reason}).`;
+}
+
+function ScanChanges({ changes, compared }: { changes: ScanChange[]; compared: boolean }) {
+  if (!changes.length) {
+    return compared ? <span className="text-muted-foreground">No changes</span> : <span className="text-muted-foreground" title="No scan comparison available">-</span>;
+  }
   return (
     <details className="group text-xs">
       <summary className="cursor-pointer list-none rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60">

@@ -1,21 +1,22 @@
-import { all } from "./db";
+import { all, get } from "./db";
 import { badRequest, notFound } from "./errors";
 import {
+  dayCount,
   findGscBatch,
   type GscPageData,
   type GscPageMetrics,
   type GscWindow,
   gscPageData,
   gscRangeView,
-  latestPageDataDate,
   mergePageRows,
   optionalWindow,
+  pageDataRange,
   readMetricRows,
   shiftDate,
 } from "./gsc-pages";
 import { optionalInt } from "./input";
 import { pageUrlKey } from "./page-url";
-import { latestCompletedScanId, scanPages, siteCompletedScan } from "./scan-summary";
+import { scanPages, siteCompletedScan } from "./scan-summary";
 import { compareScans, sameSiteUrl } from "./scans";
 import { getSite } from "./seo";
 
@@ -34,6 +35,10 @@ const CTR_OUTLIER_MIN_IMPRESSIONS = 100;
 const CTR_OUTLIER_RATIO = 0.5;
 // Search Console's performance export lists at most 1,000 rows.
 const GSC_EXPORT_ROW_CAP = 1000;
+// Content decay compares 28 days with the 28 before; with less stored data
+// the days that exist are split into two halves of at least 7 days.
+const DECAY_WINDOW_DAYS = 28;
+const DECAY_MIN_WINDOW_DAYS = 7;
 
 function requireSite(siteId: string) {
   const site = getSite(siteId);
@@ -232,7 +237,8 @@ export function gscCrawlInsights(siteId: string, input: { scanId?: unknown; star
 }
 
 // Queries where two or more pages each earn at least 10% of the query's
-// impressions, from stored query + page rows.
+// impressions, from stored query + page rows. minImpressions applies to the
+// query's total impressions across all its pages, not to each page.
 export function cannibalization(
   siteId: string,
   input: { startDate?: unknown; endDate?: unknown; minImpressions?: unknown },
@@ -240,10 +246,12 @@ export function cannibalization(
   requireSite(siteId);
   const window = optionalWindow(input.startDate, input.endDate);
   const minImpressions = optionalInt(input.minImpressions, "minImpressions", 10, 0, 1_000_000_000);
+  const filters = { minImpressions, minImpressionsAppliesTo: "query" as const };
   const match = findGscBatch(siteId, { include: ["query", "page"], window });
   if (!match) {
     return {
       available: false,
+      ...filters,
       reason: window
         ? `No stored Search Console query + page rows cover ${window.startDate} to ${window.endDate}. Sync Search Console for that window with dimensions query,page.`
         : "No Search Console rows with both the query and page dimensions are stored for this site. Sync Search Console with dimensions query,page, or import a CSV with Query and Page columns.",
@@ -289,6 +297,7 @@ export function cannibalization(
   rows.sort((a, b) => b.totalImpressions - a.totalImpressions);
   return {
     available: true,
+    ...filters,
     range: { startDate: match.range.startDate, endDate: match.range.endDate },
     source: match.source,
     total: rows.length,
@@ -309,12 +318,30 @@ function delta(current: number | null, previous: number | null, digits = 0) {
   return current === null || previous === null ? null : round(current - previous, digits);
 }
 
-// Field changes per page between the site's latest two completed scans.
-function latestScanChanges(siteId: string) {
+// The latest completed scan of the site that started on or before a date.
+function completedScanOnOrBefore(siteId: string, date: string) {
+  return (
+    get<{ id: string }>(
+      "SELECT id FROM scans WHERE site_id = ? AND status = 'completed' AND created_at < ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      [siteId, shiftDate(date, 1)],
+    )?.id ?? null
+  );
+}
+
+// Field changes per page between the scans that match the two windows: the
+// latest completed scan on or before each window's end.
+function windowScanChanges(siteId: string, current: GscWindow, previous: GscWindow) {
   const changes = new Map<string, { field: string; before: unknown; after: unknown }[]>();
-  const scanId = latestCompletedScanId(siteId);
-  const baseScanId = scanId ? latestCompletedScanId(siteId, scanId) : null;
-  if (!scanId || !baseScanId) return { scanComparison: null, changes };
+  const scanId = completedScanOnOrBefore(siteId, current.endDate);
+  const baseScanId = completedScanOnOrBefore(siteId, previous.endDate);
+  const unavailable = (reason: string) => ({ scanComparison: { scanId, baseScanId, available: false, reason }, changes });
+  if (!scanId) return unavailable(`No completed scan started on or before ${current.endDate}, the end of the current window.`);
+  if (!baseScanId) return unavailable(`No completed scan started on or before ${previous.endDate}, the end of the previous window.`);
+  if (scanId === baseScanId) {
+    return unavailable(
+      `No scan completed between ${previous.endDate} and ${current.endDate}: the latest scan before each window ends is the same scan.`,
+    );
+  }
   const comparison = compareScans(scanId, baseScanId);
   if (comparison.available) {
     for (const change of comparison.pageChanges || []) {
@@ -328,8 +355,56 @@ function latestScanChanges(siteId: string) {
   };
 }
 
+function standardDecayWindows(endDate: string) {
+  return {
+    current: { startDate: shiftDate(endDate, -(DECAY_WINDOW_DAYS - 1)), endDate },
+    previous: { startDate: shiftDate(endDate, -(2 * DECAY_WINDOW_DAYS - 1)), endDate: shiftDate(endDate, -DECAY_WINDOW_DAYS) },
+  };
+}
+
+// Default windows inside the dates stored page data answers: the last 28 days
+// vs the 28 before, or, with fewer than 56 days, two equal halves of the days
+// that exist. `reason` is set when there is too little data; the windows then
+// only suggest what to sync, ending three days ago (Search Console's usual delay).
+function defaultDecayWindows(siteId: string) {
+  const suggestion = standardDecayWindows(shiftDate(new Date().toISOString().slice(0, 10), -3));
+  const syncHint = `Sync Search Console with dimensions page,date for the last ${2 * DECAY_WINDOW_DAYS} days.`;
+  const range = pageDataRange(siteId);
+  if (!range) {
+    return {
+      ...suggestion,
+      note: null,
+      reason: `No Search Console page data with a date range is stored for this site. ${syncHint}`,
+    };
+  }
+  // Page batches without the date dimension answer only their exact windows.
+  if (!range.startDate) return { ...standardDecayWindows(range.endDate), note: null, reason: null };
+  const lagNote =
+    range.requestedEndDate && range.requestedEndDate > range.endDate
+      ? `Search Console rows stop at ${range.endDate}, before the synced end date ${range.requestedEndDate} (Google's reporting delay), so the current window ends at ${range.endDate}.`
+      : "";
+  const days = Math.max(0, dayCount(range.startDate, range.endDate));
+  if (days >= 2 * DECAY_WINDOW_DAYS) return { ...standardDecayWindows(range.endDate), note: lagNote || null, reason: null };
+  const stored = `${days} day${days === 1 ? "" : "s"} of page + date data (${range.startDate} to ${range.endDate})`;
+  const half = Math.floor(days / 2);
+  if (half < DECAY_MIN_WINDOW_DAYS) {
+    return {
+      ...suggestion,
+      note: null,
+      reason: `Only ${stored} ${days === 1 ? "is" : "are"} stored; content decay needs at least ${2 * DECAY_MIN_WINDOW_DAYS} days for two ${DECAY_MIN_WINDOW_DAYS}-day windows. ${syncHint}`,
+    };
+  }
+  const halvesNote = `Only ${stored} are stored, fewer than the ${2 * DECAY_WINDOW_DAYS} needed for ${DECAY_WINDOW_DAYS} vs ${DECAY_WINDOW_DAYS} days, so each window is ${half} days${days % 2 ? ` and ${range.startDate} is left out` : ""}.`;
+  return {
+    current: { startDate: shiftDate(range.endDate, -(half - 1)), endDate: range.endDate },
+    previous: { startDate: shiftDate(range.endDate, -(2 * half - 1)), endDate: shiftDate(range.endDate, -half) },
+    note: [halvesNote, lagNote].filter(Boolean).join(" "),
+    reason: null,
+  };
+}
+
 // Pages that lost clicks or impressions between two windows of stored page
-// data. Defaults: the last 28 days of stored data vs the 28 days before.
+// data. Without windows, defaultDecayWindows picks them and `note` says how.
 export function contentDecay(
   siteId: string,
   input: { currentStart?: unknown; currentEnd?: unknown; previousStart?: unknown; previousEnd?: unknown; limit?: unknown },
@@ -341,17 +416,16 @@ export function contentDecay(
     throw badRequest("Pass both the current and the previous window, or neither.");
   }
   const limit = optionalInt(input.limit, "limit", 200, 1, 1000);
-  const lastDate = explicitCurrent ? null : latestPageDataDate(siteId);
-  // Without stored page data the default windows only suggest what to sync:
-  // they end three days ago, Search Console's usual reporting delay.
-  const anchor = lastDate || shiftDate(new Date().toISOString().slice(0, 10), -3);
-  const current: GscWindow = explicitCurrent || { startDate: shiftDate(anchor, -27), endDate: anchor };
-  const previous: GscWindow = explicitPrevious || { startDate: shiftDate(anchor, -55), endDate: shiftDate(anchor, -28) };
+  const defaults = explicitCurrent ? null : defaultDecayWindows(siteId);
+  const current: GscWindow = explicitCurrent || defaults!.current;
+  const previous: GscWindow = explicitPrevious || defaults!.previous;
+  const note = defaults?.note ?? null;
   const unavailable = (reason: string) => ({
     available: false,
     reason,
     current,
     previous,
+    note,
     rows: [],
     suggestedSync: {
       dimensions: ["page", "date"],
@@ -359,11 +433,7 @@ export function contentDecay(
       endDate: previous.endDate > current.endDate ? previous.endDate : current.endDate,
     },
   });
-  if (!explicitCurrent && !lastDate) {
-    return unavailable(
-      "No Search Console page data with a date range is stored for this site. Sync Search Console with dimensions page,date for the last 56 days.",
-    );
-  }
+  if (defaults?.reason) return unavailable(defaults.reason);
   const currentData = gscPageData(siteId, current, { allowQueryRows: false });
   const previousData = gscPageData(siteId, previous, { allowQueryRows: false });
   if (!currentData || !previousData) {
@@ -375,7 +445,7 @@ export function contentDecay(
       `Stored Search Console page data does not cover ${missing}. Sync Search Console with dimensions page,date across both windows, or sync (or import) the page dimension for exactly each window.`,
     );
   }
-  const { scanComparison, changes } = latestScanChanges(siteId);
+  const { scanComparison, changes } = windowScanChanges(siteId, current, previous);
   const rows: any[] = [];
   for (const key of new Set([...currentData.pages.keys(), ...previousData.pages.keys()])) {
     const now = windowMetrics(currentData.pages.get(key), currentData);
@@ -398,6 +468,7 @@ export function contentDecay(
     available: true,
     current,
     previous,
+    note,
     sources: { current: gscRangeView(currentData), previous: gscRangeView(previousData) },
     scanComparison,
     total: rows.length,

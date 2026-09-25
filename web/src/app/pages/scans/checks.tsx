@@ -1,6 +1,6 @@
 import { ListChecks } from "lucide-react";
 import { Button, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui";
-import { InfoTip, ReportSection, StatusDot, formatNumber, issueTypeCount, issueTypesCount, scanCoverageMetrics, type ScanCheckRowModel, type ScanCheckSectionModel } from "../../shared";
+import { InfoTip, ReportSection, StatusDot, formatNumber, issueTypeCount, issueTypesCount, knownNumber, scanCoverageMetrics, type ScanCheckRowModel, type ScanCheckSectionModel } from "../../shared";
 import { humanizeIssueType } from "./common";
 import type { IssueCatalog } from "./issue-catalog";
 
@@ -17,7 +17,23 @@ export function ScanCheckMatrix({
   catalog: IssueCatalog;
   onSelectCheck: (row: ScanCheckRowModel) => void;
 }) {
-  const byCategory = summary.byCategory || {};
+  // Whole-category rows take their issue types from the /api/scan-issue-types
+  // catalog (plus any type this scan's issues carry), so newer checks are
+  // included and a row's count always equals the issues its button opens.
+  const categoryTypes = (category: string, exclude: string[] = []) =>
+    Array.from(
+      new Set([
+        ...Array.from(catalog.values()).filter((entry) => entry.category === category).map((entry) => entry.type),
+        ...issues.filter((issue) => issue.category === category).map((issue) => String(issue.type || "")),
+      ]),
+    )
+      .filter((type) => type && !exclude.includes(type))
+      .sort();
+  const categoryRow = (label: string, severity: string, category: string, exclude: string[] = []): ScanCheckRowModel => {
+    const types = categoryTypes(category, exclude);
+    return { label, value: issueTypesCount(issues, types), problem: true, severity, category, types };
+  };
+  const langTypes = ["html-lang-missing", "html-lang-invalid", "charset-missing"];
   const sections: ScanCheckSectionModel[] = [
     {
       title: "Metadata",
@@ -99,10 +115,11 @@ export function ScanCheckMatrix({
         { label: "Noindex pages", value: issueTypeCount(issues, "noindex"), problem: true, severity: "bad", category: "indexability", types: ["noindex"] },
         { label: "Page nofollow", value: issueTypeCount(issues, "meta-robots-nofollow"), problem: true, severity: "warn", category: "indexability", types: ["meta-robots-nofollow"] },
         { label: "Snippet restrictions", value: issueTypeCount(issues, "restrictive-snippet-directive"), problem: true, severity: "warn", category: "indexability", types: ["restrictive-snippet-directive"] },
-        { label: "Canonical issues", value: byCategory.canonicals, problem: true, severity: "warn", category: "canonicals", types: ["canonical-missing", "canonical-invalid", "canonical-multiple", "canonical-http-on-https", "canonical-cross-domain", "canonical-not-self", "canonical-points-to-redirect"] },
+        categoryRow("Canonical issues", "warn", "canonicals"),
         { label: "HTTP pages", value: issueTypeCount(issues, "page-not-https"), problem: true, severity: "bad", category: "security", types: ["page-not-https"] },
-        { label: "Lang or charset issues", value: issueTypesCount(issues, ["html-lang-missing", "html-lang-invalid", "charset-missing"]), problem: true, severity: "warn", category: "indexability", types: ["html-lang-missing", "html-lang-invalid", "charset-missing"] },
-        { label: "Hreflang issues", value: byCategory.localization, problem: true, severity: "warn", category: "localization", types: ["hreflang-invalid", "hreflang-code-invalid", "hreflang-duplicate", "hreflang-x-default-missing"] },
+        // Lang and charset checks span two categories (indexability, localization).
+        { label: "Lang or charset issues", value: issueTypesCount(issues, langTypes), problem: true, severity: "warn", types: langTypes },
+        categoryRow("Hreflang issues", "warn", "localization", langTypes),
       ],
     },
     {
@@ -121,8 +138,8 @@ export function ScanCheckMatrix({
         { label: "Deep pages", value: coverage.deepPages, problem: true, severity: "warn", category: "crawl", types: ["crawl-depth-deep"] },
         { label: "Missing from sitemap", value: coverage.pagesMissingFromSitemap, problem: true, severity: "warn", category: "sitemap", types: ["page-missing-from-sitemap"] },
         { label: "Noindex in sitemap", value: summary.noindexPagesInSitemap, problem: true, severity: "warn", category: "sitemap", types: ["noindex-page-in-sitemap"] },
-        { label: "Robots issues", value: byCategory.robots, problem: true, severity: "warn", category: "robots", types: ["robots-missing", "robots-blocks-all", "robots-sitemap-missing"] },
-        { label: "Sitemap issues", value: byCategory.sitemap, problem: true, severity: "warn", category: "sitemap", types: ["sitemap-fetch-failed", "sitemap-missing-or-empty", "sitemap-larger-than-crawl-limit"] },
+        categoryRow("Robots issues", "warn", "robots"),
+        categoryRow("Sitemap issues", "warn", "sitemap"),
       ],
     },
     {
@@ -144,10 +161,10 @@ export function ScanCheckMatrix({
       title: "Structured",
       text: "Schema, social tags, sharing",
       rows: [
-        { label: "Schema issues", value: summary.schemaIssues, problem: true, severity: "warn", category: "structured-data", types: ["structured-data-missing", "structured-data-invalid"] },
+        categoryRow("Schema issues", "warn", "structured-data"),
         { label: "Open Graph issues", value: issueTypesCount(issues, ["open-graph-incomplete", "open-graph-image-missing", "open-graph-image-invalid"]), problem: true, severity: "warn", category: "social", types: ["open-graph-incomplete", "open-graph-image-missing", "open-graph-image-invalid"] },
         { label: "Twitter/X card missing", value: issueTypeCount(issues, "twitter-card-missing"), problem: true, severity: "warn", category: "social", types: ["twitter-card-missing"] },
-        { label: "Security issues", value: summary.securityIssues, problem: true, severity: "bad", category: "security", types: ["page-not-https", "external-blank-missing-noopener"] },
+        categoryRow("Security issues", "bad", "security"),
       ],
     },
   ];
@@ -179,7 +196,15 @@ export function ScanCheckMatrix({
         })),
     });
   }
-  const rows = sections.flatMap((section) => section.rows.map((row) => ({ ...row, area: section.title, areaText: section.text })));
+  const rows = sections.flatMap((section) =>
+    section.rows.map((row) => ({
+      ...row,
+      area: section.title,
+      areaText: section.text,
+      // What the Issues tab will list for this row: its types among open issues.
+      issueCount: row.types?.length ? issueTypesCount(issues, row.types) : 0,
+    })),
+  );
 
   return (
     <ReportSection title="Scan checks" description="Every local check grouped into one readable table. Use the issue buttons to open the matching rows.">
@@ -213,13 +238,14 @@ function ScanCheckRow({
   catalog,
   onSelect,
 }: {
-  row: ScanCheckRowModel & { area?: string; areaText?: string };
+  row: ScanCheckRowModel & { area?: string; areaText?: string; issueCount: number };
   catalog: IssueCatalog;
   onSelect: (row: ScanCheckRowModel) => void;
 }) {
-  const value = Number(row.value || 0);
-  const tone = row.problem ? (value > 0 ? (row.severity === "bad" ? "bad" : "warn") : "good") : "outline";
-  const clickable = Boolean(row.problem && value > 0 && row.types?.length);
+  // A value the saved scan did not record stays "-", never 0.
+  const value = knownNumber(row.value);
+  const tone = value === null ? "outline" : row.problem ? (value > 0 ? (row.severity === "bad" ? "bad" : "warn") : "good") : "outline";
+  const clickable = Boolean(row.problem && row.issueCount > 0);
   const guidance = checkGuidance(catalog, row.types);
   return (
     <TableRow>
@@ -250,20 +276,20 @@ function ScanCheckRow({
           ) : null}
         </div>
         {row.types?.length ? (
-          <div className="mt-0.5 text-xs text-muted-foreground">{row.types.map((type) => catalog.get(type)?.title || humanizeIssueType(type)).join(" · ")}</div>
+          <div className="mt-0.5 line-clamp-3 text-xs text-muted-foreground">{row.types.map((type) => catalog.get(type)?.title || humanizeIssueType(type)).join(" · ")}</div>
         ) : null}
       </TableCell>
       <TableCell className="metric text-lg">{formatNumber(value)}</TableCell>
       <TableCell>
         <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-sm">
           <StatusDot tone={tone} />
-          {row.problem ? (value ? "issues" : "clear") : "evidence"}
+          {value === null ? "not recorded" : row.problem ? (value ? "issues" : "clear") : "evidence"}
         </span>
       </TableCell>
       <TableCell className="text-right">
         {clickable ? (
           <Button size="sm" variant="outline" onClick={() => onSelect(row)}>
-            <ListChecks /> Show {formatNumber(value)} issues
+            <ListChecks /> Show {formatNumber(row.issueCount)} {row.issueCount === 1 ? "issue" : "issues"}
           </Button>
         ) : null}
       </TableCell>

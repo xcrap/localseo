@@ -46,12 +46,13 @@ export function parseRobots(text: string) {
       currentGroup.userAgents.push(value);
       continue;
     }
-    const appliesToAll = currentAgents.length === 0 || currentAgents.includes("*");
+    // Rules before the first user-agent line belong to no group: the matcher
+    // ignores them, and so do the site-wide checks (a stray leading
+    // `Disallow: /` does not block the site).
+    const appliesToAll = currentAgents.includes("*");
     if (key === "disallow" || key === "allow") {
       sawRuleInGroup = true;
-      // An empty Disallow means "allow everything"; it is not a rule. Rules
-      // before the first user-agent line belong to no group and are ignored
-      // by the matcher.
+      // An empty Disallow means "allow everything"; it is not a rule.
       if (value && currentGroup) currentGroup.rules.push({ type: key, path: value });
       if (key === "disallow" && appliesToAll && value) {
         disallowCount += 1;

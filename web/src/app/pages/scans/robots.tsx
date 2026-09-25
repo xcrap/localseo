@@ -1,8 +1,8 @@
 import { useEffect, useState, type SyntheticEvent } from "react";
 import { FlaskConical } from "lucide-react";
-import { api, type RobotsTestResult } from "../../../api";
+import { api, type RobotsTestResult, type RobotsTestStatus } from "../../../api";
 import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from "@/components/ui";
-import { EmptyState, Field, ReportSection, StatusEvidenceTable, formatNumber, type StatusEvidenceRow } from "../../shared";
+import { EmptyState, Field, ReportSection, StatusEvidenceTable, formatNumber, knownNumber, type StatusEvidenceRow } from "../../shared";
 
 type RobotsRule = { type?: string; path?: string };
 type RobotsGroup = { userAgents?: string[]; rules?: RobotsRule[] };
@@ -21,21 +21,58 @@ function ruleLabel(type?: string) {
   return type || "Rule";
 }
 
+// How Google handles a robots.txt it could not read: a 4xx answer (except 429)
+// means there is no file, so every URL is allowed; a 5xx, a 429, or no answer
+// means robots.txt is unavailable, so the whole site is treated as disallowed.
+// Same split as the crawler's own robots handling.
+function robotsFetchState(status: unknown): "missing" | "unavailable" {
+  const code = knownNumber(status);
+  return code !== null && code >= 300 && code < 500 && code !== 429 ? "missing" : "unavailable";
+}
+
+function httpAnswer(status: unknown) {
+  const code = knownNumber(status);
+  return code !== null ? `HTTP ${code}` : "no answer";
+}
+
+function withError(text: string, error: unknown) {
+  return error ? `${text} (${String(error)})` : text;
+}
+
+const unavailableRule = "Google treats a server error, a 429, or an unreachable robots.txt as disallowing the whole site until it answers again.";
+const missingRule = "Google treats a missing robots.txt as allowing every URL.";
+
+/** Plain-language outcome of fetching robots.txt, from a scan's saved robots evidence. */
+export function robotsFileSummary(robots: any) {
+  if (robots?.exists) return { state: "found" as const, label: "Found", tone: "good" as const, text: "" };
+  const answer = httpAnswer(robots?.status);
+  if (robotsFetchState(robots?.status) === "missing") {
+    return { state: "missing" as const, label: `Missing (${answer})`, tone: "warn" as const, text: `robots.txt answered ${answer}. ${missingRule}` };
+  }
+  return {
+    state: "unavailable" as const,
+    label: `Unavailable (${answer})`,
+    tone: "bad" as const,
+    text: `${withError(`robots.txt could not be read: ${answer}`, robots?.error)}. ${unavailableRule}`,
+  };
+}
+
 // Parsed robots.txt groups saved with the scan: which user agents each group
 // addresses and the Allow/Disallow rules it carries, in file order.
 export function RobotsGroups({ robots }: { robots: any }) {
   const groups: RobotsGroup[] | null = Array.isArray(robots?.groups) ? robots.groups : null;
+  // A missing or unreachable file is checked first: its empty group list was never read from a file.
+  const file = robots?.exists === false ? robotsFileSummary(robots) : null;
   return (
     <ReportSection
       title="Robots.txt groups"
       description="Each user-agent group parsed from robots.txt during the scan, with its Allow and Disallow rules in file order."
-      meta={groups ? `${formatNumber(groups.length)} ${groups.length === 1 ? "group" : "groups"}` : undefined}
+      meta={groups && !file ? `${formatNumber(groups.length)} ${groups.length === 1 ? "group" : "groups"}` : undefined}
     >
-      {!groups ? (
-        <EmptyState
-          title={robots?.exists === false ? "No robots.txt found" : "Groups not saved for this scan"}
-          text={robots?.exists === false ? "The crawler found no robots.txt file, so every URL is crawlable by default." : "Rescan to see parsed robots.txt groups."}
-        />
+      {file ? (
+        <EmptyState title={file.state === "missing" ? "No robots.txt found" : "robots.txt was unavailable"} text={file.text} />
+      ) : !groups ? (
+        <EmptyState title="Groups not saved for this scan" text="Rescan to see parsed robots.txt groups." />
       ) : !groups.length ? (
         <EmptyState title="No user-agent groups" text="The robots.txt file was read but contains no user-agent groups, so nothing is blocked." />
       ) : (
@@ -71,30 +108,35 @@ export function RobotsGroups({ robots }: { robots: any }) {
 }
 
 // Soft 404 probe: the crawler requests a URL that cannot exist and records how
-// the server answers.
+// the server answers. Only a 404 or 410 passes; a 2xx is a soft 404; any other
+// status (403, 500, an unresolved redirect) is shown as it is.
 export function softNotFoundEvidenceRow(result: any): StatusEvidenceRow {
+  const title = "Soft 404 check";
   const probe = result?.softNotFound;
   if (!probe || typeof probe !== "object") {
-    return { title: "Soft 404 check", status: "Not checked", tone: "outline", text: "Not checked in this scan." };
+    return { title, status: "Not checked", tone: "outline", text: "Not checked in this scan." };
   }
-  const soft = probe.soft404 === true;
-  const known = typeof probe.soft404 === "boolean";
+  const status = knownNumber(probe.status);
+  const probeText = (outcome: string) => (
+    <span className="break-all">
+      Probe {probe.probeUrl || "-"} {outcome}
+      {probe.finalUrl && probe.finalUrl !== probe.probeUrl ? ` after redirecting to ${probe.finalUrl}` : ""}.
+    </span>
+  );
+  if (probe.error || status === null) {
+    return { title, status: "Inconclusive", tone: "outline", text: probeText(probe.error ? `failed: ${probe.error}` : "returned no HTTP status") };
+  }
+  if (status === 404 || status === 410) {
+    return { title, status: `Missing pages return ${status}`, tone: "good", text: probeText(`answered ${status}`) };
+  }
+  if (status >= 200 && status < 300) {
+    return { title, status: `Missing pages return ${status} — soft 404`, tone: "bad", text: probeText(`answered ${status}, so missing pages look like real pages`) };
+  }
   return {
-    title: "Soft 404 check",
-    status: !known
-      ? "Inconclusive"
-      : soft
-        ? probe.status != null
-          ? `Missing pages return ${probe.status} — soft 404`
-          : "Soft 404 — missing pages do not return 404/410"
-        : "Missing pages return a real 404/410",
-    tone: !known ? "outline" : soft ? "bad" : "good",
-    text: (
-      <span className="break-all">
-        Probe {probe.probeUrl || "-"} answered {probe.status ?? "no status"}
-        {probe.finalUrl && probe.finalUrl !== probe.probeUrl ? ` after redirecting to ${probe.finalUrl}` : ""}.
-      </span>
-    ),
+    title,
+    status: `Missing pages return ${status}`,
+    tone: "warn",
+    text: probeText(`answered ${status}. Not a soft 404, but only a 404 or 410 tells search engines a page is gone`),
   };
 }
 
@@ -105,6 +147,60 @@ const userAgentOptions = [
   { value: "*", label: "* (any crawler)" },
   { value: "custom", label: "Custom…" },
 ];
+
+// The backend reports why a URL was allowed or blocked; older APIs only sent
+// the fetch status, so the same outcome is derived from it.
+function robotsTestStatus(result: RobotsTestResult): RobotsTestStatus {
+  if (result.status) return result.status;
+  const fetched = knownNumber(result.fetchedStatus);
+  if (result.source === "provided" || (fetched !== null && fetched >= 200 && fetched < 300)) {
+    return result.matchedRule ? "matched" : "no-matching-rule";
+  }
+  return robotsFetchState(fetched) === "missing" ? "robots-missing" : "robots-unavailable";
+}
+
+function robotsTestRows(result: RobotsTestResult): StatusEvidenceRow[] {
+  const status = robotsTestStatus(result);
+  const answer = httpAnswer(result.fetchedStatus);
+  const fileRead = status === "matched" || status === "no-matching-rule";
+  const ruleRow: StatusEvidenceRow =
+    status === "matched" && result.matchedRule
+      ? {
+          title: "Matched rule",
+          status: ruleLabel(result.matchedRule.type),
+          tone: ruleVariant(result.matchedRule.type) as StatusEvidenceRow["tone"],
+          text: <code className="break-all font-mono text-[12.5px]">{result.matchedRule.path || "(empty)"}</code>,
+        }
+      : status === "robots-missing"
+        ? { title: "Matched rule", status: "No robots.txt", tone: "warn", text: `robots.txt answered ${answer}, so there are no rules. ${missingRule}` }
+        : status === "robots-unavailable"
+          ? { title: "Matched rule", status: "robots.txt unavailable", tone: "bad", text: `${withError(`robots.txt could not be read: ${answer}`, result.error)}. ${unavailableRule}` }
+          : { title: "Matched rule", status: "None", tone: "outline", text: "robots.txt was read and no rule matched this URL, so it is allowed by default." };
+  return [
+    ruleRow,
+    {
+      title: "User-agent group",
+      status: fileRead ? result.userAgentGroup || "None" : "-",
+      tone: "outline",
+      text: !fileRead
+        ? "No robots.txt rules were read, so no group applies."
+        : result.userAgentGroup
+          ? "The robots.txt group whose rules applied."
+          : "No group addresses this crawler, so no rules apply.",
+    },
+    {
+      title: "Robots.txt",
+      status: result.source === "provided" ? "Pasted robots.txt" : fileRead ? "Live robots.txt" : status === "robots-missing" ? "Missing" : "Unavailable",
+      tone: result.source === "provided" ? "outline" : fileRead ? "good" : status === "robots-missing" ? "warn" : "bad",
+      text: (
+        <span className="break-all">
+          {result.robotsUrl || "-"}
+          {result.source !== "provided" ? ` · ${answer}` : ""}
+        </span>
+      ),
+    },
+  ];
+}
 
 function defaultTestUrl(startUrl: string) {
   try {
@@ -207,37 +303,7 @@ export function RobotsTester({ siteId, startUrl }: { siteId?: string | null; sta
                   <Badge variant={result.allowed ? "good" : "bad"} className="text-sm">{result.allowed ? "Allowed" : "Blocked"}</Badge>
                   <span className="text-sm text-muted-foreground">for {outcome?.agent}</span>
                 </div>
-                <StatusEvidenceTable
-                  rows={[
-                    {
-                      title: "Matched rule",
-                      status: result.matchedRule ? ruleLabel(result.matchedRule.type) : "None",
-                      tone: result.matchedRule ? (ruleVariant(result.matchedRule.type) as any) : "outline",
-                      text: result.matchedRule ? (
-                        <code className="break-all font-mono text-[12.5px]">{result.matchedRule.path || "(empty)"}</code>
-                      ) : (
-                        "No rule matched — allowed by default."
-                      ),
-                    },
-                    {
-                      title: "User-agent group",
-                      status: result.userAgentGroup || "None",
-                      tone: "outline",
-                      text: result.userAgentGroup ? "The robots.txt group whose rules applied." : "No group addresses this crawler, so no rules apply.",
-                    },
-                    {
-                      title: "Robots.txt",
-                      status: result.source === "provided" ? "Pasted robots.txt" : "Live robots.txt",
-                      tone: result.source === "provided" ? "outline" : result.fetchedStatus != null && result.fetchedStatus >= 400 ? "warn" : "good",
-                      text: (
-                        <span className="break-all">
-                          {result.robotsUrl || "-"}
-                          {result.source !== "provided" ? ` · HTTP ${result.fetchedStatus ?? "no response"}` : ""}
-                        </span>
-                      ),
-                    },
-                  ]}
-                />
+                <StatusEvidenceTable rows={robotsTestRows(result)} />
               </div>
             ) : (
               <p className="text-sm text-muted-foreground">Results show which rule allowed or blocked the URL.</p>

@@ -84,11 +84,11 @@ export function AiPage({ site }: { site: Site }) {
 
   async function submit(event: SyntheticEvent) {
     event.preventDefault();
-    if (starting) return;
+    if (starting || !context.trim()) return;
     setStarting(true);
     try {
-      const prompt = prompts.find((item) => item.key === type)?.template?.replace("{{context}}", context) || context;
-      const job = await api.createAiJob({ type, prompt, siteId: site.id });
+      // The backend fills the saved template for this workflow with the context.
+      const job = await api.createAiJob({ type, context, siteId: site.id });
       if (job?.id) {
         setJobs((rows) => [job, ...rows.filter((row) => row.id !== job.id)]);
         selectJob(job.id);
@@ -118,7 +118,7 @@ export function AiPage({ site }: { site: Site }) {
               </Select>
             </Field>
             <Field label="Context"><Textarea className="min-h-48" value={context} onChange={(e) => setContext(e.target.value)} /></Field>
-            <Button disabled={starting}><Bot /> {starting ? "Starting job" : "Start job"}</Button>
+            <Button disabled={starting || !context.trim()}><Bot /> {starting ? "Starting job" : "Start job"}</Button>
           </form>
         </ReportSection>
         <div className="space-y-6">

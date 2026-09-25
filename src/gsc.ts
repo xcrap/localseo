@@ -3,6 +3,7 @@ import { appUrl, getConfigValue } from "./config";
 import { type CsvRow, csvRow, csvText, parseCsvNumber, parseCsvRows } from "./csv";
 import { all, get, jsonParse, run, transaction } from "./db";
 import { HttpError, badRequest, notFound } from "./errors";
+import { requireDate } from "./input";
 import { getSite } from "./seo";
 
 const GSC_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly";
@@ -21,7 +22,6 @@ type GscConnection = {
   access_token: string;
   refresh_token: string;
   expires_at: number;
-  account_email: string;
   auth_error: string;
 };
 
@@ -103,11 +103,12 @@ export function gscStatus(siteId: string) {
     needsReconnect: Boolean(connection && (connection.auth_error || !hasTokens(connection))),
     authError: connection?.auth_error || "",
     redirectUri: gscRedirectUri(),
+    // No Google account email: the only OAuth scope is webmasters.readonly,
+    // which does not reveal who signed in.
     connection: connection
       ? {
           siteId,
           siteUrl: connection.site_url,
-          accountEmail: connection.account_email,
           expiresAt: connection.expires_at,
         }
       : null,
@@ -316,14 +317,6 @@ export function setGscSite(siteId: string, siteUrl: unknown) {
     [property, siteId],
   );
   return gscStatus(siteId);
-}
-
-export function requireDate(value: unknown, field: string) {
-  const text = typeof value === "string" ? value.trim() : "";
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(Date.parse(text))) {
-    throw badRequest(`${field} must be a date like 2026-01-31.`);
-  }
-  return text;
 }
 
 function dateWindow(input: { startDate?: unknown; endDate?: unknown }) {

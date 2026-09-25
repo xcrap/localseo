@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ExternalLink } from "lucide-react";
-import { api, type ScanPageDetail } from "../../../api";
+import { api, type ScanPageDetail, type ScanPageLink } from "../../../api";
 import { Badge, Button, Sheet, SheetBody, SheetContent, SheetDescription, SheetHeader, SheetTitle, Skeleton } from "@/components/ui";
 import { EmptyState, IndexabilityBadge, formatBytes, formatMs, formatNumber, pageH1Count } from "../../shared";
 import { severityVariant } from "./common";
@@ -31,6 +31,20 @@ function SteppedList<T>({ items, render, empty }: { items: T[]; render: (item: T
       ) : null}
     </div>
   );
+}
+
+// Visible anchor text first; an image-only link falls back to its accessible
+// name (aria-label, title, or image alt), labelled so it is not read as text.
+function LinkText({ link }: { link: ScanPageLink }) {
+  if (link.anchor) return <span>“{link.anchor}”</span>;
+  if (link.accessibleName) {
+    return (
+      <span>
+        “{link.accessibleName}” <span className="text-muted-foreground/80">(accessible name, no text)</span>
+      </span>
+    );
+  }
+  return <span>No anchor text</span>;
 }
 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
@@ -222,7 +236,7 @@ export function ScanPageDrawer({
                       <div className="space-y-0.5">
                         <div className="break-all">{link.from}</div>
                         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                          <span>{link.anchor ? `“${link.anchor}”` : "No anchor text"}</span>
+                          <LinkText link={link} />
                           {link.nofollow ? <Badge variant="warn">nofollow</Badge> : null}
                         </div>
                       </div>
@@ -238,12 +252,12 @@ export function ScanPageDrawer({
                   <SteppedList
                     items={data.outlinks}
                     empty="No links were saved from this page."
-                    render={(link: any) => (
+                    render={(link) => (
                       <div className="space-y-0.5">
                         <div className="break-all">{link.href || link.url}</div>
                         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                           {link.type ? <Badge variant="outline">{link.type}</Badge> : null}
-                          <span>{link.anchor || link.accessibleName || "No anchor text"}</span>
+                          <LinkText link={link} />
                           {link.rel ? <span>rel={link.rel}</span> : null}
                         </div>
                       </div>

@@ -178,7 +178,11 @@ export const analysisTools: ToolDefinition[] = [
         ...siteIdInput,
         startDate: dateInput("Window start"),
         endDate: dateInput("Window end"),
-        minImpressions: { type: "number", minimum: 0, description: "Minimum query impressions (default 10)." },
+        minImpressions: {
+          type: "number",
+          minimum: 0,
+          description: "Minimum total impressions of the query across all its pages, not per page (default 10).",
+        },
       },
       required: ["siteId"],
     },
@@ -186,7 +190,7 @@ export const analysisTools: ToolDefinition[] = [
   {
     name: "content_decay",
     description:
-      "Pages that lost clicks or impressions between two windows of stored Search Console page data (default: the last 28 stored days vs the 28 before), with page changes between the latest two scans.",
+      "Pages that lost clicks or impressions between two windows of stored Search Console page data (default: the last 28 days that have rows vs the 28 before, or two equal halves when fewer than 56 days are stored, explained in `note`), with page changes between the latest completed scans on or before each window's end.",
     inputSchema: {
       type: "object",
       properties: {

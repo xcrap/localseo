@@ -3,30 +3,28 @@ import { Link } from "react-router-dom";
 import { FileSearch } from "lucide-react";
 import { api } from "../../../api";
 import { Badge, Button, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Skeleton, SortableTableHead, Table, TableBody, TableCell, TableHeader, TableRow } from "@/components/ui";
-import { CountUp, EmptyState, MetricTile, MetricTileGrid, ReportSection, formatDate, formatNumber, scanIsActive, scanStatusLabel } from "../../shared";
+import { CountUp, EmptyState, MetricTile, MetricTileGrid, ReportSection, formatDate, formatNumber, knownNumber, scanIsActive, scanStatusLabel } from "../../shared";
 import { FilteredRows } from "../../data-table";
 import { ScanSection, humanizeIssueType, severityVariant } from "./common";
 import { issueTypeTitle, type IssueCatalog } from "./issue-catalog";
 
 const PREVIOUS_SCAN = "__previous";
 
-// Regressions reported by the comparison: the backend may send a list, an
-// object with rows, or only a summary count; page changes flagged as
-// regressions are the fallback evidence.
+// Regressions from a comparison. The headline number counts PAGES with a
+// regression flag (summary.regressions, the same as regressions.total); new
+// high/medium issues are separate counts and never added to it. Rows are the
+// flagged page changes, so one page can contribute several rows.
 export function comparisonRegressions(comparison: any) {
+  const rows: any[] = (comparison?.pageChanges || []).filter((change: any) => change.regression);
   const value = comparison?.regressions;
-  const rows: any[] = Array.isArray(value)
-    ? value
-    : Array.isArray(value?.rows)
-      ? value.rows
-      : Array.isArray(value?.items)
-        ? value.items
-        : (comparison?.pageChanges || []).filter((change: any) => change.regression);
-  const count = Number(
-    (value && !Array.isArray(value) ? value.count ?? value.total : undefined) ?? comparison?.summary?.regressions ?? rows.length,
-  ) || 0;
-  const newHighIssues = (comparison?.newIssues || []).filter((issue: any) => issue.severity === "high");
-  return { rows, count, newHighIssues };
+  const newIssues: any[] = comparison?.newIssues || [];
+  const pageCount =
+    knownNumber(comparison?.summary?.regressions) ??
+    knownNumber(value?.total) ??
+    new Set(rows.map((row) => String(row.url || ""))).size;
+  const newHighIssues = knownNumber(value?.newHighIssues) ?? newIssues.filter((issue) => issue.severity === "high").length;
+  const newMediumIssues = knownNumber(value?.newMediumIssues) ?? newIssues.filter((issue) => issue.severity === "medium").length;
+  return { rows, pageCount, newHighIssues, newMediumIssues };
 }
 
 export function ScanChangesTab({
@@ -157,6 +155,7 @@ function ScanChangesReport({
   }
 
   const summary = comparison.summary || {};
+  const regressions = comparisonRegressions(comparison);
   const issueChanges = [
     ...(comparison.newIssues || []),
     ...(comparison.fixedIssues || []),
@@ -172,10 +171,12 @@ function ScanChangesReport({
         meta={baseLabel || (comparison.previousCreatedAt ? `Previous scan · ${formatDate(comparison.previousCreatedAt)}` : undefined)}
       >
         <MetricTileGrid>
-          <MetricTile label="New issues" value={<CountUp value={summary.newIssues || 0} />} tone={summary.newIssues ? "warn" : "default"} hint="Issue identities not present in the other scan" />
-          <MetricTile label="Fixed issues" value={<CountUp value={summary.fixedIssues || 0} />} hint="Findings from the other scan absent from this one" />
-          <MetricTile label="Regressions" value={<CountUp value={summary.regressions || 0} />} tone={summary.regressions ? "bad" : "default"} hint="Indexability, status, redirect, sitemap, or removed-page regressions" />
-          <MetricTile label="Page changes" value={<CountUp value={summary.pageChanges || 0} />} hint="Metadata, content, status, discovery, and sitemap changes" />
+          <MetricTile label="Regressed pages" value={<CountUp value={regressions.pageCount} />} tone={regressions.pageCount ? "bad" : "default"} hint="Pages that became non-indexable, started erroring or redirecting, left the sitemap, or dropped out of the crawl" />
+          <MetricTile label="New high issues" value={<CountUp value={regressions.newHighIssues} />} tone={regressions.newHighIssues ? "bad" : "default"} hint="High-severity findings not in the other scan; not part of regressed pages" />
+          <MetricTile label="New medium issues" value={<CountUp value={regressions.newMediumIssues} />} tone={regressions.newMediumIssues ? "warn" : "default"} hint="Medium-severity findings not in the other scan" />
+          <MetricTile label="All new issues" value={<CountUp value={summary.newIssues} />} hint="Every issue identity not present in the other scan, any severity" />
+          <MetricTile label="Fixed issues" value={<CountUp value={summary.fixedIssues} />} hint="Findings from the other scan absent from this one" />
+          <MetricTile label="Page changes" value={<CountUp value={summary.pageChanges} />} hint="Metadata, content, status, discovery, and sitemap changes" />
         </MetricTileGrid>
         {otherScanId ? (
           <Button asChild variant="outline" size="sm" className="mt-4">

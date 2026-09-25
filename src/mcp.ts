@@ -380,7 +380,8 @@ const coreTools: ToolDefinition[] = [
   },
   {
     name: "start_ai_job",
-    description: "Queue a local Codex CLI job; it is saved in SQLite and runs in the background.",
+    description:
+      "Queue a local Codex CLI job; it is saved in SQLite and runs in the background. Jobs of type scan.prioritize, or with context or scanId, run without Codex web search because their prompt carries crawled page text.",
     inputSchema: {
       type: "object",
       properties: {
@@ -587,7 +588,8 @@ async function callTool(name: string, args: any) {
       const candidateUrls = args.url ? [String(args.url)] : site.domain ? siteScanUrlCandidates(site) : [];
       const url = args.url || (site.domain ? await resolveSavedSiteScanUrl(site) : "");
       if (!url) throw site.domain ? unreachableScanUrlError(site.domain) : new Error("Set a site domain or pass a URL.");
-      const scan = await startScan(site.id, url);
+      // A resolved saved-site URL was just probed; a caller-supplied URL still needs its probe.
+      const scan = await startScan(site.id, url, { reachable: !args.url });
       return {
         site: site.domain,
         scan,

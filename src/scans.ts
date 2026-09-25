@@ -2,8 +2,8 @@ import * as cheerio from "cheerio";
 import { XMLParser } from "fast-xml-parser";
 import { createHash, randomUUID } from "node:crypto";
 import { getConfigValue } from "./config";
-import { all, get, jsonParse, run } from "./db";
-import { fetchText, fetchWithRedirectTrace } from "./http";
+import { all, get, jsonParse, run, transaction } from "./db";
+import { fetchText, fetchWithRedirectTrace, type KnownResponse } from "./http";
 import { parseRobots, type RobotsVerdict, robotsMatcher, testRobots } from "./robots";
 import { localHostFirst, probeScanUrl, unreachableScanUrlError } from "./site-scan-url";
 import { readStructuredData } from "./structured-data";
@@ -14,8 +14,12 @@ export { parseRobots, testRobots };
 // resource checks, and page issues stored once in result.issues.
 // Version 4: robots.txt rules per URL, canonical/hreflang/sitemap URL checks,
 // soft 404 probe, near-duplicate content, and structured data validation.
+// Version 5: concurrent page fetches with link depth settled over the whole
+// crawl graph, near-duplicates within 8 simhash bits, percent-escape
+// insensitive URL keys, per-page outlinks (pageLinks), and page-limit based
+// sitemap coverage.
 // Scans are only compared with scans that share the same crawl semantics.
-const SCAN_RESULT_VERSION = 4;
+const SCAN_RESULT_VERSION = 5;
 
 // Thrown for request problems the API should answer with a 4xx status.
 export class ScanRequestError extends Error {
@@ -35,28 +39,46 @@ function siteIgnoreRules(siteId: string) {
   return all<any>("SELECT * FROM scan_issue_ignores WHERE site_id = ?", [siteId]);
 }
 
-// Views derived from result.issues on read, for scans of every version: each
-// page's own issues list (stored once, in result.issues, since version 3) and
-// issue groups named by the issue-type catalog.
+// Views derived from result.issues on read, for scans of every version: issue
+// groups named by the issue-type catalog. Page issues are stored once, in
+// result.issues (by issue.url), and are not copied onto every page row; the
+// per-page outlink index is served by getScanPage only.
 function withIssueViews(row: any) {
   const result = row?.result;
   if (!result || !Array.isArray(result.issues)) return row;
-  const byUrl = new Map<string, any[]>();
-  for (const issue of result.issues) {
-    const rows = byUrl.get(issue.url) || [];
-    rows.push(issue);
-    byUrl.set(issue.url, rows);
-  }
+  const { pageLinks: _pageLinks, ...rest } = result;
   return {
     ...row,
     result: {
-      ...result,
+      ...rest,
       issueGroups: groupIssueSummary(result.issues.filter((issue: any) => !issue.ignored)),
-      ...(Array.isArray(result.pages)
-        ? { pages: result.pages.map((page: any) => ({ ...page, issues: byUrl.get(page.url) || [] })) }
-        : {}),
     },
   };
+}
+
+// The full saved result lives in scan_results, apart from the small scans row.
+function readScanResult(scanId: string) {
+  return jsonParse<any>(get<{ result_json: string }>("SELECT result_json FROM scan_results WHERE scan_id = ?", [scanId])?.result_json, null);
+}
+
+// Parsed results of finished scans, for the page drawer's repeated reads. The
+// cached objects are shared, so callers must not mutate them. Keyed by scan id
+// and updated_at, so a rewritten result is never served stale; running scans
+// are not cached (their updated_at has one-second resolution).
+const parsedResultCache = new Map<string, { updatedAt: string; result: any }>();
+const PARSED_RESULT_CACHE_SIZE = 4;
+
+function cachedScanResult(row: { id: string; status: string; updated_at: string }) {
+  if (row.status === "queued" || row.status === "running") return readScanResult(row.id);
+  const cached = parsedResultCache.get(row.id);
+  const result = cached && cached.updatedAt === row.updated_at ? cached.result : readScanResult(row.id);
+  // Re-inserting keeps the most recently used entries at the end.
+  parsedResultCache.delete(row.id);
+  parsedResultCache.set(row.id, { updatedAt: row.updated_at, result });
+  while (parsedResultCache.size > PARSED_RESULT_CACHE_SIZE) {
+    parsedResultCache.delete(parsedResultCache.keys().next().value as string);
+  }
+  return result;
 }
 
 function publicScanRow(row: any) {
@@ -145,7 +167,8 @@ function applyIssueIgnores(row: any, rules: any[]) {
   const pages = Array.isArray(result.pages) ? result.pages : [];
   return {
     ...row,
-    score: row.status === "completed" ? healthScore(pages, activeIssues) : row.score,
+    // Cancelled scans are scored on the pages they crawled (summary.partial).
+    score: row.status === "completed" || row.status === "cancelled" ? healthScore(pages, activeIssues) : row.score,
     issue_count: activeIssues.length,
     ignored_issue_count: ignoredCount,
     result: {
@@ -185,7 +208,7 @@ function storedScanSummary(publicRow: any) {
 function refreshScanSummary(scanId: string, rules: any[]) {
   const row = get<any>("SELECT * FROM scans WHERE id = ?", [scanId]);
   if (!row) return;
-  const publicRow = applyIssueIgnores({ ...row, result: jsonParse(row.result_json, null) }, rules);
+  const publicRow = applyIssueIgnores({ ...row, result: readScanResult(scanId) }, rules);
   run("UPDATE scans SET summary_json = ? WHERE id = ?", [storedScanSummary(publicRow), scanId]);
 }
 
@@ -297,9 +320,10 @@ export function listAllScans() {
 export function getScan(scanId: string) {
   const row = get<any>(
     `
-    SELECT scans.*, sites.name AS site_name, sites.domain AS site_domain
+    SELECT scans.*, sites.name AS site_name, sites.domain AS site_domain, scan_results.result_json
     FROM scans
     LEFT JOIN sites ON sites.id = scans.site_id
+    LEFT JOIN scan_results ON scan_results.scan_id = scans.id
     WHERE scans.id = ?
     `,
     [scanId],
@@ -345,12 +369,13 @@ export function clearScans(siteId: string) {
   return { deleted: Number(info.changes || 0) };
 }
 
-export async function startScan(siteId: string, url: string) {
+// options.reachable: the caller already probed this URL and it answered
+// (resolveSavedSiteScanUrl), so it is not probed a second time.
+export async function startScan(siteId: string, url: string, options: { reachable?: boolean } = {}) {
   const site = getSite(siteId);
   if (!site) throw new Error("Site not found.");
   const startUrl = /^https?:\/\//i.test(url.trim()) ? url.trim() : `https://${url.trim()}`;
-  const probe = await probeScanUrl(startUrl);
-  if (!probe) throw unreachableScanUrlError(startUrl);
+  if (!options.reachable && !(await probeScanUrl(startUrl))) throw unreachableScanUrlError(startUrl);
   const scanId = randomUUID();
   run(
     "INSERT INTO scans (id, site_id, url, status, updated_at) VALUES (?, ?, ?, 'queued', CURRENT_TIMESTAMP)",
@@ -555,6 +580,16 @@ const scanLimits = {
   maxImageInventory: 1200,
 };
 
+// Page requests kept in flight against the scanned site (fast crawls and
+// local hosts; polite crawls of remote sites fetch one page at a time).
+const PAGE_FETCH_CONCURRENCY = 3;
+// Outlinks kept per page for the page drawer (result.pageLinks).
+const MAX_OUTLINKS_PER_PAGE = 200;
+// Running scans write their list summary at most this often, and the full
+// result (every page and issue) at most every RESULT_SAVE_INTERVAL_MS.
+const SUMMARY_SAVE_INTERVAL_MS = 1000;
+const RESULT_SAVE_INTERVAL_MS = 10_000;
+
 function scanLimitsFor(maxPages: number): typeof scanLimits {
   const factor = Math.max(1, maxPages / scanLimits.maxPages);
   return {
@@ -583,7 +618,9 @@ function sleep(ms: number, signal?: AbortSignal) {
 }
 
 // Runs tasks with a global concurrency cap and a per-host cap, so resource
-// checks finish quickly without sending bursts to any single server.
+// checks finish quickly without sending bursts to any single server. Items are
+// grouped into per-host queues once (hosts in order of first appearance, items
+// in their original order), so each scheduling step only looks at hosts.
 async function runBounded<T>(
   items: T[],
   hostOf: (item: T) => string,
@@ -592,23 +629,35 @@ async function runBounded<T>(
   signal: AbortSignal,
   concurrency = 6,
 ) {
-  const pending = [...items];
-  const activeByHost = new Map<string, number>();
+  type HostQueue = { host: string; items: T[]; limit: number; active: number };
+  const queues = new Map<string, HostQueue>();
+  for (const item of items) {
+    const host = hostOf(item);
+    const queue = queues.get(host);
+    if (queue) queue.items.push(item);
+    else queues.set(host, { host, items: [item], limit: hostLimit(host), active: 0 });
+  }
   const running = new Set<Promise<void>>();
-  while (pending.length && !signal.aborted) {
-    const index = pending.findIndex((item) => {
-      const host = hostOf(item);
-      return (activeByHost.get(host) || 0) < hostLimit(host);
-    });
-    if (running.size >= concurrency || index < 0) {
+  while (queues.size && !signal.aborted) {
+    let next: HostQueue | undefined;
+    if (running.size < concurrency) {
+      for (const queue of queues.values()) {
+        if (queue.active < queue.limit) {
+          next = queue;
+          break;
+        }
+      }
+    }
+    if (!next) {
       await Promise.race(running);
       continue;
     }
-    const [item] = pending.splice(index, 1);
-    const host = hostOf(item);
-    activeByHost.set(host, (activeByHost.get(host) || 0) + 1);
+    const queue = next;
+    const item = queue.items.shift() as T;
+    if (!queue.items.length) queues.delete(queue.host);
+    queue.active += 1;
     const job: Promise<void> = task(item).finally(() => {
-      activeByHost.set(host, (activeByHost.get(host) || 1) - 1);
+      queue.active -= 1;
       running.delete(job);
     });
     running.add(job);
@@ -659,30 +708,43 @@ export function sameSiteUrl(url: string, scope: string) {
   return Boolean(targetKey && scopeKey && targetKey === scopeKey);
 }
 
+// Percent-escapes are case-insensitive ("%c3%a9" is "%C3%A9"); URL parsing
+// keeps them as written, so comparisons upper-case them.
+function upperCaseEscapes(value: string) {
+  return value.replace(/%[0-9a-f]{2}/gi, (sequence) => sequence.toUpperCase());
+}
+
+function withoutTrailingSlash(pathname: string) {
+  return pathname !== "/" && pathname.endsWith("/") ? pathname.replace(/\/+$/, "") || "/" : pathname;
+}
+
 function normalizedUrl(value: string) {
   try {
     const url = new URL(value);
     url.hash = "";
-    if (url.pathname !== "/" && url.pathname.endsWith("/")) {
-      url.pathname = url.pathname.replace(/\/+$/, "");
-    }
-    return url.toString();
+    url.pathname = withoutTrailingSlash(url.pathname);
+    return upperCaseEscapes(url.toString());
   } catch {
     return value;
   }
 }
 
+// Page identity: fragment, www, trailing slash, query parameter order, and
+// percent-escape case are ignored.
+function urlKey(url: URL) {
+  const params = new URLSearchParams(url.search);
+  params.sort();
+  const query = params.toString();
+  const hostname = rootEquivalentHostname(url.hostname);
+  const renderedHost = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
+  return upperCaseEscapes(
+    `${url.protocol.toLowerCase()}//${renderedHost}${url.port ? `:${url.port}` : ""}${withoutTrailingSlash(url.pathname)}${query ? `?${query}` : ""}`,
+  );
+}
+
 function normalizedUrlKey(value: string) {
   try {
-    const url = new URL(value);
-    url.hash = "";
-    url.searchParams.sort();
-    if (url.pathname !== "/" && url.pathname.endsWith("/")) {
-      url.pathname = url.pathname.replace(/\/+$/, "");
-    }
-    const hostname = rootEquivalentHostname(url.hostname);
-    const renderedHost = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
-    return `${url.protocol.toLowerCase()}//${renderedHost}${url.port ? `:${url.port}` : ""}${url.pathname}${url.search}`;
+    return urlKey(new URL(value));
   } catch {
     return value;
   }
@@ -715,34 +777,37 @@ function isHttpOnHttpsPage(value: string, pageUrl: string) {
   }
 }
 
-function isLikelyPageUrl(value: string) {
-  try {
-    const pathname = new URL(value).pathname.toLowerCase();
-    return !/\.(?:avif|bmp|css|csv|docx?|eot|gif|gz|ico|jpe?g|js|json|m4v|map|mov|mp3|mp4|ogg|otf|pdf|png|pptx?|rar|svg|tar|ttf|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i.test(pathname);
-  } catch {
-    return true;
-  }
+function isLikelyPagePath(pathname: string) {
+  return !/\.(?:avif|bmp|css|csv|docx?|eot|gif|gz|ico|jpe?g|js|json|m4v|map|mov|mp3|mp4|ogg|otf|pdf|png|pptx?|rar|svg|tar|ttf|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i.test(pathname);
 }
+
+const ignoredCrawlPath = "/cdn-cgi/l/email-protection";
 
 function isIgnoredCrawlUrl(value: string) {
   try {
-    const url = new URL(value);
-    return url.pathname === "/cdn-cgi/l/email-protection";
+    return new URL(value).pathname === ignoredCrawlPath;
   } catch {
     return false;
   }
 }
 
-function pageCrawlTarget(value: string, startUrl: string) {
-  if (!isLikelyPageUrl(value) || isIgnoredCrawlUrl(value)) return null;
-  const parameterized = hasQueryParams(value);
-  const exactStartUrl = normalizedUrlKey(value) === normalizedUrlKey(startUrl);
-  const url = parameterized && !exactStartUrl ? withoutQueryUrl(value) : value;
-  return {
-    url,
-    key: normalizedUrlKey(url),
-    parameterized,
-  };
+// The URL the crawler requests for a link, and its key. Parameterized links
+// are crawled without their query string, except the start URL itself.
+// startKey is normalizedUrlKey(startUrl), computed once per scan.
+function pageCrawlTarget(value: string, startKey: string) {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (!isLikelyPagePath(url.pathname) || url.pathname === ignoredCrawlPath) return null;
+  const key = urlKey(url);
+  const parameterized = url.searchParams.size > 0;
+  if (!parameterized || key === startKey) return { url: value, key, parameterized };
+  url.search = "";
+  url.hash = "";
+  return { url: url.toString(), key: urlKey(url), parameterized };
 }
 
 function parseSrcsetUrls(value: string, baseUrl: string) {
@@ -852,9 +917,11 @@ function contentFingerprint(value: string) {
 }
 
 // Near-duplicate detection: a 64-bit simhash of the page's 3-word shingles,
-// stored as 16 hex characters. Similar texts differ in few bits.
+// stored as 16 hex characters. Similar texts differ in few bits: measured on
+// real crawls, 99.7%-identical pages had a median distance of 4 bits while
+// unrelated pages were never closer than 19, so pairs within 8 bits match.
 const SIMHASH_MIN_WORDS = 50;
-const NEAR_DUPLICATE_MAX_DISTANCE = 3;
+const NEAR_DUPLICATE_MAX_DISTANCE = 8;
 
 function hash32(value: string, seed: number) {
   let hash = seed;
@@ -1041,29 +1108,38 @@ function comparisonIssue(issue: any, change: string, extra: Record<string, unkno
   };
 }
 
-// A short list a report can show as "Regressions": new high/medium issues and
-// pages that stopped being indexable or stopped answering 2xx.
+// Regressions, one definition for every view (Changes tab, report,
+// notifications, MCP): the pages with at least one page change flagged as a
+// regression. `total` is that page count and always equals
+// comparison.summary.regressions. New high/medium issues are counted
+// separately and are not part of `total`. `pages` keeps one row per regressed
+// page (its most serious change first), at most 20.
+const regressionOrder = ["became-non-indexable", "became-non-200", "page-removed"];
+
 function comparisonRegressions(newIssues: any[], pageChanges: any[]) {
   const isSuccess = (value: unknown) => Number(value) >= 200 && Number(value) < 300;
-  const pages = [
-    ...pageChanges
-      .filter((change) => change.type === "became-non-indexable")
-      .map((change) => ({ url: change.url, change: "became-non-indexable", before: change.before, after: change.after })),
-    ...pageChanges
-      .filter((change) => change.type === "http-status-changed" && isSuccess(change.before) && !isSuccess(change.after))
-      .map((change) => ({ url: change.url, change: "became-non-200", before: change.before, after: change.after })),
-  ];
-  const newHighIssues = newIssues.filter((issue) => issue.severity === "high").length;
-  const newMediumIssues = newIssues.filter((issue) => issue.severity === "medium").length;
-  const becameNonIndexable = pages.filter((page) => page.change === "became-non-indexable").length;
-  const becameNon200 = pages.length - becameNonIndexable;
+  const rank = (change: string) => (regressionOrder.includes(change) ? regressionOrder.indexOf(change) : regressionOrder.length);
+  const byPage = new Map<string, { url: string; change: string; before: unknown; after: unknown }[]>();
+  for (const change of pageChanges) {
+    if (!change.regression) continue;
+    const kind =
+      change.type === "http-status-changed" && isSuccess(change.before) && !isSuccess(change.after) ? "became-non-200" : change.type;
+    const rows = byPage.get(change.url) || [];
+    rows.push({ url: change.url, change: kind, before: change.before, after: change.after });
+    byPage.set(change.url, rows);
+  }
+  const regressedPages = [...byPage.values()];
+  const pagesWith = (change: string) => regressedPages.filter((rows) => rows.some((row) => row.change === change)).length;
   return {
-    total: newHighIssues + newMediumIssues + pages.length,
-    newHighIssues,
-    newMediumIssues,
-    becameNonIndexable,
-    becameNon200,
-    pages: pages.slice(0, 20),
+    total: regressedPages.length,
+    newHighIssues: newIssues.filter((issue) => issue.severity === "high").length,
+    newMediumIssues: newIssues.filter((issue) => issue.severity === "medium").length,
+    becameNonIndexable: pagesWith("became-non-indexable"),
+    becameNon200: pagesWith("became-non-200"),
+    pages: regressedPages
+      .map((rows) => [...rows].sort((a, b) => rank(a.change) - rank(b.change))[0])
+      .sort((a, b) => rank(a.change) - rank(b.change))
+      .slice(0, 20),
   };
 }
 
@@ -1141,6 +1217,7 @@ function comparePageRows(previous: any, page: any) {
   return changes;
 }
 
+// previousScan carries its parsed saved result as `result`.
 function buildScanComparison(
   previousScan: any,
   pages: any[],
@@ -1148,7 +1225,7 @@ function buildScanComparison(
   limits: typeof scanLimits,
   scanVersion = SCAN_RESULT_VERSION,
 ) {
-  const previousResult = jsonParse<any>(previousScan?.result_json, null);
+  const previousResult = previousScan?.result;
   if (!previousScan || !previousResult) {
     return emptyScanComparison("no-previous-scan");
   }
@@ -1205,6 +1282,7 @@ function buildScanComparison(
     }
   }
 
+  const regressions = comparisonRegressions(newIssues, pageChanges);
   return {
     available: true,
     previousScanId: previousScan.id,
@@ -1213,10 +1291,10 @@ function buildScanComparison(
       newIssues: newIssues.length,
       fixedIssues: fixedIssues.length,
       severityChanges: severityChanges.length,
-      regressions: pageChanges.filter((change) => change.regression).length,
+      regressions: regressions.total,
       pageChanges: pageChanges.length,
     },
-    regressions: comparisonRegressions(newIssues, pageChanges),
+    regressions,
     newIssues,
     fixedIssues,
     severityChanges,
@@ -1225,12 +1303,13 @@ function buildScanComparison(
 }
 
 // The most recent completed scan of the same site and start URL that was
-// created before scanId — the baseline for "what changed" views.
+// created before scanId — the baseline for "what changed" views — with its
+// parsed saved result.
 function previousCompletedScan(siteId: string, scanId: string, startUrl: string) {
   const startKey = normalizedUrlKey(httpStartUrl(startUrl));
   const candidate = all<any>(
     `
-    SELECT id, created_at, url FROM scans
+    SELECT id, created_at, updated_at, url, status FROM scans
     WHERE site_id = ?
       AND status = 'completed'
       AND rowid < (SELECT rowid FROM scans WHERE id = ?)
@@ -1239,26 +1318,26 @@ function previousCompletedScan(siteId: string, scanId: string, startUrl: string)
     `,
     [siteId, scanId],
   ).find((row) => normalizedUrlKey(httpStartUrl(String(row.url || ""))) === startKey);
-  if (!candidate) return null;
-  const row = get<any>("SELECT result_json FROM scans WHERE id = ?", [candidate.id]);
-  return row ? { ...candidate, result_json: row.result_json } : null;
+  return candidate ? { ...candidate, result: cachedScanResult(candidate) } : null;
 }
 
 function httpStartUrl(value: string) {
   return /^https?:\/\//i.test(value) ? value : `https://${value}`;
 }
 
+const selectScanRow = "SELECT id, site_id, url, status, created_at, updated_at FROM scans WHERE id = ?";
+
 // Compare any two scans of the same site; baseId is the older baseline.
 export function compareScans(scanId: string, baseId: string) {
-  const current = get<any>("SELECT * FROM scans WHERE id = ?", [scanId]);
-  const base = get<any>("SELECT * FROM scans WHERE id = ?", [baseId]);
+  const current = get<any>(selectScanRow, [scanId]);
+  const base = get<any>(selectScanRow, [baseId]);
   if (!current || !base) throw new ScanRequestError(404, "Scan not found.");
   if (current.site_id !== base.site_id) {
     throw new ScanRequestError(400, "Scans can only be compared within the same site.");
   }
-  const result = jsonParse<any>(current.result_json, {}) || {};
+  const result = cachedScanResult(current) || {};
   const comparison = buildScanComparison(
-    base,
+    { ...base, result: cachedScanResult(base) },
     Array.isArray(result.pages) ? result.pages : [],
     Array.isArray(result.issues) ? result.issues : [],
     result.limits,
@@ -1267,13 +1346,31 @@ export function compareScans(scanId: string, baseId: string) {
   return filterComparison(comparison, siteIgnoreRules(current.site_id));
 }
 
+// Normalized keys of a saved result's distinct outlinks, computed once per
+// cached result for repeated page-drawer reads.
+const outlinkKeyCache = new WeakMap<object, string[]>();
+
+function outlinkKeys(pageLinks: { links: any[] }) {
+  let keys = outlinkKeyCache.get(pageLinks);
+  if (!keys) {
+    keys = pageLinks.links.map((link) => normalizedUrlKey(String(link?.href || "")));
+    outlinkKeyCache.set(pageLinks, keys);
+  }
+  return keys;
+}
+
+// The aria-label, title, or image alt that names a link without anchor text.
+function accessibleNameField(link: any) {
+  return link.accessibleName ? { accessibleName: String(link.accessibleName) } : {};
+}
+
 // One page of a saved scan with its issues, link graph, images, and the
 // changes since the same page in the previous completed scan.
 export function getScanPage(scanId: string, pageUrl: string) {
   if (!pageUrl) throw new ScanRequestError(400, "Pass the page URL as ?url=.");
-  const scan = getScan(scanId);
+  const scan = get<any>(selectScanRow, [scanId]);
   if (!scan) throw new ScanRequestError(404, "Scan not found.");
-  const result = scan.result || {};
+  const result = cachedScanResult(scan) || {};
   const pages: any[] = Array.isArray(result.pages) ? result.pages : [];
   // The saved page URL, then the URL it was requested as or landed on, then
   // any of those under the same normalized URL key.
@@ -1289,14 +1386,34 @@ export function getScanPage(scanId: string, pageUrl: string) {
     [page.url, page.finalUrl, page.requestedUrl].filter(Boolean).map((value) => normalizedUrlKey(String(value))),
   );
   const pageUrls = new Set([page.url, page.requestedUrl].filter(Boolean));
-  const issues = (Array.isArray(result.issues) ? result.issues : []).filter((issue: any) => pageUrls.has(issue.url));
+  const rules = siteIgnoreRules(scan.site_id);
+  const issues = (Array.isArray(result.issues) ? result.issues : [])
+    .filter((issue: any) => pageUrls.has(issue.url))
+    .map((issue: any) => (issueMatchesIgnore(issue, rules) ? { ...issue, ignored: true } : issue));
 
-  // Anchors come from the saved link inventory; checked links add any other
-  // source pages the capped inventory did not keep.
-  const inlinks = new Map<string, { from: string; anchor?: string; nofollow?: boolean }>();
-  for (const link of Array.isArray(result.linkInventory) ? result.linkInventory : []) {
-    if (link.type !== "internal" || !pageKeys.has(normalizedUrlKey(String(link.href || ""))) || inlinks.has(link.from)) continue;
-    inlinks.set(link.from, { from: link.from, anchor: link.anchor || undefined, nofollow: /\bnofollow\b/i.test(link.rel || "") });
+  // Scans keep every page's outlinks in pageLinks (capped per page); older
+  // scans only have the globally capped link inventory. Checked links add any
+  // other source pages either one did not keep.
+  const inlinks = new Map<string, { from: string; anchor?: string; accessibleName?: string; nofollow?: boolean }>();
+  const addInlink = (from: string, link: any) =>
+    inlinks.set(from, { from, anchor: link.anchor || undefined, ...accessibleNameField(link), nofollow: /\bnofollow\b/i.test(link.rel || "") });
+  const pageLinks = Array.isArray(result.pageLinks?.links) ? result.pageLinks : null;
+  let outlinkRows: any[];
+  if (pageLinks) {
+    const keys = outlinkKeys(pageLinks);
+    const linksHere = (index: number) => pageLinks.links[index]?.type === "internal" && pageKeys.has(keys[index]);
+    for (const [from, indexes] of Object.entries<number[]>(pageLinks.pages || {})) {
+      const index = indexes.find(linksHere);
+      if (index !== undefined) addInlink(from, pageLinks.links[index]);
+    }
+    outlinkRows = (pageLinks.pages?.[page.url] || []).map((index: number) => pageLinks.links[index]).filter(Boolean);
+  } else {
+    const inventory: any[] = Array.isArray(result.linkInventory) ? result.linkInventory : [];
+    for (const link of inventory) {
+      if (link.type !== "internal" || inlinks.has(link.from) || !pageKeys.has(normalizedUrlKey(String(link.href || "")))) continue;
+      addInlink(link.from, link);
+    }
+    outlinkRows = inventory.filter((link) => link.from === page.url);
   }
   const checkedLinks: any[] = Array.isArray(result.links) ? result.links : [];
   for (const link of checkedLinks) {
@@ -1306,18 +1423,19 @@ export function getScanPage(scanId: string, pageUrl: string) {
     }
   }
   const linkChecks = new Map(checkedLinks.map((link) => [link.url, link]));
-  const outlinks = (Array.isArray(result.linkInventory) ? result.linkInventory : [])
-    .filter((link: any) => link.from === page.url)
-    .map((link: any) => {
-      const check = linkChecks.get(link.href);
-      return {
-        href: link.href,
-        anchor: link.anchor,
-        rel: link.rel,
-        type: link.type,
-        ...(check ? { ok: check.ok, status: check.status, finalStatus: check.finalStatus, finalUrl: check.finalUrl } : {}),
-      };
-    });
+  const outlinks = outlinkRows.map((link: any) => {
+    const check = linkChecks.get(link.href);
+    return {
+      href: link.href,
+      anchor: link.anchor,
+      ...accessibleNameField(link),
+      rel: link.rel,
+      type: link.type,
+      ...(check ? { ok: check.ok, status: check.status, finalStatus: check.finalStatus, finalUrl: check.finalUrl } : {}),
+    };
+  });
+  // Every <a href> on the page, so the drawer can say when the list is capped.
+  const outlinkTotal = Math.max(outlinks.length, Number(page.internalLinks || 0) + Number(page.externalLinks || 0));
   const imageChecks = new Map((Array.isArray(result.images) ? result.images : []).map((image: any) => [image.url, image]));
   const images = (Array.isArray(result.imageInventory) ? result.imageInventory : [])
     .filter((image: any) => image.from === page.url)
@@ -1330,13 +1448,15 @@ export function getScanPage(scanId: string, pageUrl: string) {
     });
 
   const previousScan = previousCompletedScan(scan.site_id, scan.id, result.startUrl || scan.url);
-  const previousPages: any[] = jsonParse<any>(previousScan?.result_json, null)?.pages || [];
+  const previousPages: any[] = Array.isArray(previousScan?.result?.pages) ? previousScan.result.pages : [];
   const previousPage = previousPages.find((row) => pageKeys.has(normalizedUrlKey(String(row.url || ""))));
   return {
     page,
     issues,
     inlinks: [...inlinks.values()],
     outlinks,
+    outlinkTotal,
+    outlinksTruncated: outlinks.length < outlinkTotal,
     images,
     previous: previousScan && previousPage
       ? {
@@ -1499,15 +1619,32 @@ export async function testSiteRobots(siteId: string, input: { url?: unknown; use
   }
   const userAgent = String(input?.userAgent || "").trim() || "Googlebot";
   const robotsUrl = `${parsed.origin}/robots.txt`;
-  if (typeof input?.robotsTxt === "string") {
-    return { ...testRobots(input.robotsTxt, url, userAgent), robotsUrl, source: "provided", fetchedStatus: null };
-  }
-  const response = await fetchText(robotsUrl, 15000, { maxBytes: MAX_ROBOTS_BYTES }).catch(() => null);
+  // status: "matched" / "no-matching-rule" when rules were read; without a
+  // readable file, "robots-missing" (3xx/4xx: everything allowed) or
+  // "robots-unavailable" (429/5xx/network: Google treats the site as disallowed).
+  const withRules = (robotsTxt: string, source: string, fetchedStatus: number | null) => {
+    const verdict = testRobots(robotsTxt, url, userAgent);
+    return { ...verdict, status: verdict.matchedRule ? "matched" : "no-matching-rule", robotsUrl, source, fetchedStatus };
+  };
+  if (typeof input?.robotsTxt === "string") return withRules(input.robotsTxt, "provided", null);
+  let error = "";
+  const response = await fetchText(robotsUrl, 15000, { maxBytes: MAX_ROBOTS_BYTES }).catch((reason) => {
+    error = reason instanceof Error ? reason.message : "Could not fetch robots.txt";
+    return null;
+  });
   const fetchedStatus = response ? response.finalStatus : null;
-  if (response?.ok) {
-    return { ...testRobots(response.text, url, userAgent), robotsUrl, source: "live", fetchedStatus };
-  }
-  return { allowed: robotsResponseAllowsAll(fetchedStatus), matchedRule: null, userAgentGroup: "", robotsUrl, source: "live", fetchedStatus };
+  if (response?.ok) return withRules(response.text, "live", fetchedStatus);
+  const missing = robotsResponseAllowsAll(fetchedStatus);
+  return {
+    allowed: missing,
+    matchedRule: null,
+    userAgentGroup: "",
+    status: missing ? "robots-missing" : "robots-unavailable",
+    ...(missing ? {} : { error: error || `robots.txt answered HTTP ${fetchedStatus}.` }),
+    robotsUrl,
+    source: "live",
+    fetchedStatus,
+  };
 }
 
 // One request for a URL that cannot exist on the site. A 2xx answer, directly
@@ -1687,12 +1824,15 @@ function scanSummary(input: {
   checkedImages: any[];
   checkedAssets: any[];
   imageInventory: any[];
-  linkInventory: any[];
   parameterUrlCount: number;
   parameterUrlTargetCount: number;
   phase: string;
+  partial?: boolean;
 }) {
-  const { pages, checkedLinks, checkedImages, checkedAssets, imageInventory, linkInventory } = input;
+  const { pages, checkedLinks, checkedImages, checkedAssets, imageInventory } = input;
+  // Link counts come from every crawled page, not the capped link inventory.
+  const internalLinks = pages.reduce((total, page) => total + Number(page.internalLinks || 0), 0);
+  const externalLinks = pages.reduce((total, page) => total + Number(page.externalLinks || 0), 0);
   const pageLoadTimes = pages
     .map((page) => Number(page.loadMs))
     .filter((value) => Number.isFinite(value) && value >= 0)
@@ -1717,6 +1857,8 @@ function scanSummary(input: {
   const broken = (rows: any[]) => rows.filter((row) => !row.ok && row.failureKind !== "tls-certificate").length;
   return {
     phase: input.phase,
+    // A cancelled scan's counts and score cover only the pages it crawled.
+    ...(input.partial ? { partial: true } : {}),
     pages: pages.length,
     failedPages: pages.filter((page) => page.error).length,
     measuredPageLoads: pageLoadTimes.length,
@@ -1750,15 +1892,9 @@ function scanSummary(input: {
       (total, link) => total + Math.max(1, Number(link.referenceCount || 0)),
       0,
     ),
-    linkTags: Math.max(
-      linkInventory.length,
-      pages.reduce(
-        (total, page) => total + Number(page.internalLinks || 0) + Number(page.externalLinks || 0),
-        0,
-      ),
-    ),
-    internalLinks: linkInventory.filter((link) => link.type === "internal").length,
-    externalLinks: linkInventory.filter((link) => link.type === "external").length,
+    linkTags: internalLinks + externalLinks,
+    internalLinks,
+    externalLinks,
     parameterUrls: input.parameterUrlCount,
     parameterUrlTargets: input.parameterUrlTargetCount,
     imageTags: imageInventory.length,
@@ -1784,6 +1920,7 @@ function scanResult(input: {
   checkedAssets: any[];
   imageInventory: any[];
   linkInventory: any[];
+  pageLinks: { links: any[]; pages: Record<string, number[]> };
   parameterUrls: any[];
   parameterUrlCount: number;
   parameterUrlTargetCount: number;
@@ -1791,6 +1928,7 @@ function scanResult(input: {
   sitemap: any;
   softNotFound: any;
   limits: typeof scanLimits;
+  partial?: boolean;
   comparison?: any;
 }) {
   const sortedIssues = [...input.issues].sort((a, b) => issuePriority(b.severity) - issuePriority(a.severity));
@@ -1815,6 +1953,7 @@ function scanResult(input: {
     issueGroups: groupIssueSummary(sortedIssues),
     links: input.checkedLinks,
     linkInventory: input.linkInventory,
+    pageLinks: input.pageLinks,
     images: input.checkedImages,
     imageInventory: input.imageInventory,
     assets: input.checkedAssets,
@@ -1823,7 +1962,10 @@ function scanResult(input: {
   };
 }
 
-function saveScanResult(scanId: string, siteId: string, status: string, score: number, result: any) {
+// Status, counts, and the small list summary (summary_json) of a scan. The
+// result only needs summary, pages, and issues here (ignore rules adjust the
+// stored summary and score).
+function saveScanSummary(scanId: string, siteId: string, status: string, score: number, result: any) {
   const publicRow = applyIssueIgnores(
     { status, score, issue_count: result.issues.length, site_id: siteId, result },
     siteIgnoreRules(siteId),
@@ -1835,13 +1977,25 @@ function saveScanResult(scanId: string, siteId: string, status: string, score: n
         score = ?,
         pages_crawled = ?,
         issue_count = ?,
-        result_json = ?,
         summary_json = ?,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
     `,
-    [status, score, result.pages.length, result.issues.length, JSON.stringify(result), storedScanSummary(publicRow), scanId],
+    [status, score, result.pages.length, result.issues.length, storedScanSummary(publicRow), scanId],
   );
+}
+
+// The full result plus the scans row, written together (nothing when the
+// scan was deleted meanwhile).
+function saveScanResult(scanId: string, siteId: string, status: string, score: number, result: any) {
+  transaction(() => {
+    if (!get("SELECT 1 FROM scans WHERE id = ?", [scanId])) return;
+    run(
+      "INSERT INTO scan_results (scan_id, result_json) VALUES (?, ?) ON CONFLICT(scan_id) DO UPDATE SET result_json = excluded.result_json",
+      [scanId, JSON.stringify(result)],
+    );
+    saveScanSummary(scanId, siteId, status, score, result);
+  });
 }
 
 // Effective robots directives for a Google-style crawler: generic rules plus
@@ -2188,21 +2342,33 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   // Pacing only matters against real remote hosts; localhost targets crawl at full speed.
   const politeTarget = crawlSpeed === "polite" && !localHostFirst(new URL(startUrl).hostname);
   const localTarget = localHostFirst(new URL(startUrl).hostname);
+  // Polite crawls of remote sites fetch one page at a time with a delay; fast
+  // crawls and local hosts keep a few page requests in flight.
+  const pageConcurrency = politeTarget ? 1 : PAGE_FETCH_CONCURRENCY;
   let pageDelayMs = 400;
   let consecutiveRateLimits = 0;
   const startKey = normalizedUrlKey(startUrl);
   const visited = new Set<string>();
   const processedContent = new Set<string>();
   // Crawl outward from the start URL by links first. Sitemap URLs are only
-  // pulled when the link queue drains, so a large sitemap cannot use up the
-  // page budget before link-discovered pages are reached.
+  // pulled when the link queue drains and no page in flight can add links,
+  // so a large sitemap cannot use up the page budget before link-discovered
+  // pages are reached.
   const queued = new Set<string>([startKey]);
   const linkQueue = [startUrl];
   const sitemapTargets: { url: string; key: string }[] = [];
   let sitemapCursor = 0;
-  // Depth is the shortest known link path from the start URL. Pages reached
-  // only through the sitemap have no link depth.
-  const depthByUrl = new Map<string, number>([[startKey, 0]]);
+  // The internal link graph, for link depth (the shortest link path from the
+  // start URL, settled once every page is in): link target keys per crawled
+  // page key, and requested keys that redirected to another page key. Pages
+  // reached only through the sitemap have no link depth.
+  const linkTargetsByKey = new Map<string, string[]>();
+  const redirectedKeys = new Map<string, string>();
+  // Final responses of crawled pages by exact URL: a redirect landing on one
+  // of them reuses it instead of downloading the page again.
+  const crawledPageResponses = new Map<string, KnownResponse>();
+  // Crawl order of each page row (fetches finish out of order).
+  const pageOrder = new Map<any, number>();
   const discoveryByUrl = new Map<string, string>([[startKey, "start-url"]]);
   const internalInlinks = new Map<string, number>();
   // Responses the crawl already fetched, keyed by exact URL, so link and
@@ -2215,6 +2381,10 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   const checkedAssets: any[] = [];
   const imageInventory: any[] = [];
   const linkInventory: any[] = [];
+  // Every page's outlinks for the page drawer: each distinct link once in
+  // `links`, and per page URL the indexes of its links (see addPageLink).
+  const pageLinks = { links: [] as any[], pages: {} as Record<string, number[]> };
+  const pageLinkIndexes = new Map<string, number>();
   const parameterUrls: any[] = [];
   const parameterUrlKeys = new Set<string>();
   const parameterTargetKeys = new Set<string>();
@@ -2248,7 +2418,30 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   const startedAtMs = Date.now();
   let progressUrl = startUrl;
   let pendingChecks = 0;
-  let lastPersistAt = 0;
+  const inFlight = new Set<Promise<void>>();
+  let lastSummarySaveAt = 0;
+  let lastResultSaveAt = 0;
+  let savedResultSignature = "";
+  let crawlSettled = false;
+
+  // Page drawer outlinks: at most MAX_OUTLINKS_PER_PAGE per page and a bounded
+  // number of distinct links overall; getScanPage reports truncation from the
+  // page's own link counts.
+  const maxDistinctPageLinks = limits.maxLinkInventory * 2;
+  const addPageLink = (pageUrl: string, row: any) => {
+    const indexes = (pageLinks.pages[pageUrl] ||= []);
+    if (indexes.length >= MAX_OUTLINKS_PER_PAGE) return;
+    const key = JSON.stringify([row.href, row.anchor, row.accessibleName, row.rel, row.target, row.type]);
+    let index = pageLinkIndexes.get(key);
+    if (index === undefined) {
+      if (pageLinks.links.length >= maxDistinctPageLinks) return;
+      index = pageLinks.links.length;
+      pageLinkIndexes.set(key, index);
+      const { from: _from, ...link } = row;
+      pageLinks.links.push(link);
+    }
+    indexes.push(index);
+  };
 
   const recordRedirectIssues = (url: string, response: any) => {
     if (response.redirected) {
@@ -2343,48 +2536,100 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     };
   };
 
-  const currentResult = (comparison?: any) =>
+  const summaryInput = () => ({
+    issues,
+    pages,
+    checkedLinks,
+    checkedImages,
+    checkedAssets,
+    imageInventory,
+    parameterUrlCount: parameterUrlKeys.size,
+    parameterUrlTargetCount: parameterTargetKeys.size,
+    phase,
+  });
+
+  const currentResult = (comparison?: any, partial = false) =>
     scanResult({
+      ...summaryInput(),
       startUrl,
       origin,
-      phase,
       progress: progress(),
-      pages,
-      issues,
-      checkedLinks,
-      checkedImages,
-      checkedAssets,
-      imageInventory,
       linkInventory,
+      pageLinks,
       parameterUrls,
-      parameterUrlCount: parameterUrlKeys.size,
-      parameterUrlTargetCount: parameterTargetKeys.size,
       robots,
       sitemap,
       softNotFound,
       limits,
+      partial,
       comparison,
     });
 
-  // Progress saves serialize the whole result, so they are throttled; the
-  // final save (completed/cancelled) always writes everything.
-  const persistProgress = (force = false) => {
+  // Progress saves. The scans row (status, counts, and the list summary with
+  // live progress) is written at most once a second, and right away when the
+  // phase changes. The full result serializes every page and issue, so it is
+  // written at most every 10 seconds and at checkpoints (the end of the setup
+  // and crawl phases), and only when it gained pages, issues, or checked
+  // resources since the last write. Final saves (completed/cancelled) always
+  // write everything.
+  const persistProgress = (mode: "tick" | "phase" | "checkpoint" = "tick") => {
     if (signal.aborted) return;
     const now = Date.now();
-    if (!force && now - lastPersistAt < 1000) return;
-    lastPersistAt = now;
-    saveScanResult(scanId, scan.site_id, "running", 0, currentResult());
+    const signature = [pages.length, issues.length, checkedLinks.length, checkedImages.length, checkedAssets.length].join("|");
+    if (signature !== savedResultSignature && (mode === "checkpoint" || now - lastResultSaveAt >= RESULT_SAVE_INTERVAL_MS)) {
+      if (!crawlSettled) settlePages();
+      saveScanResult(scanId, scan.site_id, "running", 0, currentResult());
+      savedResultSignature = signature;
+      lastResultSaveAt = now;
+      lastSummarySaveAt = now;
+      return;
+    }
+    if (mode === "tick" && now - lastSummarySaveAt < SUMMARY_SAVE_INTERVAL_MS) return;
+    saveScanSummary(scanId, scan.site_id, "running", 0, {
+      scanVersion: SCAN_RESULT_VERSION,
+      startUrl,
+      phase,
+      limits,
+      progress: progress(),
+      summary: scanSummary(summaryInput()),
+      pages,
+      issues,
+    });
+    lastSummarySaveAt = now;
   };
 
-  // Aggregate counters (inlinks, depth, discovery) keep changing while the
-  // crawl runs; settle them on every page row before reporting.
+  // Link depth: the shortest path from the start URL over every crawled
+  // page's internal links, settled over the whole graph because pages finish
+  // out of order (a shorter path can turn up after a page was processed). A
+  // redirect gives its target the depth of the redirecting URL.
+  const linkDepths = () => {
+    const depths = new Map<string, number>([[startKey, 0]]);
+    const queue = [startKey];
+    const reach = (key: string, depth: number) => {
+      if ((depths.get(key) ?? Number.POSITIVE_INFINITY) <= depth) return;
+      depths.set(key, depth);
+      queue.push(key);
+    };
+    for (let index = 0; index < queue.length; index += 1) {
+      const key = queue[index];
+      const depth = depths.get(key) as number;
+      const redirected = redirectedKeys.get(key);
+      if (redirected) reach(redirected, depth);
+      for (const target of linkTargetsByKey.get(key) || []) reach(target, depth + 1);
+    }
+    return depths;
+  };
+
+  // Aggregate values (inlinks, depth, discovery) keep changing while the
+  // crawl runs; settle them on every page row, in crawl order, before reporting.
   const settlePages = () => {
+    const depths = linkDepths();
+    pages.sort((a, b) => (pageOrder.get(a) ?? 0) - (pageOrder.get(b) ?? 0));
     for (const page of pages) {
       const keys = [page.url, page.finalUrl || page.url, page.requestedUrl || page.url].map(normalizedUrlKey);
       page.internalInlinks = Math.max(Number(page.internalInlinks || 0), ...keys.map((key) => internalInlinks.get(key) || 0));
-      const depths = keys.map((key) => depthByUrl.get(key)).filter((depth): depth is number => depth !== undefined);
-      if (typeof page.depth === "number") depths.push(page.depth);
-      page.depth = depths.length ? Math.min(...depths) : null;
+      const pageDepths = keys.map((key) => depths.get(key)).filter((depth): depth is number => depth !== undefined);
+      page.depth = pageDepths.length ? Math.min(...pageDepths) : null;
       page.discovery = keys.map((key) => discoveryByUrl.get(key)).find(Boolean) || page.discovery || "internal-link";
       page.sitemapListed = sitemapUrlSet.has(keys[0]) || sitemapUrlSet.has(keys[1]);
       page.sitemapSourceListed = keys[2] !== keys[0] && sitemapUrlSet.has(keys[2]);
@@ -2393,17 +2638,63 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     }
   };
 
-  // Cancel keeps whatever evidence was gathered and stops the scan.
+  // Once the crawl stops (done, at its limits, or cancelled), link depth is
+  // final and deep HTML pages are flagged.
+  const settleCrawl = () => {
+    settlePages();
+    if (crawlSettled) return;
+    crawlSettled = true;
+    for (const page of pages) {
+      if (page.isHtml !== true || !(page.depth > 3)) continue;
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "low",
+        category: "crawl",
+        type: "crawl-depth-deep",
+        message: `Page is ${page.depth} clicks deep`,
+        recommendation: "Important pages should usually be reachable within three clicks from crawl entry points.",
+        evidence: { depth: page.depth, discovery: page.discovery },
+      });
+    }
+  };
+
+  // After a full crawl: sitemap pages the crawl never reached count as
+  // sitemap.notCrawledCount. When the sitemap lists more crawlable pages than
+  // the page limit, those were left out because of the limit.
+  const pushSitemapCoverageIssue = () => {
+    const notCrawledCount = sitemapTargets.filter((target) => !visited.has(target.key) && !processedContent.has(target.key)).length;
+    sitemap = { ...sitemap, notCrawledCount };
+    if (!notCrawledCount || sitemapTargets.length <= limits.maxPages) return;
+    pushScanIssue(issues, {
+      url: `${origin}/sitemap.xml`,
+      severity: "low",
+      category: "sitemap",
+      type: "sitemap-larger-than-crawl-limit",
+      message: `${notCrawledCount} of ${sitemapTargets.length} sitemap pages were not crawled because of the ${limits.maxPages}-page limit`,
+      recommendation: "Raise the site's crawl page limit for a full-site run, or scan important sections separately.",
+      evidence: {
+        sitemapUrls: (sitemap.urls || []).length,
+        sitemapPages: sitemapTargets.length,
+        notCrawled: notCrawledCount,
+        pageLimit: limits.maxPages,
+      },
+    });
+  };
+
+  // Cancel keeps whatever evidence was gathered, scored on the pages crawled
+  // (summary.partial), and stops the scan.
   const throwIfCancelled = () => {
     if (!signal.aborted) return;
-    settlePages();
-    saveScanResult(scanId, scan.site_id, "cancelled", 0, currentResult());
+    settleCrawl();
+    saveScanResult(scanId, scan.site_id, "cancelled", healthScore(pages, issues), currentResult(undefined, true));
     throw new Error("Scan cancelled.");
   };
 
   const nextCrawlUrl = () => {
     const linked = linkQueue.shift();
     if (linked) return linked;
+    // Pages still in flight may queue more links; those come first.
+    if (inFlight.size) return null;
     while (sitemapCursor < sitemapTargets.length) {
       const target = sitemapTargets[sitemapCursor++];
       if (visited.has(target.key) || processedContent.has(target.key)) continue;
@@ -2427,12 +2718,12 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   throwIfCancelled();
   sitemapUrlSet = new Set((sitemap.urls || []).map((url: string) => {
     const absolute = absoluteHttpUrl(String(url), origin);
-    return absolute ? pageCrawlTarget(absolute, startUrl)?.key || normalizedUrlKey(absolute) : normalizedUrlKey(url);
+    return absolute ? pageCrawlTarget(absolute, startKey)?.key || normalizedUrlKey(absolute) : normalizedUrlKey(url);
   }));
   const sitemapTargetKeys = new Set<string>();
   for (const sitemapUrl of sitemap.urls || []) {
     const absolute = absoluteHttpUrl(String(sitemapUrl), origin);
-    const target = absolute ? pageCrawlTarget(absolute, startUrl) : null;
+    const target = absolute ? pageCrawlTarget(absolute, startKey) : null;
     if (absolute && target?.parameterized) addParameterUrl(absolute, "sitemap", undefined, target.url);
     if (absolute && target && sameSiteUrl(absolute, startUrl) && !sitemapTargetKeys.has(target.key)) {
       sitemapTargetKeys.add(target.key);
@@ -2515,17 +2806,6 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       evidence: { sitemaps: sitemap.sitemaps },
     });
   }
-  if ((sitemap.urls || []).length > limits.maxQueuedUrls) {
-    pushScanIssue(issues, {
-      url: `${origin}/sitemap.xml`,
-      severity: "low",
-      category: "sitemap",
-      type: "sitemap-larger-than-crawl-limit",
-      message: `Sitemap has more URLs than this local scan will crawl (${(sitemap.urls || []).length})`,
-      recommendation: "Raise the local crawl limit for a full-site run, or scan important sections separately.",
-      evidence: { sitemapUrls: (sitemap.urls || []).length, crawlLimit: limits.maxQueuedUrls },
-    });
-  }
   softNotFound = await probeSoftNotFound(origin, signal);
   throwIfCancelled();
   if (softNotFound.soft404) {
@@ -2544,51 +2824,39 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       },
     });
   }
-  persistProgress(true);
+  persistProgress("checkpoint");
 
   phase = "crawling";
-  let fetchedPages = 0;
-  // The page budget counts page rows only: URLs that redirect to a page
-  // already crawled, or off the site, do not use it. Total requests stay
-  // bounded by the queue limit.
-  while (pages.length < limits.maxPages && visited.size < limits.maxQueuedUrls) {
-    throwIfCancelled();
-    if (consecutiveRateLimits >= 5) {
-      persistProgress(true);
-      throw new Error(
-        "The site keeps rate limiting the crawl (HTTP 429/503). Wait a while and scan again, or keep the polite crawl speed.",
-      );
-    }
-    const requestedUrl = nextCrawlUrl();
-    if (!requestedUrl) break;
-    const requestedKey = normalizedUrlKey(requestedUrl);
-    queued.delete(requestedKey);
-    if (visited.has(requestedKey) || processedContent.has(requestedKey)) continue;
-    visited.add(requestedKey);
-    if (politeTarget && fetchedPages > 0) {
-      await sleep(pageDelayMs * (0.75 + Math.random() * 0.5), signal);
-      throwIfCancelled();
-    }
-    fetchedPages += 1;
-    progressUrl = requestedUrl;
+  // One page: fetch it (retrying once after a 429/503), then audit it. The
+  // audit after the fetch runs without awaiting, so pages in flight never
+  // interleave their updates. Never rejects: request failures become
+  // crawl-failed rows, and a response arriving after a cancel is dropped (the
+  // cancel save already holds every processed page).
+  const crawlPage = async (requestedUrl: string, requestedKey: string, order: number) => {
     let current = requestedUrl;
     let currentKey = requestedKey;
-    let currentDepth = depthByUrl.get(requestedKey);
+    const pushPage = (page: any) => {
+      pageOrder.set(page, order);
+      pages.push(page);
+    };
+    const fetchPage = () =>
+      fetchText(requestedUrl, 15000, { signal, knownResponse: (url) => crawledPageResponses.get(url) });
 
     try {
       // loadMs times the request itself: sleeps and queue waits are excluded.
       let startedAt = Date.now();
-      let response = await fetchText(requestedUrl, 15000, { signal });
+      let response = await fetchPage();
       let loadMs = Date.now() - startedAt;
       if (response.finalStatus === 429 || response.finalStatus === 503) {
         // Back off once, honoring Retry-After, before recording the response.
         const retrySeconds = Math.min(Math.max(Number(response.retryAfter) || 5, 1), 30);
         await sleep(retrySeconds * 1000, signal);
-        throwIfCancelled();
+        if (signal.aborted) return;
         startedAt = Date.now();
-        response = await fetchText(requestedUrl, 15000, { signal });
+        response = await fetchPage();
         loadMs = Date.now() - startedAt;
       }
+      if (signal.aborted) return;
       consecutiveRateLimits =
         response.finalStatus === 429 || response.finalStatus === 503 ? consecutiveRateLimits + 1 : 0;
       crawledResources.set(requestedUrl, {
@@ -2610,7 +2878,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       if (response.redirectError) {
         recordRedirectIssues(requestedUrl, response);
         const finalUrl = response.url || requestedUrl;
-        pages.push({
+        pushPage({
           url: requestedUrl,
           finalUrl,
           requestedUrl,
@@ -2625,7 +2893,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           indexable: false,
           finalIndexable: false,
           indexabilityReason: response.redirectLoop ? "redirect-loop" : "redirect-failed",
-          depth: currentDepth ?? null,
+          depth: null,
           discovery: discoveryByUrl.get(requestedKey) || "internal-link",
           internalInlinks: internalInlinks.get(requestedKey) || 0,
           sitemapListed: sitemapUrlSet.has(requestedKey) || sitemapUrlSet.has(normalizedUrlKey(finalUrl)),
@@ -2635,7 +2903,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           assets: 0,
         });
         persistProgress();
-        continue;
+        return;
       }
       const finalUrl = response.url || requestedUrl;
       const finalKey = normalizedUrlKey(finalUrl);
@@ -2657,20 +2925,26 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           },
         });
         persistProgress();
-        continue;
+        return;
       }
       if (response.redirected) recordRedirectIssues(requestedUrl, response);
+      if (finalKey !== requestedKey) redirectedKeys.set(requestedKey, finalKey);
+      // A redirect to a page already crawled (reused, not downloaded again).
       if (processedContent.has(finalKey)) {
         persistProgress();
-        continue;
+        return;
       }
       processedContent.add(finalKey);
+      crawledPageResponses.set(finalUrl, {
+        status: response.finalStatus,
+        contentType: response.contentType,
+        contentLength: response.contentLength,
+        contentEncoding: response.contentEncoding,
+        xRobotsTag: response.xRobotsTag || "",
+      });
       if (finalKey !== requestedKey) {
         current = finalUrl;
         currentKey = finalKey;
-        const finalDepth = depthByUrl.get(finalKey);
-        if (finalDepth !== undefined && (currentDepth === undefined || finalDepth < currentDepth)) currentDepth = finalDepth;
-        if (currentDepth !== undefined) depthByUrl.set(finalKey, currentDepth);
         if (!discoveryByUrl.has(finalKey)) {
           discoveryByUrl.set(finalKey, discoveryByUrl.get(requestedKey) || "internal-link");
         }
@@ -2713,7 +2987,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
             evidence: { contentType: response.contentType },
           });
         }
-        pages.push({
+        pushPage({
           url: current,
           finalUrl,
           requestedUrl,
@@ -2733,7 +3007,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           indexable: false,
           finalIndexable: false,
           indexabilityReason: response.finalStatus >= 400 ? "http-error" : noindex ? "noindex" : "non-html",
-          depth: currentDepth ?? null,
+          depth: null,
           discovery: discoveryByUrl.get(currentKey) || "internal-link",
           internalInlinks: internalInlinks.get(currentKey) || 0,
           sitemapListed: sitemapUrlSet.has(currentKey) || sitemapUrlSet.has(finalKey),
@@ -2744,7 +3018,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           assets: 0,
         });
         persistProgress();
-        continue;
+        return;
       }
       const $ = cheerio.load(response.text);
       const baseHref = cleanText($("base[href]").first().attr("href") || "");
@@ -2809,6 +3083,9 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       hreflangByPage.set(current, hreflangTargets);
       const imageRows: any[] = [];
       const linkRows: any[] = [];
+      // Internal link targets of this page, for link depth once the crawl is done.
+      const linkTargets: string[] = [];
+      linkTargetsByKey.set(currentKey, linkTargets);
       const assetRows: any[] = [];
 
       // Resources remember every page that references them, so a failing
@@ -2935,6 +3212,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         };
         linkRows.push(row);
         if (linkInventory.length < limits.maxLinkInventory) linkInventory.push(row);
+        addPageLink(current, row);
         let linkCandidate = linksToCheck.get(absolute);
         if (!linkCandidate && linksToCheck.size < limits.maxLinksToCheck) {
           linkCandidate = {
@@ -2959,16 +3237,11 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           if (!source.anchor && row.anchor) source.anchor = row.anchor;
           linkCandidate.sources.set(current, source);
         }
-        const target = isInternal ? pageCrawlTarget(absolute, startUrl) : null;
+        const target = isInternal ? pageCrawlTarget(absolute, startKey) : null;
         if (target?.parameterized) addParameterUrl(absolute, "internal-link", current, target.url);
         if (target) {
           internalInlinks.set(target.key, (internalInlinks.get(target.key) || 0) + 1);
-          if (currentDepth !== undefined) {
-            const nextDepth = currentDepth + 1;
-            if (!depthByUrl.has(target.key) || nextDepth < Number(depthByUrl.get(target.key))) {
-              depthByUrl.set(target.key, nextDepth);
-            }
-          }
+          linkTargets.push(target.key);
           if (!discoveryByUrl.has(target.key)) discoveryByUrl.set(target.key, "internal-link");
         }
         if (
@@ -3072,17 +3345,6 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           message: "URL contains tracking parameters",
           recommendation: "Keep crawlable canonical URLs clean. Strip tracking parameters from internal links and canonicalize parameter variants.",
           evidence: { url: current },
-        });
-      }
-      if (currentDepth !== undefined && currentDepth > 3) {
-        pushScanIssue(issues, {
-          url: current,
-          severity: "low",
-          category: "crawl",
-          type: "crawl-depth-deep",
-          message: `Page is ${currentDepth} clicks deep`,
-          recommendation: "Important pages should usually be reachable within three clicks from crawl entry points.",
-          evidence: { depth: currentDepth, discovery: discoveryByUrl.get(currentKey) },
         });
       }
       if (!title) {
@@ -3902,7 +4164,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         metaRefresh,
         faviconCount,
         wordCount,
-        depth: currentDepth ?? null,
+        depth: null,
         discovery: discoveryByUrl.get(currentKey) || "internal-link",
         internalInlinks: internalInlinks.get(currentKey) || 0,
         sitemapListed:
@@ -3934,10 +4196,10 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         cssAssets: assetRows.filter((asset) => asset.type === "css").length,
         jsAssets: assetRows.filter((asset) => asset.type === "js").length,
       };
-      pages.push(page);
+      pushPage(page);
       persistProgress();
     } catch (error) {
-      if (signal.aborted) throwIfCancelled();
+      if (signal.aborted) return;
       // A page that never answered (DNS, TLS, timeout, reset) still gets a
       // page row, so it is visible in reports and counts in the health score.
       const message = error instanceof Error ? error.message : "Failed to crawl URL";
@@ -3952,7 +4214,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         recommendation: "Check DNS, TLS, firewall, redirects, and server availability.",
         evidence: { error: message, failureKind },
       });
-      pages.push({
+      pushPage({
         url: current,
         finalUrl: current,
         requestedUrl,
@@ -3963,7 +4225,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         indexable: false,
         finalIndexable: false,
         indexabilityReason: "crawl-failed",
-        depth: currentDepth ?? null,
+        depth: null,
         discovery: discoveryByUrl.get(currentKey) || "internal-link",
         internalInlinks: internalInlinks.get(currentKey) || 0,
         sitemapListed: sitemapUrlSet.has(currentKey),
@@ -3974,8 +4236,56 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       });
       persistProgress();
     }
+  };
+
+  // Up to pageConcurrency page requests in flight, taken from the queue in
+  // order. The page budget counts page rows plus requests in flight, so it is
+  // never overshot: URLs that redirect to a page already crawled, or off the
+  // site, do not use it. Total requests stay bounded by the queue limit.
+  let fetchedPages = 0;
+  let crawlSequence = 0;
+  try {
+    while (true) {
+      throwIfCancelled();
+      if (consecutiveRateLimits >= 5) {
+        // Keep the evidence gathered so far with the failed scan.
+        await Promise.all(inFlight);
+        persistProgress("checkpoint");
+        throw new Error(
+          "The site keeps rate limiting the crawl (HTTP 429/503). Wait a while and scan again, or keep the polite crawl speed.",
+        );
+      }
+      const canStart =
+        inFlight.size < pageConcurrency &&
+        pages.length + inFlight.size < limits.maxPages &&
+        visited.size < limits.maxQueuedUrls;
+      const requestedUrl = canStart ? nextCrawlUrl() : null;
+      if (!requestedUrl) {
+        if (!inFlight.size) break;
+        await Promise.race(inFlight);
+        continue;
+      }
+      const requestedKey = normalizedUrlKey(requestedUrl);
+      queued.delete(requestedKey);
+      if (visited.has(requestedKey) || processedContent.has(requestedKey)) continue;
+      visited.add(requestedKey);
+      if (politeTarget && fetchedPages > 0) {
+        await sleep(pageDelayMs * (0.75 + Math.random() * 0.5), signal);
+        throwIfCancelled();
+      }
+      fetchedPages += 1;
+      progressUrl = requestedUrl;
+      const job: Promise<void> = crawlPage(requestedUrl, requestedKey, crawlSequence++).finally(() => inFlight.delete(job));
+      inFlight.add(job);
+    }
+  } finally {
+    // Pages in flight finish (or drop their response after a cancel) before
+    // the scan moves on or ends, so nothing writes to it afterwards.
+    await Promise.all(inFlight);
   }
-  settlePages();
+  settleCrawl();
+  pushSitemapCoverageIssue();
+  persistProgress("checkpoint");
 
   // Resource checks: URLs the crawl already fetched reuse that response; the
   // rest run concurrently (6 at once, at most 2 per host, 1 at a time against
@@ -3985,7 +4295,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     const results: any[] = candidates.map((candidate) => crawledResources.get(candidate.url));
     const pendingIndexes = results.flatMap((result, index) => (result ? [] : [index]));
     pendingChecks = pendingIndexes.length;
-    persistProgress(true);
+    persistProgress("phase");
     await runBounded(
       pendingIndexes,
       (index) => siteHostKey(candidates[index].url),

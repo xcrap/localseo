@@ -5,7 +5,7 @@ import { CountUp, EmptyState, JsonBlock, MetricTile, MetricTileGrid, ReportSecti
 import { FilteredRows } from "../../data-table";
 import { ScanSection } from "./common";
 import { ScanIssuesTable } from "./issues";
-import { RobotsGroups, RobotsTester, softNotFoundEvidenceRow } from "./robots";
+import { RobotsGroups, RobotsTester, robotsFileSummary, softNotFoundEvidenceRow } from "./robots";
 import type { IssueCatalog } from "./issue-catalog";
 import { ScanAssetsTable, ScanSpeedPagesTable, pageCsvColumns, pageSortValues, speedVariant } from "./tables";
 
@@ -40,12 +40,20 @@ export function ScanCrawlEvidence({
   startUrl: string;
 }) {
   const sitemapRows = Array.isArray(result.sitemap?.sitemaps) ? result.sitemap.sitemaps : [];
+  const robotsFile = result.robots ? robotsFileSummary(result.robots) : null;
+  const sitemapEvidence = [
+    "URLs listed in sitemap files and used for crawl discovery.",
+    coverage.sitemapUrlsNotCrawled != null ? `${formatNumber(coverage.sitemapUrlsNotCrawled)} of them were not crawled in this scan.` : "",
+    coverage.storedSitemapUrls != null && coverage.sitemapUrls != null && coverage.storedSitemapUrls < coverage.sitemapUrls
+      ? `This report stores the first ${formatNumber(coverage.storedSitemapUrls)}.`
+      : "",
+  ].filter(Boolean).join(" ");
   const evidenceRows = [
     {
       area: "Robots.txt",
-      status: result.robots?.exists ? "Found" : "Missing",
-      tone: result.robots?.exists ? "good" : "warn",
-      evidence: result.robots?.url || `${result.origin || result.startUrl || ""}/robots.txt`,
+      status: robotsFile ? robotsFile.label : "Not recorded",
+      tone: robotsFile ? robotsFile.tone : "outline",
+      evidence: [result.robots?.url || `${result.origin || result.startUrl || ""}/robots.txt`, robotsFile?.text].filter(Boolean).join(" · "),
     },
     {
       area: "Disallow rules",
@@ -61,13 +69,13 @@ export function ScanCrawlEvidence({
     },
     {
       area: "Sitemap URLs found",
-      status: formatNumber(result.sitemap?.urls?.length || 0),
-      tone: result.sitemap?.urls?.length ? "good" : "warn",
-      evidence: "URLs loaded from sitemap files and used for crawl discovery.",
+      status: formatNumber(coverage.sitemapUrls),
+      tone: coverage.sitemapUrls ? "good" : "warn",
+      evidence: sitemapEvidence,
     },
   ];
   const coverageRows = [
-    { metric: "Pages crawled", count: coverage.pages, detail: `${formatNumber(coverage.sitemapUrls)} sitemap-listed pages` },
+    { metric: "Pages crawled", count: coverage.pages, detail: `${formatNumber(coverage.sitemapListedPages)} sitemap-listed pages` },
     { metric: "Indexable pages", count: coverage.indexablePages, detail: `${formatNumber(coverage.nonIndexablePages)} noindex/non-indexable · ${formatNumber(coverage.unknownIndexabilityPages)} unknown` },
     { metric: "Missing from sitemap", count: coverage.pagesMissingFromSitemap, detail: "Indexable crawled pages not listed in XML sitemaps", problem: true },
     { metric: "Noindex in sitemap", count: coverage.noindexPagesInSitemap, detail: "Non-indexable pages that still appear in XML sitemaps", problem: true },

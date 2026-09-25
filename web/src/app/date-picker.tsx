@@ -35,6 +35,9 @@ export function DatePicker({
 
 export type DateRange = { startDate: string; endDate: string };
 
+/** Search Console's final (non-fresh) data usually lags 2–3 days; default ranges end this many days ago. */
+export const GSC_FINAL_DATA_LAG_DAYS = 3;
+
 /** The `days`-long window ending `endOffsetDays` before today, as YYYY-MM-DD. */
 export function recentDateRange(days: number, endOffsetDays = 0): DateRange {
   const end = new Date();

@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpRight, Bot, FileSearch, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, type Site } from "../../api";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, toast } from "@/components/ui";
-import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatMs, formatNumber, keywordToolDefaultsLabel, preferredScanUrl, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
+import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
 import { cn } from "@/lib/utils";
 import { ScanTable } from "./scans/scan-table";
 import { CwvOverviewCard } from "../cwv";
@@ -267,7 +267,15 @@ function SiteCommandCenter({
   const latestScanSpeed = latestScan ? scanSpeedMetrics(latestScan) : null;
   const latestSeverity = latestScan ? scanSeverityCounts(latestScan) : null;
   const latestGscImport = summary?.latestGscImport;
-  const brokenLinks = Number(latestScanSummary.brokenLinks || 0);
+  const gscSourceText = latestGscImport?.source === "api" ? "API sync" : latestGscImport?.source === "csv" ? "CSV import" : "import";
+  // The date range arrives as startDate/endDate (or a nested range object).
+  const gscRange = latestGscImport?.range || latestGscImport;
+  const gscRangeText =
+    gscRange?.startDate || gscRange?.endDate ? ` covering ${formatDate(gscRange.startDate)} – ${formatDate(gscRange.endDate)}` : "";
+  const gscClicks = knownNumber(latestGscImport?.totals?.clicks);
+  const brokenLinks = knownNumber(latestScanSummary.brokenLinks);
+  // The dashboard sends at most 10 recent jobs, so a full list is a lower bound.
+  const aiJobs: any[] = summary?.latestAiJobs || [];
   // The tile color follows what the scan found, not merely that one exists.
   const technicalTone: ControlTileModel["tone"] = !latestScan
     ? "warn"
@@ -293,7 +301,7 @@ function SiteCommandCenter({
           : `${scanStatusLabel(latestScan.status)} · ${formatNumber(latestScan.pages_crawled)} pages`,
       tone: technicalTone,
       tip: latestScan
-        ? `Open issues found across ${formatNumber(latestScan.pages_crawled)} crawled pages${latestSeverity ? ` — ${formatNumber(latestSeverity.high)} high, ${formatNumber(latestSeverity.medium)} medium, ${formatNumber(latestSeverity.low)} low` : ""}, with ${formatNumber(latestScanSummary.checkedLinks || 0)} links checked. Opens the full scan report.`
+        ? `Open issues found across ${formatNumber(latestScan.pages_crawled)} crawled pages${latestSeverity ? ` — ${formatNumber(latestSeverity.high)} high, ${formatNumber(latestSeverity.medium)} medium, ${formatNumber(latestSeverity.low)} low` : ""}, with ${formatNumber(latestScanSummary.checkedLinks)} links checked. Opens the full scan report.`
         : "No crawl evidence saved yet. Run a scan to build the technical report.",
     },
     {
@@ -313,9 +321,9 @@ function SiteCommandCenter({
       key: "links",
       label: "Links",
       to: "/links",
-      value: latestScan ? <CountUp value={latestScanSummary.linkTags || 0} /> : "—",
-      status: latestScan ? `${formatNumber(brokenLinks)} broken` : "Needs scan",
-      tone: latestScan ? (brokenLinks ? "bad" : "good") : "warn",
+      value: latestScan ? <CountUp value={latestScanSummary.linkTags} /> : "—",
+      status: latestScan ? (brokenLinks === null ? "broken links not recorded" : `${formatNumber(brokenLinks)} broken`) : "Needs scan",
+      tone: latestScan ? (brokenLinks ? "bad" : brokenLinks === null ? "outline" : "good") : "warn",
       tip: latestScan
         ? "Link tags found in the last crawl. Opens the local link graph."
         : "Run a site scan to build the local link graph.",
@@ -324,7 +332,7 @@ function SiteCommandCenter({
       key: "organic",
       label: "Organic research",
       to: "/domain",
-      value: <CountUp value={summary?.savedKeywordCount || 0} />,
+      value: <CountUp value={summary?.savedKeywordCount} />,
       status: summary?.savedKeywordCount ? "keywords saved" : "ready for research",
       tone: summary?.savedKeywordCount ? "good" : "outline",
       tip: "Saved keywords in the local list. Local crawl pages feed the organic research screen.",
@@ -333,8 +341,8 @@ function SiteCommandCenter({
       key: "rank",
       label: "Rank tracking",
       to: "/rank",
-      value: <CountUp value={summary?.trackerCount || 0} />,
-      status: `${formatNumber(summary?.serpRunCount || 0)} SERP runs`,
+      value: <CountUp value={summary?.trackerCount} />,
+      status: `${formatNumber(summary?.serpRunCount)} SERP runs`,
       tone: summary?.trackerCount ? "good" : "outline",
       tip: "Tracked keywords and saved SERP position checks for this site.",
     },
@@ -342,23 +350,23 @@ function SiteCommandCenter({
       key: "gsc",
       label: "Search Console",
       to: "/gsc",
-      value: <CountUp value={summary?.gscImportCount || 0} />,
+      value: <CountUp value={summary?.gscImportCount} />,
       status: summary?.gscImportCount
-        ? `latest import: ${formatNumber(latestGscImport?.rowCount || 0)} rows`
+        ? `latest ${gscSourceText}: ${formatNumber(latestGscImport?.rowCount)} rows`
         : "ready for import",
       tone: summary?.gscImportCount ? "good" : "outline",
       tip: summary?.gscImportCount
-        ? `Local CSV imports. The latest has ${formatNumber(latestGscImport?.rowCount || 0)} rows and ${formatNumber(latestGscImport?.totals?.clicks || 0)} clicks.`
+        ? `Search Console API syncs and CSV imports saved locally. The latest ${gscSourceText}${gscRangeText} has ${formatNumber(latestGscImport?.rowCount)} rows${gscClicks !== null ? ` and ${formatNumber(gscClicks)} clicks` : ""}.`
         : "Import a Search Console CSV locally, or connect Google for live performance and inspection.",
     },
     {
       key: "ai",
       label: "AI lab",
       to: "/ai",
-      value: <CountUp value={summary?.latestAiJobs?.length || 0} />,
-      status: summary?.latestAiJobs?.length ? "jobs saved" : "ready for Codex",
-      tone: summary?.latestAiJobs?.length ? "good" : "outline",
-      tip: "Saved Codex jobs. Runs locally through the Codex CLI with medium reasoning.",
+      value: !summary ? "—" : <CountUp value={summary.aiJobCount ?? aiJobs.length} />,
+      status: aiJobs.length ? "recent jobs saved" : "ready for Codex",
+      tone: aiJobs.length ? "good" : "outline",
+      tip: "Saved Codex jobs for this site. Runs locally through the Codex CLI with medium reasoning.",
     },
   ];
 
@@ -786,7 +794,8 @@ export function SitesManager({
   function renderSiteRow(site: Site) {
     const scan = healthBySite.get(site.id);
     const scanned = Boolean(scan);
-    const score = Number(scan?.score || 0);
+    // Running or failed scans have no score yet: show "-", not 0.
+    const score = knownNumber(scan?.score);
     const isActive = activeSiteId === site.id;
     const sev = scanned ? scanSeverityCounts(scan) : { high: 0, medium: 0, low: 0 };
     const openWorkspace = () => {
@@ -820,7 +829,13 @@ export function SitesManager({
         <div className="hidden items-baseline gap-3 md:flex">
           {scanned ? (
             <>
-              <span className="metric w-14 shrink-0 text-right text-2xl leading-none" style={{ color: scoreTone(score) }}>{formatNumber(score)}</span>
+              <span
+                className="metric w-14 shrink-0 text-right text-2xl leading-none"
+                style={score === null ? undefined : { color: scoreTone(score) }}
+                title={scan.status === "cancelled" ? "Partial crawl: the scan was cancelled" : undefined}
+              >
+                {formatNumber(score)}
+              </span>
               <span className="w-44 shrink-0 truncate whitespace-nowrap text-xs text-muted-foreground">
                 <span className={sev.high ? "font-medium text-bad" : ""}>{formatNumber(sev.high)}</span> high ·{" "}
                 <span className={sev.medium ? "font-medium text-warn" : ""}>{formatNumber(sev.medium)}</span> med · {formatNumber(scan.pages_crawled)} pages

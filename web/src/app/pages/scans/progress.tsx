@@ -1,4 +1,5 @@
 import { MetricTile, MetricTileGrid, ProgressBar, ReportSection, StatusEvidenceTable, formatDuration, formatNumber, scanCoverageMetrics, scanCrawlLabel, scanIsActive, scanLiveProgress, scanPhaseKey, scanPhaseLabel } from "../../shared";
+import { robotsFileSummary } from "./robots";
 
 type ScanStepState = "complete" | "running" | "pending" | "failed" | "cancelled" | "skipped";
 
@@ -68,7 +69,8 @@ export function ScanProgressPanel({
 }) {
   const active = scanIsActive(scan);
   const live = scanLiveProgress(scan);
-  const robotsFound = result.robots?.exists ? "robots.txt found" : "robots.txt missing";
+  const robotsLabel = result.robots ? robotsFileSummary(result.robots).label : "";
+  const robotsFound = robotsLabel ? `robots.txt ${robotsLabel.charAt(0).toLowerCase()}${robotsLabel.slice(1)}` : "robots.txt not read yet";
   const sitemapFiles = Array.isArray(result.sitemap?.sitemaps) ? result.sitemap.sitemaps.length : 0;
   const pagesCrawled = Math.max(live.crawled, coverage.pages);
   const steps = [
@@ -80,7 +82,7 @@ export function ScanProgressPanel({
     {
       label: "Read robots and sitemap",
       detail: `${robotsFound} · ${formatNumber(sitemapFiles)} sitemap files`,
-      evidence: `${formatNumber(coverage.sitemapUrls)} sitemap URLs available for discovery.`,
+      evidence: `${formatNumber(coverage.sitemapUrls)} sitemap URLs available for discovery${coverage.sitemapUrlsNotCrawled != null ? ` · ${formatNumber(coverage.sitemapUrlsNotCrawled)} not crawled` : ""}.`,
     },
     {
       label: "Crawl pages",

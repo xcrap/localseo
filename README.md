@@ -32,9 +32,9 @@ data connectors only when you configure them.
 - **Organic research:** local crawl pages plus organic CSV imports for ranked keywords, top pages, traffic, and keyword counts.
 - **Links and backlinks:** local crawl link graph from scans, plus backlink CSV import for web-wide backlink rows, referring domains, and top linked pages. Backlinks are never generated locally. Follow state comes from the export's rel, Nofollow/UGC/Sponsored, or follow columns; rows without it stay unknown and the dofollow ratio covers known rows only.
 - **Site scans:** local crawler for titles, descriptions, metadata length, H1/H2, heading hierarchy, canonicals, noindex, robots, sitemap indexes, schema, social tags, page response timing, missing/generic/long image alt text, image dimensions, broken links, broken images, broken CSS/JS assets, duplicate titles/descriptions/content, issue groups, progress, detail inspection, and deletion.
-- **Search Console insights:** `GET /api/sites/:id/insights/gsc-crawl` matches stored Search Console pages with a completed crawl (pages with impressions that are noindex, non-200, redirected, canonicalized elsewhere, or blocked; indexable pages without impressions; Search Console pages the crawl never reached or that are missing from the sitemap; and pages whose CTR is under half the site's own median CTR at the same position). `insights/cannibalization` lists queries where two or more pages each earn at least 10% of the impressions (from query + page rows), with the URLs rank checks recorded for that keyword. `insights/decay` compares two windows of stored page data (default: the last 28 stored days vs the 28 before) and shows page changes between the latest two scans. URLs match ignoring protocol, `www`, fragments, and trailing slashes. Without the data they need, these answer `available: false` with the reason and never estimate.
+- **Search Console insights:** `GET /api/sites/:id/insights/gsc-crawl` matches stored Search Console pages with a completed crawl (pages with impressions that are noindex, non-200, redirected, canonicalized elsewhere, or blocked; indexable pages without impressions; Search Console pages the crawl never reached or that are missing from the sitemap; and pages whose CTR is under half the site's own median CTR at the same position). `insights/cannibalization` lists queries where two or more pages each earn at least 10% of the impressions (from query + page rows), with the URLs rank checks recorded for that keyword; `minImpressions` filters on the query's total impressions across its pages. `insights/decay` compares two windows of stored page data. By default they fit the newest page + date batch: the last 28 days that have rows (Search Console's final data stops a few days before a sync's end date) vs the 28 before, or two equal halves of at least 7 days when fewer than 56 days are stored, with a `note` saying so. Page changes come from the latest completed scan on or before each window's end. URLs match ignoring protocol, `www`, fragments, trailing slashes, and the case of percent-escapes. Without the data they need, these answer `available: false` with the reason and never estimate.
 - **Core Web Vitals:** `POST /api/sites/:id/cwv` runs PageSpeed Insights in the background (2 at a time) for chosen URLs, or the latest scan's most linked indexable pages. Field values are the Chrome UX Report p75 values PSI returns for the URL (`null` when Google has none), origin field data is kept separately, and lab values come from Lighthouse.
-- **Schedules and notifications:** each site can scan itself and each rank tracker can check its keywords daily, weekly, or monthly while the app is running (`/api/sites/:id/schedule`, `/api/rank-trackers/:id/schedule`). Everything is off until you turn it on. Next run times live in SQLite, so a restart picks them up; a job whose site or tracker is already running skips that slot. Notifications (`/api/notifications`) report scans with regressions against the previous scan, failed scheduled scans, and failed or partial scheduled rank checks; they stay until you delete them.
+- **Schedules and notifications:** each site can scan itself and each rank tracker can check its keywords daily, weekly, or monthly while the app is running (`/api/sites/:id/schedule`, `/api/rank-trackers/:id/schedule`). Everything is off until you turn it on. Monthly runs keep the day of the month the schedule was set on (the last day in shorter months). Next run times live in SQLite, so a restart picks them up; a job whose site or tracker is already running skips that slot. Notifications (`/api/notifications`) report scans with page regressions or new high-severity issues against the previous scan, failed scheduled scans, and failed or partial scheduled rank checks; they stay until you delete them.
 - **Client report:** `GET /api/scans/:id/report.html` (add `?download=1` to save it) is a single print-friendly HTML file with the scan summary, open issues by severity and category, issue groups with why/how to fix and example URLs, regressions, and a short Search Console summary when data is stored. `GET /api/scans/:id/ai-context` returns a compact brief for a Codex prioritisation job (`POST /api/ai/jobs` with `type`, `scanId`, and `context`).
 - **Brand lookup:** real web-search evidence without generated answer-model claims. Per-name numbers are raw counts of results returned for an exact-phrase search (first 10 checked), not a share of voice.
 - **Prompt explorer:** local Codex jobs saved in SQLite.
@@ -127,15 +127,27 @@ next start.
 - The browser app talks to the API same-origin (through the Vite proxy in
   development). Production sends no CORS headers; development allows only the
   `APP_URL` origin.
+- `/api` answers only requests whose `Host` is `localhost`, `127.0.0.1`,
+  `[::1]`, or the host of `APP_URL`, `API_URL`, or `API_HOST` (others get
+  HTTP 421), so a DNS-rebinding page cannot reach it under its own name. When
+  you open the app from another device, put that address in `APP_URL`.
 - `POST`/`PUT`/`DELETE` requests from another site (by `Origin` or
   `Sec-Fetch-Site`) are refused, and JSON routes require an
   `application/json` body.
 - Sessions are stored in SQLite: logging out revokes that session, and
-  `bun run admin:password` signs out every session. Repeated failed logins for
-  an email are paused for 15 minutes.
+  `bun run admin:password` signs out every session. After 5 login attempts for
+  an email that did not succeed, logins for it are paused for 15 minutes;
+  attempts count as they start, so parallel guesses share the limit.
 - Codex jobs run read-only in an empty temporary directory (never the app
   checkout with `database/` and `.env`), at most `CODEX_MAX_CONCURRENT` (default
-  2) at a time, with the prompt passed after `--`.
+  2) at a time, with the prompt passed after `--`. The read-only sandbox still
+  lets Codex read any file your user can, including `database/` (Google
+  refresh tokens). Jobs whose prompt embeds crawled page text — `scan.prioritize`,
+  and any job created with `context` or a `scanId` (for example from
+  `GET /api/scans/:id/ai-context`) — run without Codex web search, so text
+  planted on a crawled page cannot make Codex send data out in search queries.
+  Other job types keep web search; `ai_jobs.web_search` records which mode a
+  job used.
 
 ## Local Data Model
 

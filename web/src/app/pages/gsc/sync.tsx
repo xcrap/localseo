@@ -3,7 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { api, type GscStatus, type GscSyncResult } from "../../../api";
 import { Button, toast } from "@/components/ui";
 import { ReportSection, formatNumber } from "../../shared";
-import { DateRangeFields, recentDateRange, type DateRange } from "../../date-picker";
+import { DateRangeFields, GSC_FINAL_DATA_LAG_DAYS, recentDateRange, type DateRange } from "../../date-picker";
 import { gscLiveProperty } from "./connection";
 import { DimensionCheckboxes } from "./tables";
 
@@ -20,8 +20,9 @@ export function GscSyncPanel({
   onSynced: (result: GscSyncResult) => void;
   onOpenConnection: () => void;
 }) {
-  // Search Console data lags by about two days, so the default window ends then.
-  const [range, setRange] = useState<DateRange>(() => recentDateRange(28, 2));
+  // Google's final data lags 2–3 days, so the default window ends 3 days ago.
+  // It spans 56 days: the two 28-day periods Content decay compares.
+  const [range, setRange] = useState<DateRange>(() => recentDateRange(56, GSC_FINAL_DATA_LAG_DAYS));
   const [dimensions, setDimensions] = useState<string[]>(["query", "page"]);
   const [syncing, setSyncing] = useState(false);
   const property = gscLiveProperty(status);
@@ -59,6 +60,27 @@ export function GscSyncPanel({
         <div className="grid gap-3 sm:grid-cols-2 lg:max-w-2xl">
           <DateRangeFields value={range} onChange={setRange} />
         </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted-foreground">Presets</span>
+          <Button type="button" size="sm" variant="outline" className="h-7 px-2.5 text-xs" onClick={() => setRange(recentDateRange(28, GSC_FINAL_DATA_LAG_DAYS))}>
+            Last 28 days
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 px-2.5 text-xs"
+            onClick={() => {
+              setRange(recentDateRange(56, GSC_FINAL_DATA_LAG_DAYS));
+              setDimensions(["page", "date"]);
+            }}
+          >
+            Content decay: 56 days · page + date
+          </Button>
+        </div>
+        <p className="text-xs leading-5 text-muted-foreground">
+          Google's final Search Console data lags 2–3 days, so ranges end 3 days ago by default. Days closer to today may be missing or still change.
+        </p>
         <DimensionCheckboxes value={dimensions} onChange={setDimensions} idPrefix="gsc-sync-dimension" />
         <p className="text-xs leading-5 text-muted-foreground">
           More dimensions mean more rows: query + page + date can reach Google's limits on large sites. Rows with fewer dimensions keep totals that match the Search Console UI more closely.

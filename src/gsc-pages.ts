@@ -1,6 +1,7 @@
 import { all, get, jsonParse } from "./db";
 import { badRequest } from "./errors";
-import { ensureGscRows, type GscImportRecord, requireDate } from "./gsc";
+import { ensureGscRows, type GscImportRecord } from "./gsc";
+import { requireDate } from "./input";
 import { pageUrlKey } from "./page-url";
 
 // Reads stored Search Console batches (API syncs and CSV imports in
@@ -46,6 +47,11 @@ export function shiftDate(date: string, days: number) {
   const value = new Date(`${date}T00:00:00Z`);
   value.setUTCDate(value.getUTCDate() + days);
   return value.toISOString().slice(0, 10);
+}
+
+// Days from startDate to endDate, both included.
+export function dayCount(startDate: string, endDate: string) {
+  return Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000) + 1;
 }
 
 function siteBatches(siteId: string) {
@@ -224,21 +230,34 @@ export function gscRangeView(data: GscPageData) {
   };
 }
 
-// The last date of stored page data (without the query dimension): the newest
-// page + date batch's last row date, else the latest window end of a page batch.
-export function latestPageDataDate(siteId: string) {
+// The dates stored page data (without the query dimension) can answer by
+// default. The newest page + date batch answers from the start of the window it
+// was synced or imported for (else its first row date) to its last row date:
+// Search Console's final data stops a few days before a sync's end date, and
+// those trailing days have no rows rather than zero clicks. Without such a
+// batch only the latest page window's end is known (startDate null).
+export function pageDataRange(siteId: string) {
   const batches = siteBatches(siteId).filter(
     ({ dimensions }) => dimensions.includes("page") && !dimensions.includes("query"),
   );
   const dated = batches.find(({ dimensions }) => dimensions.includes("date"));
   if (dated) {
     ensureGscRows(dated.record);
-    const row = get<{ endDate: string | null }>(
-      "SELECT max(date) AS endDate FROM gsc_rows WHERE import_id = ? AND date IS NOT NULL AND date != ''",
+    const rows = get<{ firstDate: string | null; lastDate: string | null }>(
+      "SELECT min(date) AS firstDate, max(date) AS lastDate FROM gsc_rows WHERE import_id = ? AND date IS NOT NULL AND date != ''",
       [dated.record.id],
     );
-    if (row?.endDate) return row.endDate;
+    if (rows?.firstDate && rows.lastDate) {
+      const { start_date: requestedStart, end_date: requestedEnd } = dated.record;
+      const requested = requestedStart && requestedEnd ? { startDate: requestedStart, endDate: requestedEnd } : null;
+      return {
+        startDate: requested?.startDate ?? rows.firstDate,
+        endDate: requested && requested.endDate < rows.lastDate ? requested.endDate : rows.lastDate,
+        requestedEndDate: requested?.endDate ?? null,
+      };
+    }
   }
   const ends = batches.map(({ record }) => record.end_date).filter((date): date is string => Boolean(date));
-  return ends.sort().at(-1) ?? null;
+  const endDate = ends.sort().at(-1);
+  return endDate ? { startDate: null, endDate, requestedEndDate: null } : null;
 }

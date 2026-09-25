@@ -28,21 +28,31 @@ function requireInterval(value: unknown, field: string) {
   return value as ScheduleInterval;
 }
 
-function addInterval(date: Date, interval: ScheduleInterval) {
+// Monthly slots land on `monthDay` (the day of the month the schedule was set),
+// clamped to the month's last day: a schedule set on Jan 31 runs Feb 28, then
+// Mar 31, never Mar 3 and never drifting to the 28th.
+function addInterval(date: Date, interval: ScheduleInterval, monthDay: number) {
   const next = new Date(date);
   if (interval === "daily") next.setUTCDate(next.getUTCDate() + 1);
   if (interval === "weekly") next.setUTCDate(next.getUTCDate() + 7);
-  if (interval === "monthly") next.setUTCMonth(next.getUTCMonth() + 1);
+  if (interval === "monthly") {
+    next.setUTCDate(1);
+    next.setUTCMonth(next.getUTCMonth() + 1);
+    const lastDay = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0)).getUTCDate();
+    next.setUTCDate(Math.min(monthDay, lastDay));
+  }
   return next;
 }
 
 // The first slot after `now` on the cadence that began at `from`: a job missed
-// while the app was closed runs once, not once per missed slot.
-function nextRunAfter(from: string | null, interval: ScheduleInterval, now: Date) {
+// while the app was closed runs once, not once per missed slot. Without a
+// stored anchor day, monthly slots keep `from`'s day of the month.
+export function nextRunAfter(from: string | null, interval: ScheduleInterval, now: Date, anchorDay?: number | null) {
   let next = from ? new Date(from) : now;
   if (Number.isNaN(next.getTime()) || now.getTime() - next.getTime() > 400 * DAY_MS) next = now;
+  const monthDay = anchorDay || next.getUTCDate();
   do {
-    next = addInterval(next, interval);
+    next = addInterval(next, interval, monthDay);
   } while (next <= now);
   return next.toISOString();
 }
@@ -93,14 +103,21 @@ export function getSiteSchedule(siteId: string) {
   };
 }
 
-// Setting the same interval again keeps the planned next run.
+// Setting the same interval again keeps the planned next run and its anchor
+// day; a new interval starts its cadence now, anchored on today's day of month.
 export function setScanSchedule(siteId: string, input: { scanInterval?: unknown }) {
   const site = get<any>("SELECT id, scan_schedule, scan_next_run_at FROM sites WHERE id = ?", [siteId]);
   if (!site) throw notFound("Site not found.");
   const interval = requireInterval(input.scanInterval, "scanInterval");
-  const unchanged = interval === normalizeInterval(site.scan_schedule) && site.scan_next_run_at;
-  const next = interval === "off" ? null : unchanged ? site.scan_next_run_at : nextRunAfter(null, interval, new Date());
-  run("UPDATE sites SET scan_schedule = ?, scan_next_run_at = ? WHERE id = ?", [interval, next, siteId]);
+  if (interval === normalizeInterval(site.scan_schedule) && site.scan_next_run_at) return getSiteSchedule(siteId);
+  const now = new Date();
+  const next = interval === "off" ? null : nextRunAfter(null, interval, now);
+  run("UPDATE sites SET scan_schedule = ?, scan_next_run_at = ?, scan_schedule_day = ? WHERE id = ?", [
+    interval,
+    next,
+    next ? now.getUTCDate() : null,
+    siteId,
+  ]);
   return getSiteSchedule(siteId);
 }
 
@@ -108,14 +125,18 @@ export function setTrackerSchedule(trackerId: string, input: { interval?: unknow
   const tracker = get<any>("SELECT id, site_id, schedule_interval, next_check_at FROM rank_trackers WHERE id = ?", [trackerId]);
   if (!tracker) throw notFound("Tracker not found.");
   const interval = requireInterval(input.interval, "interval");
-  const unchanged = interval === normalizeInterval(tracker.schedule_interval) && tracker.next_check_at;
-  const next = interval === "off" ? null : unchanged ? tracker.next_check_at : nextRunAfter(null, interval, new Date());
-  run("UPDATE rank_trackers SET schedule_interval = ?, next_check_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [
-    interval,
-    next,
-    trackerId,
-  ]);
+  if (interval === normalizeInterval(tracker.schedule_interval) && tracker.next_check_at) return getSiteSchedule(tracker.site_id);
+  const now = new Date();
+  const next = interval === "off" ? null : nextRunAfter(null, interval, now);
+  run(
+    "UPDATE rank_trackers SET schedule_interval = ?, next_check_at = ?, schedule_day = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [interval, next, next ? now.getUTCDate() : null, trackerId],
+  );
   return getSiteSchedule(tracker.site_id);
+}
+
+function scanActive(siteId: string) {
+  return Boolean(get("SELECT 1 FROM scans WHERE site_id = ? AND status IN ('queued', 'running')", [siteId]));
 }
 
 // Each due job first moves its next run time forward (only if nobody else did),
@@ -128,18 +149,20 @@ async function startDueScans(now: Date) {
   );
   for (const site of due) {
     const claimed = run("UPDATE sites SET scan_next_run_at = ? WHERE id = ? AND scan_schedule = ? AND scan_next_run_at IS ?", [
-      nextRunAfter(site.scan_next_run_at, normalizeInterval(site.scan_schedule), now),
+      nextRunAfter(site.scan_next_run_at, normalizeInterval(site.scan_schedule), now, site.scan_schedule_day),
       site.id,
       site.scan_schedule,
       site.scan_next_run_at,
     ]);
     if (!claimed.changes) continue;
-    if (get("SELECT 1 FROM scans WHERE site_id = ? AND status IN ('queued', 'running')", [site.id])) continue;
+    if (scanActive(site.id)) continue;
     try {
       if (!site.domain) throw new Error("Set a site domain before scheduling scans.");
       const url = await resolveSavedSiteScanUrl(site);
       if (!url) throw unreachableScanUrlError(site.domain);
-      const scan = await startScan(site.id, url);
+      // The URL probe takes a while; a manual scan may have started meanwhile.
+      if (scanActive(site.id)) continue;
+      const scan = await startScan(site.id, url, { reachable: true });
       run("UPDATE scans SET scheduled = 1 WHERE id = ?", [scan.id]);
       run("UPDATE sites SET scan_last_run_at = ? WHERE id = ?", [now.toISOString(), site.id]);
     } catch (error) {
@@ -163,7 +186,7 @@ function startDueRankChecks(now: Date) {
     const claimed = run(
       "UPDATE rank_trackers SET next_check_at = ? WHERE id = ? AND schedule_interval = ? AND next_check_at IS ?",
       [
-        nextRunAfter(tracker.next_check_at, normalizeInterval(tracker.schedule_interval), now),
+        nextRunAfter(tracker.next_check_at, normalizeInterval(tracker.schedule_interval), now, tracker.schedule_day),
         tracker.id,
         tracker.schedule_interval,
         tracker.next_check_at,
@@ -189,37 +212,52 @@ function plural(count: number, word: string) {
   return `${count} ${word}${count === 1 ? "" : "s"}`;
 }
 
+function count(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+// A scan regressed when pages gained a regression flag (regressions.total, the
+// same number as summary.regressions) or it has new high-severity issues. The
+// page count is read from the summary so comparisons saved while total still
+// included new issues count pages too.
 function notifyRegressions(row: { id: string; site_id: string; site_name: string }) {
   const comparison = getScan(row.id)?.result?.comparison;
   const regressions = comparison?.available ? comparison.regressions : null;
-  if (!regressions || !(regressions.total > 0)) return;
-  const parts = [
-    regressions.newHighIssues ? `${plural(regressions.newHighIssues, "new high-severity issue")}` : "",
-    regressions.newMediumIssues ? `${plural(regressions.newMediumIssues, "new medium-severity issue")}` : "",
-    regressions.becameNonIndexable ? `${plural(regressions.becameNonIndexable, "page")} became non-indexable` : "",
-    regressions.becameNon200 ? `${plural(regressions.becameNon200, "page")} stopped answering HTTP 200` : "",
+  if (!regressions) return;
+  const pageRegressions = count(comparison.summary?.regressions ?? regressions.total);
+  const newHighIssues = count(regressions.newHighIssues);
+  const newMediumIssues = count(regressions.newMediumIssues);
+  if (!pageRegressions && !newHighIssues) return;
+  const headline = [
+    pageRegressions ? plural(pageRegressions, "page regression") : "",
+    newHighIssues ? plural(newHighIssues, "new high-severity issue") : "",
+  ].filter(Boolean);
+  const details = [
+    ...headline,
+    newMediumIssues ? plural(newMediumIssues, "new medium-severity issue") : "",
+    regressions.becameNonIndexable ? `${plural(count(regressions.becameNonIndexable), "page")} became non-indexable` : "",
+    regressions.becameNon200 ? `${plural(count(regressions.becameNon200), "page")} stopped answering HTTP 200` : "",
   ].filter(Boolean);
   createNotification({
     siteId: row.site_id,
     type: "scan-regression",
-    title: `${plural(regressions.total, "regression")} in the latest scan of ${row.site_name}`,
-    body: `Compared with the previous scan: ${parts.join(", ")}.`,
+    title: `${headline.join(", ")} in the latest scan of ${row.site_name}`,
+    body: `Compared with the previous scan: ${details.join(", ")}.`,
     data: {
       scanId: row.id,
       baseScanId: comparison.previousScanId ?? null,
-      regressions: {
-        total: regressions.total,
-        newHighIssues: regressions.newHighIssues,
-        newMediumIssues: regressions.newMediumIssues,
-        becameNonIndexable: regressions.becameNonIndexable,
-        becameNon200: regressions.becameNon200,
-      },
+      pageRegressions,
+      newHighIssues,
+      newMediumIssues,
     },
   });
 }
 
 // Every finished scan (manual, MCP, or scheduled) is checked once for
-// regressions; failed scheduled scans raise their own notice.
+// regressions; failed scheduled scans raise their own notice. A scan is
+// claimed (notified_at set only if still unset) before its notice is written,
+// so two ticks or two app processes never notify the same scan twice.
 function notifyFinishedScans(now: Date) {
   const rows = all<any>(
     `
@@ -232,6 +270,8 @@ function notifyFinishedScans(now: Date) {
     `,
   );
   for (const row of rows) {
+    const claimed = run("UPDATE scans SET notified_at = ? WHERE id = ? AND notified_at IS NULL", [now.toISOString(), row.id]);
+    if (!claimed.changes) continue;
     try {
       if (row.status === "completed") notifyRegressions(row);
       if (row.status === "failed" && row.scheduled) {
@@ -246,7 +286,6 @@ function notifyFinishedScans(now: Date) {
     } catch (error) {
       console.error(`Scheduler could not check scan ${row.id}:`, error);
     }
-    run("UPDATE scans SET notified_at = ? WHERE id = ?", [now.toISOString(), row.id]);
   }
 }
 
@@ -260,6 +299,8 @@ function notifyScheduledRankRuns(now: Date) {
     `,
   );
   for (const row of rows) {
+    const claimed = run("UPDATE rank_runs SET notified_at = ? WHERE id = ? AND notified_at IS NULL", [now.toISOString(), row.id]);
+    if (!claimed.changes) continue;
     if (row.status === "failed" || row.status === "partial") {
       createNotification({
         siteId: row.site_id,
@@ -276,7 +317,6 @@ function notifyScheduledRankRuns(now: Date) {
         },
       });
     }
-    run("UPDATE rank_runs SET notified_at = ? WHERE id = ?", [now.toISOString(), row.id]);
   }
 }
 

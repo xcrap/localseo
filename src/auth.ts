@@ -176,8 +176,11 @@ export function revokeSessionToken(token: string | undefined, config = getAuthCo
   if (session) run("DELETE FROM admin_sessions WHERE id = ?", [session.sessionId]);
 }
 
-// In-memory brute-force guard for the login form: after too many failures for
-// one email, further attempts (even correct ones) wait until the window resets.
+// In-memory brute-force guard for the login form: after too many failed
+// attempts for one email, further attempts (even correct ones) wait until the
+// window resets. An attempt counts as failed from the moment it starts (before
+// the slow password check), so parallel attempts cannot all slip under the
+// limit; a successful sign-in clears the count.
 const LOGIN_MAX_FAILURES = 5;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const loginFailures = new Map<string, { count: number; resetAt: number }>();
@@ -186,24 +189,19 @@ function loginKey(email: string) {
   return email.trim().toLowerCase();
 }
 
-export function loginRetryAfterSeconds(email: string) {
-  const entry = loginFailures.get(loginKey(email));
-  if (!entry) return 0;
-  if (entry.resetAt <= Date.now()) {
-    loginFailures.delete(loginKey(email));
+// Seconds to wait when the limit is reached (the attempt is not counted), else
+// 0 after counting this attempt.
+export function beginLoginAttempt(email: string) {
+  const key = loginKey(email);
+  const now = Date.now();
+  const entry = loginFailures.get(key);
+  if (!entry || entry.resetAt <= now) {
+    loginFailures.set(key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
     return 0;
   }
-  return entry.count >= LOGIN_MAX_FAILURES ? Math.ceil((entry.resetAt - Date.now()) / 1000) : 0;
-}
-
-export function recordLoginFailure(email: string) {
-  const key = loginKey(email);
-  const entry = loginFailures.get(key);
-  if (!entry || entry.resetAt <= Date.now()) {
-    loginFailures.set(key, { count: 1, resetAt: Date.now() + LOGIN_WINDOW_MS });
-  } else {
-    entry.count += 1;
-  }
+  if (entry.count >= LOGIN_MAX_FAILURES) return Math.ceil((entry.resetAt - now) / 1000);
+  entry.count += 1;
+  return 0;
 }
 
 export function clearLoginFailures(email: string) {

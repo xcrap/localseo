@@ -26,7 +26,11 @@ const schemaRules: Record<string, SchemaRule> = {
     required: ["name", "offers|review|aggregateRating"],
     nested: { offers: "Offer|AggregateOffer", review: "Review", aggregateRating: "AggregateRating" },
   },
-  Offer: { nestedOnly: true, required: ["price", "priceCurrency"] },
+  // Google accepts the price inside a PriceSpecification as well.
+  Offer: {
+    nestedOnly: true,
+    required: ["price|priceSpecification.price", "priceCurrency|priceSpecification.priceCurrency"],
+  },
   AggregateOffer: { nestedOnly: true, required: ["lowPrice", "priceCurrency"] },
   AggregateRating: { required: ["ratingValue", "ratingCount|reviewCount"], requiredWhenTopLevel: ["itemReviewed"] },
   Review: { required: ["author", "reviewRating"], requiredWhenTopLevel: ["itemReviewed"], nested: { reviewRating: "Rating" } },
@@ -83,6 +87,8 @@ export type StructuredDataItem = {
 };
 
 const MAX_ITEMS_PER_PAGE = 20;
+// Items described per page before nested ones are dropped.
+const MAX_CANDIDATES_PER_PAGE = 100;
 const MAX_MICRODATA_SCOPES = 200;
 
 type Node = Record<string, unknown>;
@@ -139,12 +145,15 @@ function hasPath(value: unknown, path: string[], refs: Refs): boolean {
   return isNode(node) && hasPath(node[path[0]], path.slice(1), refs);
 }
 
+// nested collects every child node checked as part of its parent (inline or
+// resolved from an @id reference), so it is not checked again on its own.
 function checkRule(
   node: Node,
   ruleName: string,
   context: { prefix: string; topLevel: boolean; last: boolean; depth: number },
   refs: Refs,
   missing: { required: Set<string>; recommended: Set<string> },
+  nested: Set<Node>,
 ) {
   const rule = schemaRules[ruleName];
   const label = (property: string) =>
@@ -168,6 +177,7 @@ function checkRule(
       .filter(isNode);
     const options = nestedRules.split("|");
     for (const [index, child] of children.entries()) {
+      nested.add(child);
       const ownRule = asArray(child["@type"])
         .map((type) => ruleNameFor(typeName(type), true))
         .find((name) => options.includes(name));
@@ -177,18 +187,24 @@ function checkRule(
         { prefix: `${context.prefix}${property}.`, topLevel: false, last: index === children.length - 1, depth: context.depth + 1 },
         refs,
         missing,
+        nested,
       );
     }
   }
 }
 
-function describeItem(node: Node, format: StructuredDataItem["format"], refs: Refs): StructuredDataItem | null {
+function describeItem(
+  node: Node,
+  format: StructuredDataItem["format"],
+  refs: Refs,
+  nested: Set<Node>,
+): StructuredDataItem | null {
   const types = asArray(node["@type"]).map(typeName).filter(Boolean);
   if (!types.length) return null;
   const type = types.find((name) => ruleNameFor(name)) || types[0];
   const ruleName = ruleNameFor(type);
   const missing = { required: new Set<string>(), recommended: new Set<string>() };
-  if (ruleName) checkRule(node, ruleName, { prefix: "", topLevel: true, last: false, depth: 0 }, refs, missing);
+  if (ruleName) checkRule(node, ruleName, { prefix: "", topLevel: true, last: false, depth: 0 }, refs, missing, nested);
   return { format, type, missingRequired: [...missing.required], missingRecommended: [...missing.recommended] };
 }
 
@@ -247,11 +263,16 @@ export function readStructuredData($: CheerioAPI) {
   const refs: Refs = new Map();
   collectIds(documents, refs);
   const microdata = microdataRoots($);
-  const items: StructuredDataItem[] = [];
+  // Every candidate is described first; nodes another item checked as its
+  // child (Product.review -> {"@id": "#r"} with the Review in @graph) are then
+  // dropped, so they are not validated again as standalone items (which would
+  // wrongly ask a nested Review for itemReviewed).
+  const nested = new Set<Node>();
+  const candidates: { node: Node; item: StructuredDataItem }[] = [];
   const addItem = (node: Node, format: StructuredDataItem["format"]) => {
-    const item = items.length < MAX_ITEMS_PER_PAGE ? describeItem(node, format, refs) : null;
+    const item = candidates.length < MAX_CANDIDATES_PER_PAGE ? describeItem(node, format, refs, nested) : null;
     if (!item) return;
-    items.push(item);
+    candidates.push({ node, item });
     // A page entity nested inline as mainEntity (WebPage -> Product) is its
     // own rich result candidate unless the parent's rules already check it.
     if (schemaRules[ruleNameFor(item.type)]?.nested?.mainEntity) return;
@@ -261,5 +282,9 @@ export function readStructuredData($: CheerioAPI) {
   };
   for (const node of jsonLdRoots(documents)) addItem(node, "json-ld");
   for (const node of microdata) addItem(node, "microdata");
+  const items = candidates
+    .filter(({ node }) => !nested.has(node))
+    .slice(0, MAX_ITEMS_PER_PAGE)
+    .map(({ item }) => item);
   return { jsonLdCount: scripts.length, parseErrors, microdataCount: microdata.length, items };
 }

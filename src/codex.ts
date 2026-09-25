@@ -6,6 +6,13 @@ import { codexModel, codexReasoningEffort } from "./config";
 import { all, get, run } from "./db";
 import { badRequest, notFound } from "./errors";
 
+// Local Codex CLI jobs, saved in ai_jobs. Each job runs `codex exec` in an
+// empty temp directory with the read-only sandbox, which can still read the
+// whole disk (database/ holds Google refresh tokens). Web search is the job's
+// only way to send data out, so it is turned off for jobs whose prompt embeds
+// crawled page content (scan.prioritize, jobs with `context` or a `scanId`);
+// ai_jobs.web_search records which mode a job ran in.
+
 const codexTimeoutMs = Number(process.env.CODEX_TIMEOUT_MS || 600000);
 // Each job is a full Codex CLI process; run at most this many at once and keep
 // the rest queued in order.
@@ -29,7 +36,16 @@ export type AiJob = {
   finished_at: string | null;
   site_id: string | null;
   scan_id: string | null;
+  web_search: number;
 };
+
+// Scan prioritisation and any job built from `context` or linked to a scan
+// embed text from crawled pages (titles, headings, URLs), which a hostile page
+// can word as instructions. Those jobs run without Codex web search, so an
+// injected instruction cannot send what Codex reads out through search queries.
+function jobUsesCrawledContent(type: string, context: string, scanId: string | null) {
+  return type === "scan.prioritize" || Boolean(context) || Boolean(scanId);
+}
 
 export const promptTemplates = [
   {
@@ -118,9 +134,10 @@ export function createAiJob(input: { type?: unknown; prompt?: unknown; siteId?: 
     siteId = scan.site_id;
   }
   const id = randomUUID();
+  const webSearch = jobUsesCrawledContent(type, context, scanId) ? 0 : 1;
   run(
-    "INSERT INTO ai_jobs (id, type, prompt, status, message, site_id, scan_id) VALUES (?, ?, ?, 'queued', 'Queued', ?, ?)",
-    [id, type, prompt, siteId, scanId],
+    "INSERT INTO ai_jobs (id, type, prompt, status, message, site_id, scan_id, web_search) VALUES (?, ?, ?, 'queued', 'Queued', ?, ?, ?)",
+    [id, type, prompt, siteId, scanId, webSearch],
   );
   pendingJobs.push(id);
   queueMicrotask(startQueuedJobs);
@@ -132,11 +149,25 @@ export function createAiJob(input: { type?: unknown; prompt?: unknown; siteId?: 
 export function listAiJobs(siteId?: string) {
   if (siteId) {
     return all<AiJob>(
-      "SELECT * FROM ai_jobs WHERE site_id = ? OR site_id IS NULL ORDER BY created_at DESC",
+      "SELECT * FROM ai_jobs WHERE site_id = ? OR site_id IS NULL ORDER BY created_at DESC, rowid DESC",
       [siteId],
     );
   }
-  return all<AiJob>("SELECT * FROM ai_jobs ORDER BY created_at DESC");
+  return all<AiJob>("SELECT * FROM ai_jobs ORDER BY created_at DESC, rowid DESC");
+}
+
+// Dashboard rows: the latest jobs in listAiJobs' scope as small rows (no
+// prompt or result), plus how many jobs that scope holds.
+export function recentAiJobs(siteId?: string, limit = 10) {
+  const where = siteId ? "WHERE site_id = ? OR site_id IS NULL" : "";
+  const params = siteId ? [siteId] : [];
+  return {
+    rows: all<Pick<AiJob, "id" | "type" | "status" | "message" | "created_at" | "finished_at" | "scan_id">>(
+      `SELECT id, type, status, message, created_at, finished_at, scan_id FROM ai_jobs ${where} ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      [...params, limit],
+    ),
+    total: get<{ count: number }>(`SELECT count(*) AS count FROM ai_jobs ${where}`, params)?.count || 0,
+  };
 }
 
 export function getAiJob(id: string) {
@@ -170,20 +201,24 @@ async function runAiJob(id: string) {
     "UPDATE ai_jobs SET status = 'running', message = 'Codex is working', started_at = CURRENT_TIMESTAMP WHERE id = ?",
     [id],
   );
-  const result = await runCodex(job.prompt);
+  const result = await runCodex(job.prompt, Boolean(job.web_search));
   run(
     "UPDATE ai_jobs SET status = 'completed', message = 'Completed', result_text = ?, result_json = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
     [result.text, result.json ? JSON.stringify(result.json) : null, id],
   );
 }
 
-// Codex runs read-only in an empty per-job directory, never in the app checkout
-// (which holds database/ with Google tokens and .env). The prompt goes after
-// "--" so text starting with "-" can never be parsed as a CLI option.
-export function codexArgs(prompt: string, workDir: string, outputPath: string) {
+// Codex runs in an empty per-job directory, never in the app checkout, with
+// the read-only sandbox. Read-only still lets Codex read any file the user can
+// (including database/ with Google refresh tokens and .env); it only blocks
+// writes and network access from commands. The one outbound channel left is
+// web search (--search), which is off for jobs that embed crawled content
+// (see jobUsesCrawledContent). The prompt goes after "--" so text starting
+// with "-" can never be parsed as a CLI option.
+export function codexArgs(prompt: string, workDir: string, outputPath: string, webSearch = false) {
   const args = [
     "codex",
-    "--search",
+    ...(webSearch ? ["--search"] : []),
     "--ask-for-approval",
     "never",
     "exec",
@@ -204,13 +239,13 @@ export function codexArgs(prompt: string, workDir: string, outputPath: string) {
   return args;
 }
 
-async function runCodex(prompt: string): Promise<{ text: string; json: unknown | null }> {
+async function runCodex(prompt: string, webSearch: boolean): Promise<{ text: string; json: unknown | null }> {
   const workDir = await mkdtemp(path.join(os.tmpdir(), "local-seo-codex-"));
   const outputPath = path.join(workDir, "last-message.txt");
   try {
     const env = { ...process.env };
     for (const key of hiddenEnvKeys) delete env[key];
-    const proc = Bun.spawn(codexArgs(prompt, workDir, outputPath), {
+    const proc = Bun.spawn(codexArgs(prompt, workDir, outputPath, webSearch), {
       cwd: workDir,
       stdout: "pipe",
       stderr: "pipe",

@@ -247,7 +247,7 @@ export function DomainPage({ site }: { site: Site }) {
             </ReportSection>
           </TabsContent>
           <TabsContent value="snapshot">
-            {overview ? <OrganicSnapshot result={overview} domain={domain} keywordRows={keywords?.keywords?.length || 0} pageRows={pages?.pages?.length || 0} /> : <EmptyState title="No snapshot" text="Run an analysis to save the first organic research snapshot." />}
+            {overview ? <OrganicSnapshot result={overview} domain={domain} keywordRows={Array.isArray(keywords?.keywords) ? keywords.keywords.length : null} pageRows={Array.isArray(pages?.pages) ? pages.pages.length : null} /> : <EmptyState title="No snapshot" text="Run an analysis to save the first organic research snapshot." />}
           </TabsContent>
         </Tabs>
         <HistoryList title="Organic research history" rows={history} labelKey="domain" labelTitle="Research site" />
@@ -432,10 +432,12 @@ function LocalOrganicPagesTable({ rows }: { rows: any[] }) {
   );
 }
 
-function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: any; domain: string; keywordRows: number; pageRows: number }) {
+function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: any; domain: string; keywordRows: number | null; pageRows: number | null }) {
   const organicKeywords = metricValue(result.organicKeywords);
   const organicTraffic = metricValue(result.organicTraffic);
   const estimatedValue = metricValue(result.estimatedValue);
+  // Imported snapshots carry importedAt; saved history rows carry createdAt/created_at.
+  const savedAt = result.importedAt || result.createdAt || result.created_at;
   return (
     <ReportSection
       title="Snapshot"
@@ -443,7 +445,7 @@ function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: an
       meta={
         <SourceMeta
           source={result.source}
-          extra={<span>· {domain || result.domain || "-"}{result.createdAt ? ` · ${formatDate(result.createdAt)}` : ""}</span>}
+          extra={<span>· {domain || result.domain || "-"}{savedAt ? ` · ${formatDate(savedAt)}` : ""}</span>}
         />
       }
     >
@@ -749,7 +751,7 @@ export function LinksPage({ site }: { site: Site }) {
             </ReportSection>
           </TabsContent>
           <TabsContent value="snapshot">
-            {overview ? <BacklinkSnapshot result={overview} domain={domain} rows={profile?.rows?.length || 0} tab={profile?.tab || tab} /> : <EmptyState title="No snapshot" text="Import a backlink CSV and run an analysis to save the first backlink snapshot." />}
+            {overview ? <BacklinkSnapshot result={overview} domain={domain} rows={Array.isArray(profile?.rows) ? profile.rows.length : null} tab={profile?.tab || tab} /> : <EmptyState title="No snapshot" text="Import a backlink CSV and run an analysis to save the first backlink snapshot." />}
           </TabsContent>
         </Tabs>
         <HistoryList title="Backlink imports" rows={history} labelKey="domain" labelTitle="Backlink domain" />
@@ -946,7 +948,7 @@ function LocalInternalGraphTable({ rows }: { rows: any[] }) {
   );
 }
 
-function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: string; rows: number; tab: string }) {
+function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: string; rows: number | null; tab: string }) {
   const backlinks = metricValue(result.backlinks, result.summary?.backlinks);
   const referringDomains = metricValue(result.referringDomains, result.summary?.referringDomains);
   const dofollowRatio = metricValue(result.dofollowRatio, result.summary?.dofollowRatio);
@@ -981,7 +983,7 @@ function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: 
           { title: "Visible rows", value: rows, detail: `Rows currently loaded in the ${tab} tab.` },
           { title: "Backlinks", value: backlinks, detail: "Total backlinks from the imported rows." },
           { title: "Referring domains", value: referringDomains, detail: "Unique linking domains from the imported rows." },
-          { title: "Dofollow %", value: dofollowRatio, detail: ratioDetail },
+          { title: "Dofollow %", value: dofollowRatio, detail: ratioDetail, format: (value) => `${formatNumber(value)}%` },
           { title: "Nofollow", value: nofollowCount, detail: "Imported rows the export marks as not followed." },
           { title: "Follow unknown", value: followUnknown, detail: "Imported rows whose export did not state follow or nofollow." },
         ]}

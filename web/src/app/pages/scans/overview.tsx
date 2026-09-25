@@ -1,6 +1,6 @@
 import { CheckCircle2, EyeOff } from "lucide-react";
 import { Badge, Button } from "@/components/ui";
-import { CountUp, EmptyState, Hint, MetricTile, MetricTileGrid, ReportSection, ScoreDial, StatusDot, formatDate, formatMs, formatNumber, issueCategoryLabel, scanCoverageMetrics, scanIsActive, scoreMeaning, scoreVerdict, type MetricTileProps } from "../../shared";
+import { CountUp, EmptyState, Hint, MetricTile, MetricTileGrid, ReportSection, ScoreDial, StatusDot, formatDate, formatMs, formatNumber, issueCategoryLabel, knownNumber, scanCoverageMetrics, scanIsActive, scoreMeaning, scoreVerdict, type MetricTileProps } from "../../shared";
 import { cn } from "@/lib/utils";
 import { comparisonRegressions } from "./changes";
 import { PrioritiseWithCodexButton } from "./codex-prioritise";
@@ -27,7 +27,11 @@ export function ScanReportOverview({
   const isActive = scanIsActive(scan);
   const isCompleted = scan.status === "completed";
   const isFailed = scan.status === "failed";
-  const finalScore = Number(scan.score || 0);
+  // A cancelled scan keeps a real score over the pages it crawled
+  // (summary.partial); a scan that never scored has no number to show.
+  const finalScore = knownNumber(scan.score);
+  const isPartial = scan.status === "cancelled" || summary.partial === true;
+  const partialPages = knownNumber(scan.pages_crawled) ?? coverage.pages;
   const dialColor = isFailed ? "var(--bad)" : undefined;
   const sourceUrl = result.startUrl || scan.url;
   const metaIssues = Number(summary.missingTitles || 0) + Number(summary.missingDescriptions || 0);
@@ -39,7 +43,7 @@ export function ScanReportOverview({
     {
       label: "Pages crawled",
       value: <CountUp value={coverage.pages} />,
-      hint: `${formatNumber(coverage.indexablePages)} indexable · ${formatNumber(coverage.nonIndexablePages)} noindex · ${formatNumber(coverage.sitemapUrls)} in sitemap`,
+      hint: `${formatNumber(coverage.indexablePages)} indexable · ${formatNumber(coverage.nonIndexablePages)} noindex · ${formatNumber(coverage.sitemapListedPages)} in sitemap`,
     },
     {
       label: "Links checked",
@@ -93,14 +97,30 @@ export function ScanReportOverview({
           ) : (
             <div className="w-full space-y-4">
               <div className="flex flex-col items-center gap-2">
-                <ScoreDial
-                  score={finalScore}
-                  size={148}
-                  color={dialColor}
-                  suffix="%"
-                  label={isCompleted ? scoreVerdict(finalScore) : scan.status === "cancelled" ? "partial" : "score"}
-                />
-                <p className="text-xs font-medium text-muted-foreground">{scoreMeaning}</p>
+                {finalScore === null ? (
+                  <div className="flex flex-col items-center gap-2 py-6">
+                    <span className="metric text-4xl leading-none text-muted-foreground">-</span>
+                    <p className="max-w-[210px] text-xs leading-5 text-muted-foreground">
+                      No score: the scan {isFailed ? "failed" : "stopped"} before any page was scored.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <ScoreDial
+                      score={finalScore}
+                      size={148}
+                      color={dialColor}
+                      suffix="%"
+                      label={isPartial ? "partial crawl" : isCompleted ? scoreVerdict(finalScore) : "score"}
+                    />
+                    <p className="text-xs font-medium text-muted-foreground">{scoreMeaning}</p>
+                    {isPartial ? (
+                      <p className="max-w-[220px] text-xs leading-5 text-muted-foreground">
+                        {formatNumber(partialPages)} {partialPages === 1 ? "page" : "pages"} crawled before {scan.status === "cancelled" ? "the scan was cancelled" : "the crawl stopped"}; the score covers only those pages.
+                      </p>
+                    ) : null}
+                  </>
+                )}
               </div>
               <div>
                 <div className="eyebrow-muted mb-2">Open issues</div>
@@ -173,8 +193,8 @@ export function ScanRegressionsCard({
   onOpenPage: (url: string) => void;
 }) {
   if (!comparison?.available) return null;
-  const { rows, count, newHighIssues } = comparisonRegressions(comparison);
-  const fixed = Number(comparison.summary?.fixedIssues || 0);
+  const { rows, pageCount, newHighIssues, newMediumIssues } = comparisonRegressions(comparison);
+  const fixed = comparison.summary?.fixedIssues;
   const preview = rows.slice(0, 5);
   return (
     <ReportSection
@@ -188,9 +208,10 @@ export function ScanRegressionsCard({
       }
     >
       <MetricTileGrid>
-        <MetricTile label="Regressions" value={<CountUp value={count} />} tone={count ? "bad" : "good"} hint="Page-level changes for the worse" />
-        <MetricTile label="New high issues" value={<CountUp value={newHighIssues.length} />} tone={newHighIssues.length ? "bad" : "default"} hint="High-severity findings not in the previous scan" />
-        <MetricTile label="Fixed issues" value={<CountUp value={fixed} />} tone={fixed ? "good" : "default"} hint="Previous findings absent from this scan" />
+        <MetricTile label="Regressed pages" value={<CountUp value={pageCount} />} tone={pageCount ? "bad" : "good"} hint="Pages with a change for the worse" />
+        <MetricTile label="New high issues" value={<CountUp value={newHighIssues} />} tone={newHighIssues ? "bad" : "default"} hint="High-severity findings not in the previous scan" />
+        <MetricTile label="New medium issues" value={<CountUp value={newMediumIssues} />} tone={newMediumIssues ? "warn" : "default"} hint="Medium-severity findings not in the previous scan" />
+        <MetricTile label="Fixed issues" value={<CountUp value={fixed} />} tone={Number(fixed) ? "good" : "default"} hint="Previous findings absent from this scan" />
       </MetricTileGrid>
       {preview.length ? (
         <div className="mt-4 divide-y divide-border/60 rounded-xl border border-border/60">
@@ -215,7 +236,7 @@ export function ScanRegressionsCard({
           ))}
           {rows.length > preview.length ? (
             <div className="px-3.5 py-2 text-xs text-muted-foreground">
-              {formatNumber(rows.length - preview.length)} more on the Changes tab.
+              {formatNumber(rows.length - preview.length)} more regressed {rows.length - preview.length === 1 ? "change" : "changes"} on the Changes tab.
             </div>
           ) : null}
         </div>

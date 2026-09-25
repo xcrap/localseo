@@ -246,11 +246,14 @@ export function ScanDetail({
   const selectSeverity = (severity: string) => showIssuesWith({ ...clearedIssueFilters, severity, showIgnored: false });
   const selectIssueGroup = (group: any) =>
     showIssuesWith({ ...clearedIssueFilters, category: group.category || "all", type: group.type || "all", showIgnored: false });
+  // A check row with issue types lands on exactly those types, the same set its
+  // button counted; adding the row's category could hide types filed under
+  // another category (html-lang-invalid is localization, not indexability).
   const selectScanCheck = (row: ScanCheckRowModel) => {
     const types = row.types || [];
     showIssuesWith({
       ...clearedIssueFilters,
-      category: row.category || "all",
+      category: types.length ? "all" : row.category || "all",
       type: types.length === 1 ? types[0] : "all",
       checkTypes: types.length > 1 ? types : [],
       checkLabel: types.length > 1 ? row.label : "",

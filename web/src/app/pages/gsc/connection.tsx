@@ -82,14 +82,22 @@ export function GscConnectionPanel({
         tone: "warn",
         text: status?.authError || "Google no longer accepts the saved sign-in. Reconnect to query live data again.",
       }
-    : {
-        title: "Google account",
-        status: connected ? "Connected" : "Not connected",
-        tone: connected ? "good" : "warn",
-        text:
-          status?.connection?.accountEmail ||
-          (status?.configured ? "Connect once, then choose the matching property." : "OAuth is not configured in this local runtime; local CSV import still works."),
-      };
+    : connected
+      ? {
+          // The API may not return the account email; being connected never depends on it.
+          title: "Google account",
+          status: "Connected",
+          tone: "good",
+          text:
+            status?.connection?.accountEmail ||
+            (status?.connection?.siteUrl ? "Signed in to Google. Live queries use the selected property." : "Signed in to Google. Load properties and pick the one for this site."),
+        }
+      : {
+          title: "Google account",
+          status: "Not connected",
+          tone: "warn",
+          text: status?.configured ? "Connect once, then choose the matching property." : "OAuth is not configured in this local runtime; local CSV import still works.",
+        };
   return (
     <ReportSection
       title="Google connection"
