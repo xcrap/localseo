@@ -1,9 +1,49 @@
-import { useEffect, useMemo, useState, type ChangeEvent, type SyntheticEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type SyntheticEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { FileSearch, Globe2, Link2, Plus } from "lucide-react";
 import { api, type Site } from "../../api";
-import { Badge, Button, Input, Label, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsContent, TabsList, TabsTrigger, toast } from "@/components/ui";
-import { EmptyState, Field, FilteredRows, HistoryList, IndexabilityBadge, InfoTip, PageHeader, ProviderNotice, ReportSection, SiteDomainField, StatsBand, StatusDot, defaultEvidenceScan, domainKey, formatDate, formatNumber, LengthBadge, ScanLinksTable, hasIndexabilityEvidence, metricValue, pageH1Status, pageIssueTypesCount, scanIsActive, scanIssueCount, scanStatusLabel, sourceLabel, sourceVariant, setSelectedScanId, sortScanRows } from "../shared";
+import { Badge, Button, Input, Label, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Skeleton, SortableTableHead, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsContent, TabsList, TabsTrigger, toast } from "@/components/ui";
+import { EmptyState, Field, HistoryList, IndexabilityBadge, InfoTip, PageHeader, ProviderNotice, ReportSection, SiteDomainField, StatsBand, StatusDot, defaultEvidenceScan, domainKey, formatDate, formatNumber, LengthBadge, ScanLinksTable, hasIndexabilityEvidence, metricValue, pageH1Status, pageIssueTypesCount, scanIsActive, scanIssueCount, scanStatusLabel, sourceLabel, sourceVariant, setSelectedScanId, sortScanRows } from "../shared";
+import { FilteredRows } from "../data-table";
+
+// Scan lists are lite rows; the selected scan's pages and links come from the
+// full report. The effect cleanup drops a stale response when the selection
+// changes mid-request.
+function useFullScan(scanId: string, version: string) {
+  const [state, setState] = useState<{ key: string; scan?: any; error?: string }>({ key: "" });
+  const key = scanId ? `${scanId}:${version}` : "";
+  useEffect(() => {
+    if (!scanId) return;
+    let cancelled = false;
+    api
+      .scan(scanId)
+      .then((scan) => {
+        if (!cancelled) setState({ key, scan });
+      })
+      .catch((err) => {
+        if (!cancelled) setState({ key, error: err instanceof Error ? err.message : "Could not load the saved scan" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [key]);
+  // Keep showing the previous report of the same scan while a newer version loads.
+  const current = state.key === key ? state : state.key.startsWith(`${scanId}:`) ? state : null;
+  return {
+    scan: current?.scan || null,
+    error: current?.error || "",
+    loading: Boolean(scanId) && !current?.scan && !current?.error,
+  };
+}
+
+function EvidenceSkeleton() {
+  return (
+    <div className="space-y-3" role="status" aria-busy="true" aria-label="Loading saved scan evidence">
+      <Skeleton className="h-20 rounded-xl" />
+      <Skeleton className="h-48 rounded-xl" />
+    </div>
+  );
+}
 
 function SourceMeta({ source, extra }: { source?: string; extra?: ReactNode }) {
   return (
@@ -33,6 +73,8 @@ export function DomainPage({ site }: { site: Site }) {
     [scanRows, selectedScanId],
   );
   const organicImported = history.some((row) => row.source === "organic-import" && domainKey(row.domain) === domainKey(domain));
+  const fullScan = useFullScan(selectedScan?.id || "", String(selectedScan?.updated_at || ""));
+  const researchRequest = useRef(0);
 
   useEffect(() => {
     setDomain(site.domain);
@@ -61,6 +103,7 @@ export function DomainPage({ site }: { site: Site }) {
   async function run(event?: SyntheticEvent) {
     event?.preventDefault();
     setLoading(true);
+    const token = ++researchRequest.current;
     const body = { siteId: site.id, domain, pageSize: 50 };
     try {
       const [overviewData, keywordData, pageData] = await Promise.all([
@@ -68,6 +111,7 @@ export function DomainPage({ site }: { site: Site }) {
         api.domainKeywords(body),
         api.domainPages(body),
       ]);
+      if (token !== researchRequest.current) return;
       setOverview(overviewData);
       setKeywords(keywordData);
       setPages(pageData);
@@ -93,12 +137,14 @@ export function DomainPage({ site }: { site: Site }) {
         csv,
       });
       toast.success(`Imported ${formatNumber(imported.keywordCount || 0)} keyword rows and ${formatNumber(imported.pageCount || 0)} page rows from ${file.name}.`);
+      const token = ++researchRequest.current;
       const body = { siteId: site.id, domain, pageSize: 50 };
       const [overviewData, keywordData, pageData] = await Promise.all([
         api.domainOverview(body),
         api.domainKeywords(body),
         api.domainPages(body),
       ]);
+      if (token !== researchRequest.current) return;
       setOverview(overviewData);
       setKeywords(keywordData);
       setPages(pageData);
@@ -171,6 +217,9 @@ export function DomainPage({ site }: { site: Site }) {
       <div className="mt-6 space-y-6">
         <LocalOrganicEvidence
           scan={selectedScan}
+          fullScan={fullScan.scan}
+          fullScanLoading={fullScan.loading}
+          fullScanError={fullScan.error}
           scans={scanRows}
           selectedScanId={selectedScan?.id || ""}
           onScanChange={setSelectedScanIdState}
@@ -189,16 +238,16 @@ export function DomainPage({ site }: { site: Site }) {
           </TabsList>
           <TabsContent value="keywords">
             <ReportSection title="Ranked keywords" meta={keywords ? <SourceMeta source={keywords.source} /> : undefined}>
-              {keywords?.keywords?.length ? <FilteredRows rows={keywords.keywords} placeholder="Filter keywords…">{(rows) => <DomainKeywordsTable rows={rows} />}</FilteredRows> : <EmptyState title="No keyword rows" text={keywords?.warning || "Analyze an organic research site to load ranked keyword data."} />}
+              {keywords?.keywords?.length ? <FilteredRows rows={keywords.keywords} placeholder="Filter keywords…" csvName={`ranked-keywords-${domainKey(domain)}`}>{(rows) => <DomainKeywordsTable rows={rows} />}</FilteredRows> : <EmptyState title="No keyword rows" text={keywords?.warning || "Analyze an organic research site to load ranked keyword data."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="pages">
             <ReportSection title="Top pages" meta={pages ? <SourceMeta source={pages.source} /> : undefined}>
-              {pages?.pages?.length ? <FilteredRows rows={pages.pages} placeholder="Filter pages…">{(rows) => <DomainPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={pages?.warning || "Analyze an organic research site to load top page data."} />}
+              {pages?.pages?.length ? <FilteredRows rows={pages.pages} placeholder="Filter pages…" csvName={`top-pages-${domainKey(domain)}`}>{(rows) => <DomainPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={pages?.warning || "Analyze an organic research site to load top page data."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="snapshot">
-            {overview ? <OrganicSnapshot result={overview} domain={domain} keywordRows={keywords?.keywords?.length || 0} pageRows={pages?.pages?.length || 0} /> : <EmptyState title="No snapshot" text="Run an analysis to save the first organic research snapshot." />}
+            {overview ? <OrganicSnapshot result={overview} domain={domain} keywordRows={Array.isArray(keywords?.keywords) ? keywords.keywords.length : null} pageRows={Array.isArray(pages?.pages) ? pages.pages.length : null} /> : <EmptyState title="No snapshot" text="Run an analysis to save the first organic research snapshot." />}
           </TabsContent>
         </Tabs>
         <HistoryList title="Organic research history" rows={history} labelKey="domain" labelTitle="Research site" />
@@ -249,6 +298,9 @@ function ScanRunPicker({
 
 function LocalOrganicEvidence({
   scan,
+  fullScan,
+  fullScanLoading,
+  fullScanError,
   scans,
   selectedScanId,
   onScanChange,
@@ -257,6 +309,9 @@ function LocalOrganicEvidence({
   scanning,
 }: {
   scan: any;
+  fullScan: any;
+  fullScanLoading: boolean;
+  fullScanError: string;
   scans: any[];
   selectedScanId: string;
   onScanChange: (scanId: string) => void;
@@ -264,9 +319,8 @@ function LocalOrganicEvidence({
   onScan: () => void;
   scanning: boolean;
 }) {
-  const pages = scan?.result?.pages || [];
-  const rows = [...pages]
-    .sort((a, b) => scanIssueCount(b) - scanIssueCount(a));
+  const pages = useMemo(() => fullScan?.result?.pages || [], [fullScan]);
+  const rows = useMemo(() => [...pages].sort((a, b) => scanIssueCount(b) - scanIssueCount(a)), [pages]);
   const indexableCount = pages.filter((page: any) => page.indexable === true).length;
   const unknownIndexabilityCount = pages.filter((page: any) => !hasIndexabilityEvidence(page)).length;
   const missingTitleCount = pages.filter((page: any) => !page.title).length;
@@ -291,7 +345,11 @@ function LocalOrganicEvidence({
               <Button asChild variant="secondary"><Link to="/"><Plus /> Add site</Link></Button>
             )}
           />
-        ) : !scan.result ? (
+        ) : fullScanLoading ? (
+          <EvidenceSkeleton />
+        ) : fullScanError ? (
+          <EmptyState title="Could not load this saved scan" text={fullScanError} />
+        ) : !fullScan?.result?.pages ? (
           <EmptyState
             title={scanIsActive(scan) ? "This saved scan is still running" : "This saved scan has no crawl evidence"}
             text={scanIsActive(scan) ? "Open the scan report to watch progress. Evidence appears here after crawl data is saved." : scan.error || "This saved scan did not include crawl rows."}
@@ -307,10 +365,10 @@ function LocalOrganicEvidence({
                 { title: "Missing titles", value: missingTitleCount },
                 { title: "Missing descriptions", value: missingDescriptionCount },
                 { title: "H1 issues", value: h1IssueCount, detail: "Missing, empty, or repeated H1 headings across crawled pages." },
-                { title: "Crawl issues", value: scan.issue_count, detail: "All issues recorded by this saved scan." },
+                { title: "Crawl issues", value: fullScan.issue_count, detail: "All issues recorded by this saved scan." },
               ]}
             />
-            {rows.length ? <FilteredRows rows={rows} placeholder="Filter crawl pages…">{(filtered) => <LocalOrganicPagesTable rows={filtered} />}</FilteredRows> : <EmptyState title="No page rows" text="This saved scan did not save page rows." />}
+            {rows.length ? <FilteredRows rows={rows} placeholder="Filter crawl pages…" csvName="crawl-pages" sortValues={localPageSortValues}>{(filtered) => <LocalOrganicPagesTable rows={filtered} />}</FilteredRows> : <EmptyState title="No page rows" text="This saved scan did not save page rows." />}
           </>
         )}
       </div>
@@ -318,19 +376,25 @@ function LocalOrganicEvidence({
   );
 }
 
+const localPageSortValues: Record<string, (page: any) => unknown> = {
+  page: (page) => page.finalUrl || page.url,
+  title: (page) => page.title || page.url,
+  issues: (page) => scanIssueCount(page),
+};
+
 function LocalOrganicPagesTable({ rows }: { rows: any[] }) {
   return (
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>Page</TableHead>
-          <TableHead>Indexable</TableHead>
-          <TableHead>Title</TableHead>
-          <TableHead>Description</TableHead>
-          <TableHead>H1</TableHead>
-          <TableHead>Words</TableHead>
-          <TableHead>Inlinks</TableHead>
-          <TableHead>Issues</TableHead>
+          <SortableTableHead sortKey="page">Page</SortableTableHead>
+          <SortableTableHead sortKey="indexable">Indexable</SortableTableHead>
+          <SortableTableHead sortKey="titleLength">Title</SortableTableHead>
+          <SortableTableHead sortKey="descriptionLength">Description</SortableTableHead>
+          <SortableTableHead sortKey="h1Count">H1</SortableTableHead>
+          <SortableTableHead sortKey="wordCount">Words</SortableTableHead>
+          <SortableTableHead sortKey="internalInlinks">Inlinks</SortableTableHead>
+          <SortableTableHead sortKey="issues">Issues</SortableTableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -368,10 +432,12 @@ function LocalOrganicPagesTable({ rows }: { rows: any[] }) {
   );
 }
 
-function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: any; domain: string; keywordRows: number; pageRows: number }) {
+function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: any; domain: string; keywordRows: number | null; pageRows: number | null }) {
   const organicKeywords = metricValue(result.organicKeywords);
   const organicTraffic = metricValue(result.organicTraffic);
   const estimatedValue = metricValue(result.estimatedValue);
+  // Imported snapshots carry importedAt; saved history rows carry createdAt/created_at.
+  const savedAt = result.importedAt || result.createdAt || result.created_at;
   return (
     <ReportSection
       title="Snapshot"
@@ -379,7 +445,7 @@ function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: an
       meta={
         <SourceMeta
           source={result.source}
-          extra={<span>· {domain || result.domain || "-"}{result.createdAt ? ` · ${formatDate(result.createdAt)}` : ""}</span>}
+          extra={<span>· {domain || result.domain || "-"}{savedAt ? ` · ${formatDate(savedAt)}` : ""}</span>}
         />
       }
     >
@@ -399,7 +465,16 @@ function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: an
 function DomainKeywordsTable({ rows }: { rows: any[] }) {
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>Keyword</TableHead><TableHead>Position</TableHead><TableHead>Volume</TableHead><TableHead>Traffic</TableHead><TableHead>KD</TableHead><TableHead>URL</TableHead></TableRow></TableHeader>
+      <TableHeader>
+        <TableRow>
+          <SortableTableHead sortKey="keyword">Keyword</SortableTableHead>
+          <SortableTableHead sortKey="position">Position</SortableTableHead>
+          <SortableTableHead sortKey="searchVolume">Volume</SortableTableHead>
+          <SortableTableHead sortKey="traffic">Traffic</SortableTableHead>
+          <SortableTableHead sortKey="keywordDifficulty">KD</SortableTableHead>
+          <SortableTableHead sortKey="url">URL</SortableTableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
         {rows.map((row) => (
           <TableRow key={`${row.keyword}:${row.url}`}>
@@ -419,7 +494,14 @@ function DomainKeywordsTable({ rows }: { rows: any[] }) {
 function DomainPagesTable({ rows }: { rows: any[] }) {
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>Page</TableHead><TableHead>Traffic</TableHead><TableHead>Keywords</TableHead><TableHead>Evidence</TableHead></TableRow></TableHeader>
+      <TableHeader>
+        <TableRow>
+          <SortableTableHead sortKey="page">Page</SortableTableHead>
+          <SortableTableHead sortKey="organicTraffic">Traffic</SortableTableHead>
+          <SortableTableHead sortKey="keywords">Keywords</SortableTableHead>
+          <TableHead>Evidence</TableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
         {rows.map((row) => (
           <TableRow key={row.page}>
@@ -468,6 +550,10 @@ export function LinksPage({ site }: { site: Site }) {
     () => scanRows.find((scan) => scan.id === selectedScanId) || defaultEvidenceScan(scanRows),
     [scanRows, selectedScanId],
   );
+  const fullScan = useFullScan(selectedScan?.id || "", String(selectedScan?.updated_at || ""));
+  // Only the newest backlink request may write results, so quick tab switches
+  // cannot leave an older tab's rows on screen.
+  const backlinkRequest = useRef(0);
 
   useEffect(() => {
     setDomain(site.domain);
@@ -500,6 +586,7 @@ export function LinksPage({ site }: { site: Site }) {
       setError("Import a backlink CSV for this domain before running web-wide backlink tables. Local scan links are available below.");
       return;
     }
+    const token = ++backlinkRequest.current;
     setLoading(true);
     setError("");
     const body = { siteId: site.id, domain, tab: nextTab, pageSize: 50 };
@@ -508,13 +595,14 @@ export function LinksPage({ site }: { site: Site }) {
         api.backlinksOverview(body),
         api.backlinksProfile(body),
       ]);
+      if (token !== backlinkRequest.current) return;
       setOverview(overviewData);
       setProfile(profileData);
       await loadHistory();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Backlink analysis failed");
+      if (token === backlinkRequest.current) toast.error(err instanceof Error ? err.message : "Backlink analysis failed");
     } finally {
-      setLoading(false);
+      if (token === backlinkRequest.current) setLoading(false);
     }
   }
 
@@ -539,11 +627,13 @@ export function LinksPage({ site }: { site: Site }) {
       });
       await loadHistory();
       toast.success(`Imported ${formatNumber(imported.rowCount || imported.row_count || 0)} backlink rows from ${file.name}.`);
+      const token = ++backlinkRequest.current;
       const body = { siteId: site.id, domain, tab, pageSize: 50 };
       const [overviewData, profileData] = await Promise.all([
         api.backlinksOverview(body),
         api.backlinksProfile(body),
       ]);
+      if (token !== backlinkRequest.current) return;
       setOverview(overviewData);
       setProfile(profileData);
     } catch (err) {
@@ -625,6 +715,9 @@ export function LinksPage({ site }: { site: Site }) {
       <div className="mt-6 space-y-6">
         <LocalLinkEvidence
           scan={selectedScan}
+          fullScan={fullScan.scan}
+          fullScanLoading={fullScan.loading}
+          fullScanError={fullScan.error}
           scans={scanRows}
           selectedScanId={selectedScan?.id || ""}
           onScanChange={setSelectedScanIdState}
@@ -644,21 +737,21 @@ export function LinksPage({ site }: { site: Site }) {
           </TabsList>
           <TabsContent value="backlinks">
             <ReportSection title="External backlinks" meta={profile ? <SourceMeta source={profile.source} /> : undefined}>
-              {profile?.tab === "backlinks" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter backlinks…">{(rows) => <BacklinksRowsTable rows={rows} />}</FilteredRows> : <EmptyState title="No web-wide backlink index" text={profile?.warning || "Import a backlink CSV above to populate this table. Local scans do not invent web-wide backlinks."} />}
+              {profile?.tab === "backlinks" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter backlinks…" csvName={`backlinks-${domainKey(domain)}`}>{(rows) => <BacklinksRowsTable rows={rows} />}</FilteredRows> : <EmptyState title="No web-wide backlink index" text={profile?.warning || "Import a backlink CSV above to populate this table. Local scans do not invent web-wide backlinks."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="domains">
             <ReportSection title="Referring domains">
-              {profile?.tab === "domains" && profile.rows?.length ? <ReferringDomainsTable rows={profile.rows} /> : <EmptyState title="No domain rows" text={profile?.warning || "Switch tabs after running a backlink analysis."} />}
+              {profile?.tab === "domains" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter referring domains…" csvName={`referring-domains-${domainKey(domain)}`}>{(rows) => <ReferringDomainsTable rows={rows} />}</FilteredRows> : <EmptyState title="No domain rows" text={profile?.warning || "Switch tabs after running a backlink analysis."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="pages">
             <ReportSection title="Top linked pages">
-              {profile?.tab === "pages" && profile.rows?.length ? <BacklinkPagesTable rows={profile.rows} /> : <EmptyState title="No page rows" text={profile?.warning || "Switch tabs after running a backlink analysis."} />}
+              {profile?.tab === "pages" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter linked pages…" csvName={`linked-pages-${domainKey(domain)}`}>{(rows) => <BacklinkPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={profile?.warning || "Switch tabs after running a backlink analysis."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="snapshot">
-            {overview ? <BacklinkSnapshot result={overview} domain={domain} rows={profile?.rows?.length || 0} tab={profile?.tab || tab} /> : <EmptyState title="No snapshot" text="Import a backlink CSV and run an analysis to save the first backlink snapshot." />}
+            {overview ? <BacklinkSnapshot result={overview} domain={domain} rows={Array.isArray(profile?.rows) ? profile.rows.length : null} tab={profile?.tab || tab} /> : <EmptyState title="No snapshot" text="Import a backlink CSV and run an analysis to save the first backlink snapshot." />}
           </TabsContent>
         </Tabs>
         <HistoryList title="Backlink imports" rows={history} labelKey="domain" labelTitle="Backlink domain" />
@@ -669,6 +762,9 @@ export function LinksPage({ site }: { site: Site }) {
 
 function LocalLinkEvidence({
   scan,
+  fullScan,
+  fullScanLoading,
+  fullScanError,
   scans,
   selectedScanId,
   onScanChange,
@@ -677,6 +773,9 @@ function LocalLinkEvidence({
   scanning,
 }: {
   scan: any;
+  fullScan: any;
+  fullScanLoading: boolean;
+  fullScanError: string;
   scans: any[];
   selectedScanId: string;
   onScanChange: (scanId: string) => void;
@@ -684,22 +783,24 @@ function LocalLinkEvidence({
   onScan: () => void;
   scanning: boolean;
 }) {
-  const result = scan?.result || {};
-  const linkInventory = result.linkInventory || [];
-  const checkedLinks = result.links || [];
-  const pages = result.pages || [];
-  const checkedByUrl = new Map(checkedLinks.map((link: any) => [link.url, link]));
-  const externalLinks = linkInventory.filter((link: any) => link.type === "external");
-  const internalLinks = linkInventory.filter((link: any) => link.type === "internal");
-  const brokenLinks = checkedLinks.filter(
-    (link: any) => !link.ok && link.failureKind !== "tls-certificate",
-  );
-  const unverifiedLinks = checkedLinks.filter(
-    (link: any) => !link.ok && link.failureKind === "tls-certificate",
-  );
-  const noInlinkPages = pages.filter((page: any) => Number(page.internalInlinks || 0) === 0);
-  const pageRows = [...pages]
-    .sort((a, b) => Number(b.internalInlinks || 0) - Number(a.internalInlinks || 0));
+  const graph = useMemo(() => {
+    const result = fullScan?.result || {};
+    const linkInventory: any[] = result.linkInventory || [];
+    const checkedLinks: any[] = result.links || [];
+    const pages: any[] = result.pages || [];
+    return {
+      linkInventory,
+      checkedLinks,
+      checkedByUrl: new Map(checkedLinks.map((link: any) => [link.url, link])),
+      externalLinks: linkInventory.filter((link: any) => link.type === "external"),
+      internalLinks: linkInventory.filter((link: any) => link.type === "internal"),
+      brokenLinks: checkedLinks.filter((link: any) => !link.ok && link.failureKind !== "tls-certificate"),
+      unverifiedLinks: checkedLinks.filter((link: any) => !link.ok && link.failureKind === "tls-certificate"),
+      noInlinkPages: pages.filter((page: any) => Number(page.internalInlinks || 0) === 0),
+      pageRows: [...pages].sort((a, b) => Number(b.internalInlinks || 0) - Number(a.internalInlinks || 0)),
+    };
+  }, [fullScan]);
+  const { linkInventory, checkedLinks, checkedByUrl, externalLinks, internalLinks, brokenLinks, unverifiedLinks, noInlinkPages, pageRows } = graph;
   return (
     <ReportSection
       title="Local link graph"
@@ -719,7 +820,11 @@ function LocalLinkEvidence({
               <Button asChild variant="secondary"><Link to="/"><Plus /> Add site</Link></Button>
             )}
           />
-        ) : !scan.result ? (
+        ) : fullScanLoading ? (
+          <EvidenceSkeleton />
+        ) : fullScanError ? (
+          <EmptyState title="Could not load this saved scan" text={fullScanError} />
+        ) : !fullScan?.result?.pages ? (
           <EmptyState
             title={scanIsActive(scan) ? "This saved scan is still running" : "This saved scan has no link evidence"}
             text={scanIsActive(scan) ? "Open the scan report to watch progress. Link evidence appears here after crawl data is saved." : scan.error || "This saved scan did not include link rows."}
@@ -746,16 +851,16 @@ function LocalLinkEvidence({
                 <TabsTrigger value="internal">Internal graph</TabsTrigger>
               </TabsList>
               <TabsContent value="external">
-                {externalLinks.length ? <FilteredRows rows={externalLinks} placeholder="Filter external links…">{(rows) => <LocalExternalLinksTable rows={rows} checkedByUrl={checkedByUrl} />}</FilteredRows> : <EmptyState title="No external links" text="This saved scan did not find external links." />}
+                {externalLinks.length ? <FilteredRows rows={externalLinks} placeholder="Filter external links…" csvName="external-links">{(rows) => <LocalExternalLinksTable rows={rows} checkedByUrl={checkedByUrl} />}</FilteredRows> : <EmptyState title="No external links" text="This saved scan did not find external links." />}
               </TabsContent>
               <TabsContent value="broken">
-                {brokenLinks.length ? <ScanLinksTable rows={brokenLinks} /> : <EmptyState title="No broken links" text="This saved scan did not find failing link URLs." />}
+                {brokenLinks.length ? <FilteredRows rows={brokenLinks} placeholder="Filter broken links…" csvName="broken-links">{(rows) => <ScanLinksTable rows={rows} />}</FilteredRows> : <EmptyState title="No broken links" text="This saved scan did not find failing link URLs." />}
               </TabsContent>
               <TabsContent value="unverified">
-                {unverifiedLinks.length ? <ScanLinksTable rows={unverifiedLinks} /> : <EmptyState title="No certificate warnings" text="Every checked link certificate was verified." />}
+                {unverifiedLinks.length ? <FilteredRows rows={unverifiedLinks} placeholder="Filter unverified links…" csvName="unverified-links">{(rows) => <ScanLinksTable rows={rows} />}</FilteredRows> : <EmptyState title="No certificate warnings" text="Every checked link certificate was verified." />}
               </TabsContent>
               <TabsContent value="internal">
-                {pageRows.length ? <FilteredRows rows={pageRows} placeholder="Filter pages…">{(rows) => <LocalInternalGraphTable rows={rows} />}</FilteredRows> : <EmptyState title="No internal graph" text="This saved scan did not save page link rows." />}
+                {pageRows.length ? <FilteredRows rows={pageRows} placeholder="Filter pages…" csvName="internal-link-graph" sortValues={localPageSortValues}>{(rows) => <LocalInternalGraphTable rows={rows} />}</FilteredRows> : <EmptyState title="No internal graph" text="This saved scan did not save page link rows." />}
               </TabsContent>
             </Tabs>
           </>
@@ -770,11 +875,11 @@ function LocalExternalLinksTable({ rows, checkedByUrl }: { rows: any[]; checkedB
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>URL</TableHead>
+          <SortableTableHead sortKey="href">URL</SortableTableHead>
           <TableHead>Status</TableHead>
-          <TableHead>Anchor</TableHead>
-          <TableHead>Rel</TableHead>
-          <TableHead>From</TableHead>
+          <SortableTableHead sortKey="anchor">Anchor</SortableTableHead>
+          <SortableTableHead sortKey="rel">Rel</SortableTableHead>
+          <SortableTableHead sortKey="from">From</SortableTableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -814,13 +919,13 @@ function LocalInternalGraphTable({ rows }: { rows: any[] }) {
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>Page</TableHead>
-          <TableHead>Depth</TableHead>
-          <TableHead>Inlinks</TableHead>
-          <TableHead>Internal out</TableHead>
-          <TableHead>External out</TableHead>
-          <TableHead>Sitemap</TableHead>
-          <TableHead>Issues</TableHead>
+          <SortableTableHead sortKey="title">Page</SortableTableHead>
+          <SortableTableHead sortKey="depth">Depth</SortableTableHead>
+          <SortableTableHead sortKey="internalInlinks">Inlinks</SortableTableHead>
+          <SortableTableHead sortKey="internalLinks">Internal out</SortableTableHead>
+          <SortableTableHead sortKey="externalLinks">External out</SortableTableHead>
+          <SortableTableHead sortKey="sitemapListed">Sitemap</SortableTableHead>
+          <SortableTableHead sortKey="issues">Issues</SortableTableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -843,10 +948,20 @@ function LocalInternalGraphTable({ rows }: { rows: any[] }) {
   );
 }
 
-function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: string; rows: number; tab: string }) {
+function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: string; rows: number | null; tab: string }) {
   const backlinks = metricValue(result.backlinks, result.summary?.backlinks);
   const referringDomains = metricValue(result.referringDomains, result.summary?.referringDomains);
-  const dofollowRatio = metricValue(result.dofollowRatio);
+  const dofollowRatio = metricValue(result.dofollowRatio, result.summary?.dofollowRatio);
+  const dofollowCount = metricValue(result.dofollowBacklinks, result.summary?.dofollowBacklinks);
+  const nofollowCount = metricValue(result.nofollowBacklinks, result.summary?.nofollowBacklinks);
+  const followUnknown = metricValue(result.followUnknownBacklinks, result.summary?.followUnknownBacklinks);
+  // The ratio only covers rows whose export states follow/nofollow; rows
+  // without that evidence are never counted as nofollow.
+  const followKnown = dofollowCount != null && nofollowCount != null ? Number(dofollowCount) + Number(nofollowCount) : null;
+  const ratioDetail =
+    followKnown != null
+      ? `Share of followed links among the ${formatNumber(followKnown)} rows with known follow status. Rows without follow evidence are not counted.`
+      : "Share of followed links among rows whose export states follow or nofollow. Rows without follow evidence are not counted.";
   return (
     <ReportSection
       title="Snapshot"
@@ -868,9 +983,17 @@ function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: 
           { title: "Visible rows", value: rows, detail: `Rows currently loaded in the ${tab} tab.` },
           { title: "Backlinks", value: backlinks, detail: "Total backlinks from the imported rows." },
           { title: "Referring domains", value: referringDomains, detail: "Unique linking domains from the imported rows." },
-          { title: "Dofollow %", value: dofollowRatio, detail: "Dofollow ratio computed from the imported rows." },
+          { title: "Dofollow %", value: dofollowRatio, detail: ratioDetail, format: (value) => `${formatNumber(value)}%` },
+          { title: "Nofollow", value: nofollowCount, detail: "Imported rows the export marks as not followed." },
+          { title: "Follow unknown", value: followUnknown, detail: "Imported rows whose export did not state follow or nofollow." },
         ]}
       />
+      {dofollowRatio != null && followKnown != null ? (
+        <p className="mt-3 text-xs text-muted-foreground">
+          Dofollow % is over the {formatNumber(followKnown)} rows with known follow status
+          {Number(followUnknown || 0) > 0 ? `; ${formatNumber(followUnknown)} rows have no follow evidence and are left out` : ""}.
+        </p>
+      ) : null}
     </ReportSection>
   );
 }
@@ -878,7 +1001,15 @@ function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: 
 function BacklinksRowsTable({ rows }: { rows: any[] }) {
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>From</TableHead><TableHead>Anchor</TableHead><TableHead>Rank</TableHead><TableHead>Spam</TableHead><TableHead>Type</TableHead></TableRow></TableHeader>
+      <TableHeader>
+        <TableRow>
+          <SortableTableHead sortKey="domainFrom">From</SortableTableHead>
+          <SortableTableHead sortKey="anchor">Anchor</SortableTableHead>
+          <SortableTableHead sortKey="rank">Rank</SortableTableHead>
+          <SortableTableHead sortKey="spamScore">Spam</SortableTableHead>
+          <SortableTableHead sortKey="isDofollow">Type</SortableTableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
         {rows.map((row, index) => (
           <TableRow key={`${row.urlFrom}:${index}`}>
@@ -886,7 +1017,15 @@ function BacklinksRowsTable({ rows }: { rows: any[] }) {
             <TableCell className="max-w-xs truncate">{row.anchor || "-"}</TableCell>
             <TableCell className="nums">{formatNumber(row.rank)}</TableCell>
             <TableCell className="nums">{formatNumber(row.spamScore)}</TableCell>
-            <TableCell><Badge variant={row.isDofollow ? "good" : "outline"}>{row.isDofollow ? "follow" : "nofollow"}</Badge></TableCell>
+            <TableCell>
+              {row.isDofollow === true ? (
+                <Badge variant="good">follow</Badge>
+              ) : row.isDofollow === false ? (
+                <Badge variant="warn">nofollow</Badge>
+              ) : (
+                <Badge variant="outline">unknown</Badge>
+              )}
+            </TableCell>
           </TableRow>
         ))}
       </TableBody>
@@ -897,7 +1036,15 @@ function BacklinksRowsTable({ rows }: { rows: any[] }) {
 function ReferringDomainsTable({ rows }: { rows: any[] }) {
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>Domain</TableHead><TableHead>Backlinks</TableHead><TableHead>Pages</TableHead><TableHead>Rank</TableHead><TableHead>Spam</TableHead></TableRow></TableHeader>
+      <TableHeader>
+        <TableRow>
+          <SortableTableHead sortKey="domain">Domain</SortableTableHead>
+          <SortableTableHead sortKey="backlinks">Backlinks</SortableTableHead>
+          <SortableTableHead sortKey="referringPages">Pages</SortableTableHead>
+          <SortableTableHead sortKey="rank">Rank</SortableTableHead>
+          <SortableTableHead sortKey="spamScore">Spam</SortableTableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
         {rows.map((row) => (
           <TableRow key={row.domain}>
@@ -916,7 +1063,15 @@ function ReferringDomainsTable({ rows }: { rows: any[] }) {
 function BacklinkPagesTable({ rows }: { rows: any[] }) {
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>Page</TableHead><TableHead>Backlinks</TableHead><TableHead>Ref. domains</TableHead><TableHead>Rank</TableHead><TableHead>Broken</TableHead></TableRow></TableHeader>
+      <TableHeader>
+        <TableRow>
+          <SortableTableHead sortKey="page">Page</SortableTableHead>
+          <SortableTableHead sortKey="backlinks">Backlinks</SortableTableHead>
+          <SortableTableHead sortKey="referringDomains">Ref. domains</SortableTableHead>
+          <SortableTableHead sortKey="rank">Rank</SortableTableHead>
+          <SortableTableHead sortKey="brokenBacklinks">Broken</SortableTableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
         {rows.map((row) => (
           <TableRow key={row.page}>

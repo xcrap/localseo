@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState, type ComponentProps, type SyntheticEvent,
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpRight, Bot, FileSearch, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, type Site } from "../../api";
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Badge, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
-import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ProgressBar, ReportSection, ScanPlanPreview, ScanPlanSummary, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatMs, formatNumber, keywordToolDefaultsLabel, preferredScanUrl, scanProgress, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, toast } from "@/components/ui";
+import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
 import { cn } from "@/lib/utils";
-import { ScanTable } from "./scans";
+import { ScanTable } from "./scans/scan-table";
+import { CwvOverviewCard } from "../cwv";
+import { SiteScheduleCard } from "../schedule";
 
 export function Overview({
   site,
@@ -17,8 +19,6 @@ export function Overview({
   selectSite: (id: string) => void;
 }) {
   const [summary, setSummary] = useState<any>(null);
-  const [scan, setScan] = useState<any>(null);
-  const [scanRun, setScanRun] = useState<any>(null);
   const [scanning, setScanning] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -28,12 +28,24 @@ export function Overview({
   const [firstCrawlHost, setFirstCrawlHost] = useState<Site["crawl_host"]>("auto");
   const [firstScanError, setFirstScanError] = useState("");
   const navigate = useNavigate();
-  const scanLedgerRows = sortScanRows(
-    (summary?.allScans || summary?.latestScans || []).filter((row: any) => row.site_id === site.id),
+  // Dashboard scan rows are lite (no pages/issues arrays); the full report is
+  // loaded on the scans page.
+  const scanLedgerRows = useMemo(
+    () => sortScanRows((summary?.latestScans || []).filter((row: any) => row.site_id === site.id)),
+    [summary, site.id],
   );
 
   useEffect(() => {
-    api.dashboard(site.id).then(setSummary).catch(console.error);
+    let cancelled = false;
+    api
+      .dashboard(site.id)
+      .then((data) => {
+        if (!cancelled) setSummary(data);
+      })
+      .catch(console.error);
+    return () => {
+      cancelled = true;
+    };
   }, [site.id]);
 
   useEffect(() => {
@@ -55,13 +67,12 @@ export function Overview({
     setScanError("");
     try {
       const result = await api.scanSite(site.id);
-      setScan(result);
-      setScanRun(result.scan);
       if (result.scan?.id) {
         setSelectedScanId(site.id, result.scan.id);
         navigate(`/scans/${result.scan.id}`);
+      } else {
+        navigate("/scans");
       }
-      setSummary(await api.dashboard(site.id));
     } catch (err) {
       setScanError(err instanceof Error ? err.message : "Could not start site scan");
     } finally {
@@ -101,18 +112,6 @@ export function Overview({
       setScanning(false);
     }
   }
-
-  useEffect(() => {
-    if (!scanRun || (scanRun.status !== "queued" && scanRun.status !== "running")) return;
-    const interval = window.setInterval(async () => {
-      const nextScan = await api.scan(scanRun.id);
-      setScanRun(nextScan);
-      if (nextScan?.status === "completed" || nextScan?.status === "failed") {
-        setSummary(await api.dashboard(site.id));
-      }
-    }, 1500);
-    return () => window.clearInterval(interval);
-  }, [scanRun?.id, scanRun?.status]);
 
   const firstScanPlan = {
     domain: firstDomain,
@@ -200,31 +199,15 @@ export function Overview({
         </section>
       ) : null}
       {scanError && <p className="mb-6 rounded-lg bg-bad-soft/50 px-3.5 py-2.5 text-sm text-destructive">{scanError}</p>}
-      {scan && (
-        <section className="mb-6 rounded-2xl border border-primary/25 bg-primary/[0.03] p-5">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h2 className="font-heading text-lg leading-tight">
-                {scanRun?.status === "completed" ? "Scan complete" : scanRun?.status === "failed" ? "Scan failed" : "Scan running"}
-                <span className="ml-2 text-sm text-muted-foreground">{scan.scanUrl || scanRun?.url || scan.site}</span>
-              </h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                {scanRun?.pages_crawled || 0} pages scanned · {scanRun?.issue_count || 0} issues found
-              </p>
-            </div>
-            <Button asChild variant="secondary" size="sm">
-              <Link to={scanRun?.id ? `/scans/${scanRun.id}` : "/scans"}>Open scan report</Link>
-            </Button>
-          </div>
-          <div className="space-y-4">
-            <ProgressBar value={scanProgress(scanRun)} />
-            {scan.related?.length ? <ScanCoverageList rows={scan.related} scanStatus={scanRun?.status} /> : null}
-          </div>
-        </section>
-      )}
       <div className="mb-8">
         <SiteCommandCenter summary={summary} />
       </div>
+      {site.domain ? (
+        <div className="mb-8 grid gap-x-8 gap-y-8 xl:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+          <SiteScheduleCard siteId={site.id} />
+          <CwvOverviewCard siteId={site.id} />
+        </div>
+      ) : null}
       <div className="grid gap-x-8 gap-y-8 2xl:grid-cols-[minmax(0,1.1fr)_minmax(520px,0.9fr)]">
         <ReportSection title="Scan history" meta={`${formatNumber(scanLedgerRows.length)} saved`}>
           {scanLedgerRows.length ? (
@@ -279,21 +262,46 @@ function SiteCommandCenter({
 }: {
   summary: any;
 }) {
-  const latestScan = summary?.latestScans?.[0];
+  const latestScan = sortScanRows<any>(summary?.latestScans || [])[0];
   const latestScanSummary = latestScan?.result?.summary || {};
   const latestScanSpeed = latestScan ? scanSpeedMetrics(latestScan) : null;
+  const latestSeverity = latestScan ? scanSeverityCounts(latestScan) : null;
   const latestGscImport = summary?.latestGscImport;
-  const brokenLinks = Number(latestScanSummary.brokenLinks || 0);
+  const gscSourceText = latestGscImport?.source === "api" ? "API sync" : latestGscImport?.source === "csv" ? "CSV import" : "import";
+  // The date range arrives as startDate/endDate (or a nested range object).
+  const gscRange = latestGscImport?.range || latestGscImport;
+  const gscRangeText =
+    gscRange?.startDate || gscRange?.endDate ? ` covering ${formatDate(gscRange.startDate)} – ${formatDate(gscRange.endDate)}` : "";
+  const gscClicks = knownNumber(latestGscImport?.totals?.clicks);
+  const brokenLinks = knownNumber(latestScanSummary.brokenLinks);
+  // The dashboard sends at most 10 recent jobs, so a full list is a lower bound.
+  const aiJobs: any[] = summary?.latestAiJobs || [];
+  // The tile color follows what the scan found, not merely that one exists.
+  const technicalTone: ControlTileModel["tone"] = !latestScan
+    ? "warn"
+    : latestScan.status === "failed"
+      ? "bad"
+      : latestScan.status !== "completed"
+        ? "warn"
+        : latestSeverity?.high
+          ? "bad"
+          : latestSeverity?.medium
+            ? "warn"
+            : "good";
   const tiles: ControlTileModel[] = [
     {
       key: "scan",
       label: "Technical scan",
       to: latestScan ? `/scans/${latestScan.id}` : "/scans",
       value: latestScan ? <CountUp value={latestScan.issue_count} /> : "—",
-      status: latestScan ? `${scanStatusLabel(latestScan.status)} · ${formatNumber(latestScan.pages_crawled)} pages` : "Needs scan",
-      tone: latestScan ? (latestScan.status === "failed" ? "bad" : "good") : "warn",
+      status: !latestScan
+        ? "Needs scan"
+        : latestScan.status === "completed" && latestSeverity
+          ? `${formatNumber(latestSeverity.high)} high · ${formatNumber(latestSeverity.medium)} med · ${formatNumber(latestScan.pages_crawled)} pages`
+          : `${scanStatusLabel(latestScan.status)} · ${formatNumber(latestScan.pages_crawled)} pages`,
+      tone: technicalTone,
       tip: latestScan
-        ? `Open issues found across ${formatNumber(latestScan.pages_crawled)} crawled pages, with ${formatNumber(latestScanSummary.checkedLinks || 0)} links checked. Opens the full scan report.`
+        ? `Open issues found across ${formatNumber(latestScan.pages_crawled)} crawled pages${latestSeverity ? ` — ${formatNumber(latestSeverity.high)} high, ${formatNumber(latestSeverity.medium)} medium, ${formatNumber(latestSeverity.low)} low` : ""}, with ${formatNumber(latestScanSummary.checkedLinks)} links checked. Opens the full scan report.`
         : "No crawl evidence saved yet. Run a scan to build the technical report.",
     },
     {
@@ -313,9 +321,9 @@ function SiteCommandCenter({
       key: "links",
       label: "Links",
       to: "/links",
-      value: latestScan ? <CountUp value={latestScanSummary.linkTags || 0} /> : "—",
-      status: latestScan ? `${formatNumber(brokenLinks)} broken` : "Needs scan",
-      tone: latestScan ? (brokenLinks ? "bad" : "good") : "warn",
+      value: latestScan ? <CountUp value={latestScanSummary.linkTags} /> : "—",
+      status: latestScan ? (brokenLinks === null ? "broken links not recorded" : `${formatNumber(brokenLinks)} broken`) : "Needs scan",
+      tone: latestScan ? (brokenLinks ? "bad" : brokenLinks === null ? "outline" : "good") : "warn",
       tip: latestScan
         ? "Link tags found in the last crawl. Opens the local link graph."
         : "Run a site scan to build the local link graph.",
@@ -324,7 +332,7 @@ function SiteCommandCenter({
       key: "organic",
       label: "Organic research",
       to: "/domain",
-      value: <CountUp value={summary?.savedKeywordCount || 0} />,
+      value: <CountUp value={summary?.savedKeywordCount} />,
       status: summary?.savedKeywordCount ? "keywords saved" : "ready for research",
       tone: summary?.savedKeywordCount ? "good" : "outline",
       tip: "Saved keywords in the local list. Local crawl pages feed the organic research screen.",
@@ -333,8 +341,8 @@ function SiteCommandCenter({
       key: "rank",
       label: "Rank tracking",
       to: "/rank",
-      value: <CountUp value={summary?.trackerCount || 0} />,
-      status: `${formatNumber(summary?.serpRunCount || 0)} SERP runs`,
+      value: <CountUp value={summary?.trackerCount} />,
+      status: `${formatNumber(summary?.serpRunCount)} SERP runs`,
       tone: summary?.trackerCount ? "good" : "outline",
       tip: "Tracked keywords and saved SERP position checks for this site.",
     },
@@ -342,23 +350,23 @@ function SiteCommandCenter({
       key: "gsc",
       label: "Search Console",
       to: "/gsc",
-      value: <CountUp value={summary?.gscImportCount || 0} />,
+      value: <CountUp value={summary?.gscImportCount} />,
       status: summary?.gscImportCount
-        ? `latest import: ${formatNumber(latestGscImport?.rowCount || 0)} rows`
+        ? `latest ${gscSourceText}: ${formatNumber(latestGscImport?.rowCount)} rows`
         : "ready for import",
       tone: summary?.gscImportCount ? "good" : "outline",
       tip: summary?.gscImportCount
-        ? `Local CSV imports. The latest has ${formatNumber(latestGscImport?.rowCount || 0)} rows and ${formatNumber(latestGscImport?.totals?.clicks || 0)} clicks.`
+        ? `Search Console API syncs and CSV imports saved locally. The latest ${gscSourceText}${gscRangeText} has ${formatNumber(latestGscImport?.rowCount)} rows${gscClicks !== null ? ` and ${formatNumber(gscClicks)} clicks` : ""}.`
         : "Import a Search Console CSV locally, or connect Google for live performance and inspection.",
     },
     {
       key: "ai",
       label: "AI lab",
       to: "/ai",
-      value: <CountUp value={summary?.latestAiJobs?.length || 0} />,
-      status: summary?.latestAiJobs?.length ? "jobs saved" : "ready for Codex",
-      tone: summary?.latestAiJobs?.length ? "good" : "outline",
-      tip: "Saved Codex jobs. Runs locally through the Codex CLI with medium reasoning.",
+      value: !summary ? "—" : <CountUp value={summary.aiJobCount ?? aiJobs.length} />,
+      status: aiJobs.length ? "recent jobs saved" : "ready for Codex",
+      tone: aiJobs.length ? "good" : "outline",
+      tip: "Saved Codex jobs for this site. Runs locally through the Codex CLI with medium reasoning.",
     },
   ];
 
@@ -385,37 +393,6 @@ function SiteCommandCenter({
         ))}
       </div>
     </section>
-  );
-}
-
-function ScanCoverageList({ rows, scanStatus }: { rows: any[]; scanStatus?: string }) {
-  return (
-    <div className="divide-y divide-border/60 rounded-xl border border-border/70 bg-card/60">
-      {rows.map((row) => {
-        const status = row.key === "technical-scan" && scanStatus ? scanStatus : row.status;
-        const tone = status === "completed" || status === "queued" || status === "running" || status === "local" ? "good" : status === "needs-provider" ? "warn" : "outline";
-        const actionLabel = row.key === "technical-scan"
-          ? "Open live report"
-          : row.key === "page-speed"
-            ? "Open speed report"
-            : `Open ${String(row.label || "").toLowerCase()}`;
-        return (
-          <div key={row.key} className="grid gap-x-4 gap-y-1 px-4 py-2.5 lg:grid-cols-[200px_1fr_auto] lg:items-center">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              <StatusDot tone={tone as any} />
-              {row.label}
-              <span className="font-normal text-muted-foreground">{scanStatusLabel(status)}</span>
-            </div>
-            <p className="min-w-0 truncate text-[13px] text-muted-foreground" title={row.message}>{row.message}</p>
-            {row.route ? (
-              <Link className="text-sm font-medium text-primary underline-offset-4 hover:underline" to={row.route}>
-                {actionLabel}
-              </Link>
-            ) : null}
-          </div>
-        );
-      })}
-    </div>
   );
 }
 
@@ -600,13 +577,11 @@ export function EditSiteDialog({
 }
 
 export function SitesManager({
-  variant,
   sites,
   reloadSites,
   activeSiteId,
   selectSite,
 }: {
-  variant: "home" | "settings";
   sites: Site[];
   reloadSites: () => Promise<void>;
   activeSiteId: string;
@@ -621,17 +596,6 @@ export function SitesManager({
     crawlProtocol: Site["crawl_protocol"];
     crawlHost: Site["crawl_host"];
   };
-  type SiteEditForm = {
-    name: string;
-    domain: string;
-    notes: string;
-    location_code: number;
-    language_code: string;
-    crawl_protocol: Site["crawl_protocol"];
-    crawl_host: Site["crawl_host"];
-    crawl_speed: Site["crawl_speed"];
-    crawl_max_pages: number;
-  };
   const initialSiteForm: SiteForm = {
     name: "",
     domain: "",
@@ -643,34 +607,19 @@ export function SitesManager({
   };
   const [open, setOpen] = useState(false);
   const [showKeywordDefaults, setShowKeywordDefaults] = useState(false);
-  const [showEditKeywordDefaults, setShowEditKeywordDefaults] = useState(false);
   const [siteDefaults, setSiteDefaults] = useState<SiteForm>(initialSiteForm);
   const [form, setForm] = useState<SiteForm>(initialSiteForm);
   const [editing, setEditing] = useState<Site | null>(null);
   const [deleting, setDeleting] = useState<Site | null>(null);
-  const [editForm, setEditForm] = useState<SiteEditForm>({
-    name: "",
-    domain: "",
-    notes: "",
-    location_code: defaultKeywordLocationCode,
-    language_code: defaultKeywordLanguageCode,
-    crawl_protocol: "auto",
-    crawl_host: "auto",
-    crawl_speed: "auto",
-    crawl_max_pages: 0,
-  });
   const [error, setError] = useState("");
   const [scanningSiteId, setScanningSiteId] = useState("");
   const [creatingAction, setCreatingAction] = useState<"scan" | "save" | "">("");
   const [deletingSiteId, setDeletingSiteId] = useState("");
-  const [editingSiteId, setEditingSiteId] = useState("");
-  const [editIgnoreCount, setEditIgnoreCount] = useState<number | null>(null);
-  const [clearingIgnores, setClearingIgnores] = useState(false);
   const [allScans, setAllScans] = useState<any[]>([]);
   const navigate = useNavigate();
 
+  // Lite scan rows: score and severity summary per site, no report arrays.
   useEffect(() => {
-    if (variant !== "home") return;
     let cancelled = false;
     api.allScans()
       .then((rows) => {
@@ -680,7 +629,7 @@ export function SitesManager({
     return () => {
       cancelled = true;
     };
-  }, [variant, sites.length]);
+  }, [sites.length]);
 
   const healthBySite = useMemo(() => {
     const map = new Map<string, any>();
@@ -755,61 +704,6 @@ export function SitesManager({
     await createSite(true);
   }
 
-  function startEdit(site: Site) {
-    setEditing(site);
-    setShowEditKeywordDefaults(false);
-    setError("");
-    setEditIgnoreCount(null);
-    api
-      .issueIgnores(site.id)
-      .then((rules) => setEditIgnoreCount(Array.isArray(rules) ? rules.length : 0))
-      .catch(() => setEditIgnoreCount(0));
-    setEditForm({
-      name: site.name,
-      domain: site.domain || "",
-      notes: site.notes || "",
-      location_code: site.location_code || defaultKeywordLocationCode,
-      language_code: site.language_code || defaultKeywordLanguageCode,
-      crawl_protocol: site.crawl_protocol || "auto",
-      crawl_host: site.crawl_host || "auto",
-      crawl_speed: site.crawl_speed || "auto",
-      crawl_max_pages: Number(site.crawl_max_pages || 0),
-    });
-  }
-
-  async function submitEdit(event: SyntheticEvent) {
-    event.preventDefault();
-    if (!editing) return;
-    setError("");
-    setEditingSiteId(editing.id);
-    try {
-      const updated = await api.updateSite(editing.id, editForm);
-      setEditing(null);
-      await reloadSites();
-      toast.success(`${cleanSiteDomain(updated.domain) || updated.name || "Site"} updated locally.`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Could not update site";
-      setError(message);
-      toast.error(message);
-    } finally {
-      setEditingSiteId("");
-    }
-  }
-
-  async function clearIgnores() {
-    if (!editing) return;
-    setClearingIgnores(true);
-    try {
-      const result = await api.clearIssueIgnores(editing.id);
-      setEditIgnoreCount(0);
-      toast.success(result.deleted === 1 ? "1 ignore rule cleared" : `${result.deleted} ignore rules cleared`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not clear ignore rules");
-    } finally {
-      setClearingIgnores(false);
-    }
-  }
-
   async function deleteSite(site: Site) {
     setError("");
     setDeletingSiteId(site.id);
@@ -852,44 +746,6 @@ export function SitesManager({
     crawl_protocol: form.crawlProtocol,
     crawl_host: form.crawlHost,
   };
-  const editScanPlan = {
-    domain: editForm.domain,
-    crawl_protocol: editForm.crawl_protocol,
-    crawl_host: editForm.crawl_host,
-  };
-  function siteActions(site: Site, layout: "mobile" | "desktop" = "desktop") {
-    const mobile = layout === "mobile";
-    const buttonClass = mobile ? "h-11 min-w-32 flex-1 sm:flex-none" : undefined;
-    return (
-      <div className={cn("flex flex-wrap gap-2", mobile ? "" : "justify-end")}>
-        {activeSiteId !== site.id ? (
-          <Button size={mobile ? "default" : "sm"} variant="secondary" className={buttonClass} onClick={() => selectSite(site.id)}>
-            Make active
-          </Button>
-        ) : null}
-        {site.domain ? (
-          <Button
-            size={mobile ? "default" : "sm"}
-            variant="outline"
-            className={buttonClass}
-            aria-label={`Scan ${site.name}`}
-            title={`Scan ${site.domain}`}
-            disabled={scanningSiteId === site.id}
-            onClick={() => scanSite(site)}
-          >
-            <FileSearch /> {scanningSiteId === site.id ? "Starting" : "Scan website"}
-          </Button>
-        ) : null}
-        <Button size={mobile ? "default" : "sm"} variant="outline" className={buttonClass} aria-label={`Edit ${site.name}`} onClick={() => startEdit(site)}>
-          <Pencil /> Edit
-        </Button>
-        <Button size={mobile ? "default" : "sm"} variant="destructive" className={buttonClass} aria-label={`Delete ${site.name}`} onClick={() => setDeleting(site)}>
-          <Trash2 /> Delete
-        </Button>
-      </div>
-    );
-  }
-
   const onboarding = (
     <section className="rounded-2xl border border-dashed border-primary/35 p-6 sm:p-9">
       <div className="mx-auto max-w-2xl text-center">
@@ -938,7 +794,8 @@ export function SitesManager({
   function renderSiteRow(site: Site) {
     const scan = healthBySite.get(site.id);
     const scanned = Boolean(scan);
-    const score = Number(scan?.score || 0);
+    // Running or failed scans have no score yet: show "-", not 0.
+    const score = knownNumber(scan?.score);
     const isActive = activeSiteId === site.id;
     const sev = scanned ? scanSeverityCounts(scan) : { high: 0, medium: 0, low: 0 };
     const openWorkspace = () => {
@@ -972,7 +829,13 @@ export function SitesManager({
         <div className="hidden items-baseline gap-3 md:flex">
           {scanned ? (
             <>
-              <span className="metric w-14 shrink-0 text-right text-2xl leading-none" style={{ color: scoreTone(score) }}>{formatNumber(score)}</span>
+              <span
+                className="metric w-14 shrink-0 text-right text-2xl leading-none"
+                style={score === null ? undefined : { color: scoreTone(score) }}
+                title={scan.status === "cancelled" ? "Partial crawl: the scan was cancelled" : undefined}
+              >
+                {formatNumber(score)}
+              </span>
               <span className="w-44 shrink-0 truncate whitespace-nowrap text-xs text-muted-foreground">
                 <span className={sev.high ? "font-medium text-bad" : ""}>{formatNumber(sev.high)}</span> high ·{" "}
                 <span className={sev.medium ? "font-medium text-warn" : ""}>{formatNumber(sev.medium)}</span> med · {formatNumber(scan.pages_crawled)} pages
@@ -989,7 +852,7 @@ export function SitesManager({
               <FileSearch /> {scanningSiteId === site.id ? "Starting" : "Scan"}
             </Button>
           ) : null}
-          <Button size="icon" variant="ghost" className="size-8 text-muted-foreground/70 hover:text-foreground" aria-label={`Edit ${site.name}`} onClick={() => startEdit(site)}>
+          <Button size="icon" variant="ghost" className="size-8 text-muted-foreground/70 hover:text-foreground" aria-label={`Edit ${site.name}`} onClick={() => setEditing(site)}>
             <Pencil />
           </Button>
           <Button size="icon" variant="ghost" className="size-8 text-muted-foreground/70 hover:text-destructive" aria-label={`Delete ${site.name}`} onClick={() => setDeleting(site)}>
@@ -1058,84 +921,6 @@ export function SitesManager({
     </Dialog>
   );
 
-  const editDialog = (
-    <Dialog open={Boolean(editing)} onOpenChange={(nextOpen) => !nextOpen && setEditing(null)}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Edit site</DialogTitle>
-          <DialogDescription>Changes apply to this saved website address and future scans.</DialogDescription>
-        </DialogHeader>
-        <form className="space-y-4" onSubmit={submitEdit}>
-          <Field label="Site name"><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} required /></Field>
-          <Field label="Website address"><Input value={editForm.domain} onChange={(e) => setEditForm({ ...editForm, domain: e.target.value })} /></Field>
-          <KeywordToolDefaultsPanel
-            expanded={showEditKeywordDefaults}
-            locationCode={editForm.location_code}
-            languageCode={editForm.language_code}
-            onToggle={() => setShowEditKeywordDefaults((value) => !value)}
-            onLocationCodeChange={(value) => setEditForm({ ...editForm, location_code: value })}
-            onLanguageCodeChange={(value) => setEditForm({ ...editForm, language_code: value })}
-          />
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Scan protocol">
-              <Select value={editForm.crawl_protocol} onValueChange={(value) => setEditForm({ ...editForm, crawl_protocol: value as Site["crawl_protocol"] })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {crawlProtocolOptions.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="Host variant">
-              <Select value={editForm.crawl_host} onValueChange={(value) => setEditForm({ ...editForm, crawl_host: value as Site["crawl_host"] })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {crawlHostOptions.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="Crawl speed">
-              <Select value={editForm.crawl_speed} onValueChange={(value) => setEditForm({ ...editForm, crawl_speed: value as Site["crawl_speed"] })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {crawlSpeedOptions.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="Max pages per scan">
-              <Input
-                type="number"
-                min={10}
-                max={1000}
-                placeholder="App default"
-                value={editForm.crawl_max_pages || ""}
-                onChange={(e) => setEditForm({ ...editForm, crawl_max_pages: Number(e.target.value) || 0 })}
-              />
-            </Field>
-          </div>
-          <ScanPlanPreview site={editScanPlan} />
-          <Field label="Notes"><Textarea value={editForm.notes} onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })} /></Field>
-          {editIgnoreCount ? (
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 px-3.5 py-2.5">
-              <div className="text-sm">
-                <div className="font-medium">Ignored issues</div>
-                <p className="text-xs text-muted-foreground">
-                  {formatNumber(editIgnoreCount)} saved ignore {editIgnoreCount === 1 ? "rule" : "rules"} hide issues from this site's reports and scoring.
-                </p>
-              </div>
-              <Button type="button" variant="outline" size="sm" disabled={clearingIgnores} onClick={clearIgnores}>
-                <Trash2 /> {clearingIgnores ? "Clearing" : "Clear all"}
-              </Button>
-            </div>
-          ) : null}
-          {error && <p className="text-sm text-destructive">{error}</p>}
-          <Button type="submit" disabled={Boolean(editingSiteId)}>
-            <Pencil /> {editingSiteId ? "Saving changes" : "Save changes"}
-          </Button>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
-
   const deleteDialog = (
     <AlertDialog open={Boolean(deleting)} onOpenChange={(nextOpen) => !nextOpen && setDeleting(null)}>
       <AlertDialogContent>
@@ -1156,110 +941,33 @@ export function SitesManager({
     </AlertDialog>
   );
 
-  if (variant === "home") {
-    return (
-      <>
-        <PageHeader
-          title="Your sites"
-          meta={`${formatNumber(sites.length)} ${sites.length === 1 ? "site" : "sites"} · open one to enter its workspace`}
-          action={
-            sites.length ? (
-              <Button onClick={() => setOpen(true)}>
-                <Plus /> Add site
-              </Button>
-            ) : undefined
-          }
-        />
-        {sites.length === 0 ? (
-          onboarding
-        ) : (
-          <div className="divide-y divide-border/70 overflow-hidden rounded-xl border border-border bg-card">
-            {sites.map((site) => renderSiteRow(site))}
-          </div>
-        )}
-        {addDialog}
-        {editDialog}
-        {deleteDialog}
-      </>
-    );
-  }
-
   return (
     <>
-      <section className="overflow-hidden rounded-xl border border-border bg-card">
-        <div className="flex flex-col gap-3 border-b border-border/70 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="font-heading text-lg font-semibold">Sites</h2>
-            <p className="mt-0.5 text-sm text-muted-foreground">Saved website addresses and their crawl preferences. The active site drives every workspace screen.</p>
-          </div>
-          <Button size="sm" onClick={() => setOpen(true)}><Plus /> Add site</Button>
+      <PageHeader
+        title="Your sites"
+        meta={`${formatNumber(sites.length)} ${sites.length === 1 ? "site" : "sites"} · open one to enter its workspace`}
+        action={
+          sites.length ? (
+            <Button onClick={() => setOpen(true)}>
+              <Plus /> Add site
+            </Button>
+          ) : undefined
+        }
+      />
+      {sites.length === 0 ? (
+        onboarding
+      ) : (
+        <div className="divide-y divide-border/70 overflow-hidden rounded-xl border border-border bg-card">
+          {sites.map((site) => renderSiteRow(site))}
         </div>
-        <div className="p-5">
-          {sites.length === 0 ? (
-            onboarding
-          ) : (
-            <>
-              <div className="space-y-3 md:hidden">
-                {sites.map((site) => (
-                  <div key={site.id} className={cn("space-y-4 rounded-xl border p-4", activeSiteId === site.id ? "border-primary/30 bg-primary/[0.03]" : "border-border")}>
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="flex min-w-0 items-start gap-3">
-                        <SiteAvatar site={site} className="size-10" />
-                        <div className="min-w-0">
-                          <div className="break-words font-heading text-base font-semibold">{site.name}</div>
-                          <div className="mt-0.5 break-all text-sm text-muted-foreground">{site.domain || "Add a website address"}</div>
-                        </div>
-                      </div>
-                      {activeSiteId === site.id ? <Badge variant="good">Active</Badge> : <Badge variant="outline">Available</Badge>}
-                    </div>
-                    <ScanPlanSummary site={site} compact />
-                    {site.notes ? <p className="text-sm leading-6 text-muted-foreground">{site.notes}</p> : null}
-                    {siteActions(site, "mobile")}
-                  </div>
-                ))}
-              </div>
-              <div className="-mx-5 -mb-5 hidden md:block">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="pl-5">Site</TableHead>
-                      <TableHead>Scan plan</TableHead>
-                      <TableHead>Notes</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead className="pr-5 text-right">Actions</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {sites.map((site) => (
-                      <TableRow key={site.id} className={activeSiteId === site.id ? "bg-primary/[0.04]" : ""}>
-                        <TableCell className="min-w-64 pl-5">
-                          <div className="flex items-center gap-3">
-                            <SiteAvatar site={site} className="size-9" />
-                            <div className="min-w-0">
-                              <div className="font-medium">{site.name}</div>
-                              <div className="text-xs text-muted-foreground">{site.domain || "Add a website address"}</div>
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="min-w-56">
-                          <ScanPlanSummary site={site} compact />
-                        </TableCell>
-                        <TableCell className="max-w-md">
-                          <div className="line-clamp-2 text-sm text-muted-foreground">{site.notes || "No notes yet."}</div>
-                        </TableCell>
-                        <TableCell>{activeSiteId === site.id ? <Badge variant="good">Active</Badge> : <Badge variant="outline">Available</Badge>}</TableCell>
-                        <TableCell className="pr-5">{siteActions(site)}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            </>
-          )}
-        </div>
-      </section>
+      )}
       {addDialog}
-      {editDialog}
+      <EditSiteDialog
+        site={editing}
+        open={Boolean(editing)}
+        onOpenChange={(nextOpen) => !nextOpen && setEditing(null)}
+        onSaved={reloadSites}
+      />
       {deleteDialog}
     </>
   );

@@ -2,8 +2,8 @@ import { useEffect, useState, type SyntheticEvent } from "react";
 import { Link } from "react-router-dom";
 import { Bot, ExternalLink, Sparkles } from "lucide-react";
 import { api, type Site } from "../../api";
-import { Badge, Button, Input, Label, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
-import { EmptyState, Field, HistoryList, PageHeader, ProviderNotice, ReportSection, SourceBadge, StatsBand, StatusDot, StatusEvidenceTable } from "../shared";
+import { Button, Input, Label, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
+import { EmptyState, Field, HistoryList, PageHeader, ProviderNotice, ReportSection, SourceBadge, StatsBand, StatusDot, StatusEvidenceTable, formatNumber } from "../shared";
 
 export function BrandLookupPage({ site }: { site: Site }) {
   const [query, setQuery] = useState(site.domain || site.name);
@@ -63,16 +63,65 @@ function formatRunCount(count: number) {
   return count === 1 ? "1 run" : `${count} runs`;
 }
 
+type BrandResultCount = {
+  label: string;
+  isPrimary?: boolean;
+  resultCount: number | null;
+  maxResults?: number | null;
+  error?: string;
+};
+
+// Exact-phrase web results per name, out of the first N results checked. A raw
+// count from one search, not a share of voice or a visibility score.
+function BrandResultCounts({ rows }: { rows: BrandResultCount[] }) {
+  if (!rows.length) {
+    return <EmptyState title="No result counts" text="This lookup saved no per-name search counts." />;
+  }
+  return (
+    <div className="space-y-3">
+      {rows.map((row) => {
+        const max = Number(row.maxResults || 0);
+        const count = row.resultCount;
+        return (
+          <div key={row.label} className="space-y-1">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+              <span className={row.isPrimary ? "font-semibold" : ""}>
+                {row.label}
+                {row.isPrimary ? <span className="ml-1.5 text-xs font-normal text-muted-foreground">looked up</span> : null}
+              </span>
+              {count == null ? (
+                <span className="text-xs text-bad">Search failed</span>
+              ) : (
+                <span className="nums">
+                  {formatNumber(count)}
+                  {max ? <span className="text-muted-foreground"> of first {formatNumber(max)}</span> : null}
+                </span>
+              )}
+            </div>
+            {count != null && max ? (
+              <div className="h-2 rounded-full bg-muted" aria-hidden>
+                <div className="h-2 rounded-full bg-primary" style={{ width: `${Math.min(100, (count / max) * 100)}%` }} />
+              </div>
+            ) : null}
+            {count == null && row.error ? <p className="text-xs text-muted-foreground">{row.error}</p> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function BrandLookupResult({ result }: { result: any }) {
-  const shareRows = result.shareOfVoice || [];
-  const totalShare = shareRows.reduce((sum: number, row: any) => sum + Number(row.value || 0), 0);
+  const countRows: BrandResultCount[] = Array.isArray(result.resultCounts) ? result.resultCounts : [];
+  const maxResults = countRows.find((row) => row.maxResults)?.maxResults;
   const citationRows = result.citations || [];
   const recommendationRows = result.recommendations || [];
   return (
     <div className="space-y-6">
       {result.warning ? <ProviderNotice title="Lookup warning" text={result.warning} source={result.source} /> : null}
       <ReportSection
-        title="Share of voice"
+        title="Exact-phrase web results"
+        description={`How many results an exact-phrase web search returned for each name, among the first ${maxResults ? formatNumber(maxResults) : "results"} checked. A raw result count, not share of voice or visibility.`}
         meta={
           <span className="inline-flex flex-wrap items-center gap-2">
             <SourceBadge source={result.source} />
@@ -80,30 +129,16 @@ function BrandLookupResult({ result }: { result: any }) {
           </span>
         }
       >
-        <div className="space-y-3">
-          {shareRows.length ? shareRows.map((row: any) => {
-            const percent = totalShare ? Math.round((Number(row.value || 0) / totalShare) * 100) : Number(row.value || 0);
-            return (
-              <div key={row.label} className="space-y-1">
-                <div className="flex items-center justify-between text-sm">
-                  <span className={row.isPrimary ? "font-semibold" : ""}>{row.label}</span>
-                  <span className="nums">{percent}%</span>
-                </div>
-                <div className="h-2 rounded-full bg-muted">
-                  <div className="h-2 rounded-full bg-primary" style={{ width: `${Math.min(100, percent)}%` }} />
-                </div>
-              </div>
-            );
-          }) : <EmptyState title="No share data" text="Run with competitors or connect a visibility data source to compare entities." />}
-        </div>
+        <BrandResultCounts rows={countRows} />
       </ReportSection>
       {result.platforms?.length ? (
         <StatsBand
-          title="Platform visibility"
+          title="Results by platform"
+          text="Result rows returned by each search platform for the looked-up name. Counts, not percentages."
           items={(result.platforms || []).map((platform: any) => ({
-            title: platform.platform.replaceAll("_", " "),
-            value: `${platform.visibility}%`,
-            detail: `${platform.mentions} mentions`,
+            title: String(platform.platform || "platform").replaceAll("_", " "),
+            value: platform.resultCount,
+            detail: platform.resultCount == null ? "No result count was saved for this platform." : `${formatNumber(platform.resultCount)} results returned`,
           }))}
         />
       ) : null}
@@ -270,7 +305,7 @@ function PromptResult({ result }: { result: any }) {
               { title: "Local job", status: result.jobId ? "Queued" : "None", tone: result.jobId ? "warn" : "good", text: result.jobId ? "Open the AI lab to read the Codex result when it finishes." : "No local Codex job was queued for this run." },
             ]}
           />
-          {result.jobId ? <Button asChild variant="secondary"><Link to="/ai"><Bot /> Open AI lab</Link></Button> : null}
+          {result.jobId ? <Button asChild variant="secondary"><Link to={`/ai?job=${encodeURIComponent(result.jobId)}`}><Bot /> Open AI lab</Link></Button> : null}
         </div>
       </ReportSection>
       <div className="grid gap-6 xl:grid-cols-2">
@@ -282,18 +317,10 @@ function PromptResult({ result }: { result: any }) {
         >
           <div className="space-y-4">
             <span className="inline-flex items-center gap-1.5 text-sm font-medium">
-              <StatusDot tone={row.brandMentioned ? "good" : "outline"} />
-              {row.brandMentioned ? "Mentioned" : "Not mentioned"}
+              <StatusDot tone={row.brandMentioned === true ? "good" : row.brandMentioned === false ? "warn" : "outline"} />
+              {row.brandMentioned === true ? "Mentioned" : row.brandMentioned === false ? "Not mentioned" : "Not checked"}
             </span>
             <p className="text-sm leading-6">{row.text}</p>
-            {row.fanOutQueries?.length ? (
-              <div className="space-y-2">
-                <Label>Fan-out queries</Label>
-                <div className="flex flex-wrap gap-2">
-                  {row.fanOutQueries.map((query: string) => <Badge key={query} variant="outline">{query}</Badge>)}
-                </div>
-              </div>
-            ) : null}
             {row.citations?.length ? (
               <div className="space-y-1">
                 <Label>Citations</Label>

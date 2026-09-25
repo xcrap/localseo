@@ -11,6 +11,7 @@ const SECRET_KEYS = new Set([
   "auth_session_secret",
   "google_client_secret",
   "mcp_token",
+  "pagespeed_api_key",
 ]);
 
 const APP_PREFERENCE_KEYS = new Set([
@@ -64,6 +65,7 @@ export function listPublicConfig(): Record<string, string | boolean | number> {
     "google_client_id",
     "google_client_secret",
     "mcp_token",
+    "pagespeed_api_key",
     "openserp_url",
     "searxng_url",
     "codex_model",
@@ -90,6 +92,12 @@ export function listPublicConfig(): Record<string, string | boolean | number> {
   };
 }
 
+// The URL the browser app is opened on (the Vite dev server in development,
+// the API itself in production). OAuth redirects and CORS use it.
+export function appUrl() {
+  return process.env.APP_URL?.trim() || "http://localhost:5173";
+}
+
 export function codexModel() {
   return getConfigValue("codex_model") || process.env.CODEX_MODEL || "";
 }
@@ -100,4 +108,16 @@ export function codexReasoningEffort() {
     process.env.CODEX_REASONING_EFFORT ||
     "medium"
   );
+}
+
+// Optional Google API key for PageSpeed Insights (PAGESPEED_API_KEY). PSI also
+// answers without a key, with a small shared quota.
+export function pageSpeedApiKey() {
+  return getConfigValue("pagespeed_api_key");
+}
+
+// PAGESPEED_API_URL points PageSpeed requests elsewhere (the smoke test uses a
+// local fixture).
+export function pageSpeedApiUrl() {
+  return process.env.PAGESPEED_API_URL?.trim() || "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 }

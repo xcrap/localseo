@@ -8,5 +8,5 @@ const email = (await rl.question("Admin email: ")).trim();
 const password = await rl.question("Password (min 10 chars): ");
 rl.close();
 
-const user = createOrReplaceAdmin(email, password);
+const user = await createOrReplaceAdmin(email, password);
 console.log(`Admin saved: ${user.email}`);

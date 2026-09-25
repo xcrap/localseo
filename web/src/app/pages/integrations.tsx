@@ -1,499 +1,99 @@
-import { useEffect, useMemo, useState, type ChangeEvent, type SyntheticEvent } from "react";
-import { BarChart3, Bot, ExternalLink, RefreshCw, Settings, Upload } from "lucide-react";
-import { api, type Site } from "../../api";
-import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsContent, TabsList, TabsTrigger, Textarea, toast } from "@/components/ui";
-import { DatePicker, EmptyState, Field, InfoTip, JobTable, PageHeader, ReportSection, StatsBand, StatusDot, StatusEvidenceTable, cleanSiteDomain, crawlHostOptions, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlMaxPagesFromConfig, defaultCrawlProtocolFromConfig, defaultCrawlSpeedFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatDateInput, formatNumber, formatPercent, formatPosition, languageOptions, marketOptions, preferredScanUrl, serpProviderStatus } from "../shared";
-import { cn } from "@/lib/utils";
+import { useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
+import { useSearchParams } from "react-router-dom";
+import { Bot, RefreshCw, Settings } from "lucide-react";
+import { api, isNotFoundError, type AiJob, type Site } from "../../api";
+import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
+import { EmptyState, Field, InfoTip, JobTable, PageHeader, ReportSection, StatusDot, StatusEvidenceTable, cleanSiteDomain, crawlHostOptions, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlMaxPagesFromConfig, defaultCrawlProtocolFromConfig, defaultCrawlSpeedFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatNumber, languageOptions, marketOptions, preferredScanUrl, serpProviderStatus } from "../shared";
 
-export function GscPage({ site }: { site: Site }) {
-  const defaultInspectionUrl = site.domain ? `${preferredScanUrl(site).replace(/\/$/, "")}/` : "";
-  const defaultGscProperty = site.domain ? `sc-domain:${cleanSiteDomain(site.domain).replace(/^www\./i, "")}` : "";
-  const [status, setStatus] = useState<any>(null);
-  const [sites, setSites] = useState<any[]>([]);
-  const [imports, setImports] = useState<any[]>([]);
-  const [performance, setPerformance] = useState<any>(null);
-  const [inspectUrls, setInspectUrls] = useState(defaultInspectionUrl);
-  const [inspection, setInspection] = useState<any>(null);
-  const [dimension, setDimension] = useState("query");
-  const [importSiteUrl, setImportSiteUrl] = useState(defaultGscProperty);
-  const [loading, setLoading] = useState("");
-  const [gscTab, setGscTab] = useState("performance");
-  const today = new Date();
-  const defaultEndDate = formatDateInput(today);
-  const defaultStartDate = formatDateInput(new Date(today.getTime() - 28 * 86400000));
-  const [dateRange, setDateRange] = useState({ startDate: defaultStartDate, endDate: defaultEndDate });
-  const latestImport = imports[0];
-  const selectedGscProperty = status?.connection?.siteUrl || "";
-  const connectionTone = status?.connected || imports.length ? "good" : status?.configured ? "warn" : "outline";
-  const connectionLabel = status?.connected ? "Connected" : imports.length ? "Local imports" : status?.configured ? "Ready to connect" : "OAuth missing";
+const AI_POLL_MS = 1500;
 
-  async function load() {
-    const [nextStatus, nextImports] = await Promise.all([
-      api.gscStatus(site.id),
-      api.gscImports(site.id),
-    ]);
-    setStatus(nextStatus);
-    setImports(nextImports);
-    if (nextImports[0]) {
-      showImport(nextImports[0]);
-    } else {
-      setPerformance(null);
-    }
-  }
-  useEffect(() => {
-    setImportSiteUrl(defaultGscProperty);
-    setInspectUrls(defaultInspectionUrl);
-    load().catch(console.error);
-  }, [site.id, site.domain, site.crawl_protocol, site.crawl_host]);
-
-  function showImport(row: any) {
-    setPerformance({ source: "import", import: row, rows: row.rows || [] });
-    setDimension(row.dimensions?.[0] || "query");
-  }
-
-  async function connect() {
-    try {
-      const { url } = await api.gscStart(site.id);
-      window.open(url, "_blank", "width=680,height=780");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not start Google connection");
-    }
-  }
-  async function loadSites() {
-    setLoading("sites");
-    try {
-      setSites(await api.gscSites(site.id));
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not load Search Console properties");
-    } finally {
-      setLoading("");
-    }
-  }
-  async function selectSite(siteUrl: string) {
-    setLoading("site");
-    try {
-      setStatus(await api.gscSetSite(site.id, siteUrl));
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not select property");
-    } finally {
-      setLoading("");
-    }
-  }
-  async function query() {
-    setLoading("performance");
-    try {
-      setPerformance(await api.gscPerformance({
-        siteId: site.id,
-        startDate: dateRange.startDate,
-        endDate: dateRange.endDate,
-        dimensions: [dimension],
-        rowLimit: 100,
-      }));
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not query Search Console performance");
-    } finally {
-      setLoading("");
-    }
-  }
-  async function importCsv(event: ChangeEvent<HTMLInputElement>) {
-    const input = event.currentTarget;
-    const file = input.files?.[0];
-    if (!file) return;
-    setLoading("import");
-    try {
-      const csv = await file.text();
-      const result = await api.gscImport({
-        siteId: site.id,
-        siteUrl: importSiteUrl || site.domain,
-        sourceName: file.name,
-        csv,
-      });
-      setImports((rows) => [result, ...rows.filter((row) => row.id !== result.id)]);
-      showImport(result);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not import Search Console CSV");
-    } finally {
-      input.value = "";
-      setLoading("");
-    }
-  }
-  async function inspect() {
-    setLoading("inspection");
-    try {
-      setInspection(await api.gscInspect({ siteId: site.id, urls: inspectUrls }));
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not inspect URLs");
-    } finally {
-      setLoading("");
-    }
-  }
-  async function disconnect() {
-    setLoading("disconnect");
-    try {
-      await api.gscDisconnect(site.id);
-      setSites([]);
-      setPerformance(null);
-      setInspection(null);
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not disconnect Search Console");
-    } finally {
-      setLoading("");
-    }
-  }
-
-  return (
-    <>
-      <PageHeader
-        title="Search Console"
-        description="Connect Google when OAuth is available, or import a Search Console CSV into local SQLite."
-        meta={
-          <span className="flex flex-wrap items-center gap-x-2">
-            <span className="inline-flex items-center gap-1.5">
-              <StatusDot tone={connectionTone} /> {connectionLabel}
-            </span>
-            {imports.length ? (
-              <>
-                <span className="text-border">·</span>
-                <span>{formatNumber(imports.length)} local {imports.length === 1 ? "import" : "imports"}</span>
-              </>
-            ) : null}
-          </span>
-        }
-      />
-      <Tabs value={gscTab} onValueChange={setGscTab} className="space-y-5">
-        <TabsList>
-          <TabsTrigger value="performance">Performance</TabsTrigger>
-          <TabsTrigger value="import">Local import</TabsTrigger>
-          <TabsTrigger value="inspection">URL inspection</TabsTrigger>
-          <TabsTrigger value="connection">Connection</TabsTrigger>
-        </TabsList>
-        <TabsContent value="performance" className="space-y-5">
-          <ReportSection
-            title="Performance rows"
-            description="Clicks, impressions, CTR, and average position from Search Console."
-            meta={performance?.source === "import" ? `Viewing ${performance.import?.sourceName || "local import"} · ${formatDate(performance.import?.createdAt)}` : undefined}
-          >
-            <div className="mb-5 grid gap-3 md:grid-cols-[1fr_1fr_180px_auto_auto]">
-              <Field label="Start date">
-                <DatePicker value={dateRange.startDate} onChange={(startDate) => setDateRange({ ...dateRange, startDate })} />
-              </Field>
-              <Field label="End date">
-                <DatePicker value={dateRange.endDate} onChange={(endDate) => setDateRange({ ...dateRange, endDate })} />
-              </Field>
-              <Field label="Dimension">
-                <Select value={dimension} onValueChange={setDimension}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="query">Queries</SelectItem>
-                    <SelectItem value="page">Pages</SelectItem>
-                    <SelectItem value="country">Countries</SelectItem>
-                    <SelectItem value="device">Devices</SelectItem>
-                  </SelectContent>
-                </Select>
-              </Field>
-              <div className="flex items-end">
-                <Button onClick={query} disabled={!status?.connection?.siteUrl || loading === "performance"}><BarChart3 /> {loading === "performance" ? "Querying" : "Query live"}</Button>
-              </div>
-              <div className="flex items-end">
-                <Button variant="secondary" onClick={() => latestImport && showImport(latestImport)} disabled={!latestImport}><Upload /> Latest import</Button>
-              </div>
-            </div>
-            {performance?.rows?.length ? (
-              <div className="space-y-4">
-                <GscPerformanceSummary rows={performance.rows} />
-                <GscPerformanceTable rows={performance.rows} dimension={dimension} />
-              </div>
-            ) : (
-              <EmptyState
-                title="No Search Console rows"
-                text="Import a CSV locally or connect Google and query a property."
-              />
-            )}
-          </ReportSection>
-        </TabsContent>
-        <TabsContent value="import" className="space-y-5">
-          <ReportSection
-            title="Local CSV import"
-            description="Export Search Console performance as CSV and store it in this app's SQLite database. Saved imports reopen without Google OAuth."
-            meta={imports.length ? `${formatNumber(imports.length)} saved` : undefined}
-          >
-            <div className="grid gap-4 lg:grid-cols-[minmax(260px,360px)_minmax(260px,1fr)]">
-              <Field label="Property label">
-                <Input value={importSiteUrl} onChange={(event) => setImportSiteUrl(event.target.value)} placeholder="sc-domain:example.com" />
-              </Field>
-              <Field label="CSV file">
-                <Input type="file" accept=".csv,text/csv" onChange={importCsv} disabled={loading === "import"} />
-              </Field>
-            </div>
-            {imports.length ? (
-              <GscImportHistory rows={imports} onOpen={showImport} />
-            ) : (
-              <div className="mt-5">
-                <EmptyState title="No imports yet" text="Choose a Search Console CSV export to save real performance evidence locally." />
-              </div>
-            )}
-          </ReportSection>
-        </TabsContent>
-        <TabsContent value="inspection" className="space-y-5">
-          <ReportSection
-            title="URL inspection"
-            description="Inspect up to 20 URLs against a connected Google Search Console property."
-          >
-            <div className="space-y-4">
-              <StatusEvidenceTable
-                rows={[
-                  {
-                    title: "Inspection source",
-                    status: selectedGscProperty ? "Google API ready" : "Google property required",
-                    tone: selectedGscProperty ? "good" : "warn",
-                    text: selectedGscProperty
-                      ? `Live inspection uses ${selectedGscProperty}.`
-                      : "Local CSV imports cover performance rows only; live URL inspection needs a connected Google property.",
-                  },
-                ]}
-              />
-              <Field label="URLs to inspect">
-                <Textarea value={inspectUrls} onChange={(event) => setInspectUrls(event.target.value)} placeholder="https://example.com/page" />
-              </Field>
-              <Button
-                onClick={selectedGscProperty ? inspect : () => setGscTab("connection")}
-                disabled={loading === "inspection"}
-              >
-                <ExternalLink /> {loading === "inspection" ? "Inspecting" : selectedGscProperty ? "Inspect URLs" : "Open connection"}
-              </Button>
-              {inspection?.rows?.length ? <GscInspectionResults rows={inspection.rows} /> : null}
-            </div>
-          </ReportSection>
-        </TabsContent>
-        <TabsContent value="connection" className="space-y-5">
-          <ReportSection
-            title="Google connection"
-            description="Connect once for live performance queries and URL inspection. Local CSV import works without Google."
-          >
-            <div className="space-y-4">
-              <StatusEvidenceTable
-                rows={[
-                  {
-                    title: "Google account",
-                    status: status?.connected ? "Connected" : "Not connected",
-                    tone: status?.connected ? "good" : "warn",
-                    text:
-                      status?.connection?.accountEmail ||
-                      (status?.configured
-                        ? "Connect once, then choose the matching property."
-                        : "OAuth is not configured in this local runtime; local CSV import still works."),
-                  },
-                  { title: "Selected property", status: status?.connection?.siteUrl ? "Selected" : "None", tone: status?.connection?.siteUrl ? "good" : "warn", text: status?.connection?.siteUrl || "Load properties and pick the property for this site." },
-                ]}
-              />
-              <div className="flex flex-wrap gap-3">
-                <Button onClick={connect} disabled={!status?.configured}>Connect Google</Button>
-                <Button variant="secondary" onClick={loadSites} disabled={!status?.connected || loading === "sites"}>{loading === "sites" ? "Loading" : "Load properties"}</Button>
-                <Button variant="outline" onClick={disconnect} disabled={!status?.connected || loading === "disconnect"}>Disconnect</Button>
-              </div>
-              {sites.length > 0 ? (
-                <Field label="Property">
-                  <Select value={status?.connection?.siteUrl || ""} onValueChange={selectSite}>
-                    <SelectTrigger><SelectValue placeholder="Choose property" /></SelectTrigger>
-                    <SelectContent>
-                      {sites.map((site) => <SelectItem key={site.siteUrl} value={site.siteUrl}>{site.siteUrl}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </Field>
-              ) : null}
-            </div>
-          </ReportSection>
-        </TabsContent>
-      </Tabs>
-    </>
-  );
-}
-
-function GscImportHistory({ rows, onOpen }: { rows: any[]; onOpen: (row: any) => void }) {
-  return (
-    <div className="mt-5">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Import</TableHead>
-            <TableHead>Property</TableHead>
-            <TableHead>Rows</TableHead>
-            <TableHead>Clicks</TableHead>
-            <TableHead>Impressions</TableHead>
-            <TableHead>Date</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {rows.map((row) => (
-            <TableRow
-              key={row.id}
-              className="cursor-pointer"
-              onClick={() => onOpen(row)}
-            >
-              <TableCell className="font-medium">
-                <button
-                  type="button"
-                  className="text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 rounded-sm"
-                  onClick={(event) => { event.stopPropagation(); onOpen(row); }}
-                >
-                  {row.sourceName || "Search Console CSV"}
-                </button>
-              </TableCell>
-              <TableCell className="break-all text-sm text-muted-foreground">{row.siteUrl || "-"}</TableCell>
-              <TableCell className="nums">{formatNumber(row.rowCount)}</TableCell>
-              <TableCell className="nums">{formatNumber(row.totals?.clicks || 0)}</TableCell>
-              <TableCell className="nums">{formatNumber(row.totals?.impressions || 0)}</TableCell>
-              <TableCell>{formatDate(row.createdAt)}</TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
-  );
-}
-
-function GscPerformanceSummary({ rows }: { rows: any[] }) {
-  const totals = rows.reduce((acc, row) => {
-    const impressions = Number(row.impressions || 0);
-    acc.clicks += Number(row.clicks || 0);
-    acc.impressions += impressions;
-    acc.weightedPosition += Number(row.position || 0) * impressions;
-    return acc;
-  }, { clicks: 0, impressions: 0, weightedPosition: 0 });
-  const ctr = totals.impressions ? totals.clicks / totals.impressions : 0;
-  const position = totals.impressions ? totals.weightedPosition / totals.impressions : 0;
-  return (
-    <StatsBand
-      items={[
-        { title: "Clicks", value: totals.clicks },
-        { title: "Impressions", value: totals.impressions },
-        { title: "CTR %", value: Number((ctr * 100).toFixed(1)) },
-        { title: "Avg. position", value: Number(position.toFixed(1)) },
-      ]}
-    />
-  );
-}
-
-function GscPerformanceTable({ rows, dimension }: { rows: any[]; dimension: string }) {
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>{dimension === "query" ? "Query" : dimension === "page" ? "Page" : dimension}</TableHead>
-          <TableHead>Clicks</TableHead>
-          <TableHead>Impressions</TableHead>
-          <TableHead>CTR</TableHead>
-          <TableHead>Position</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {rows.map((row, index) => (
-          <TableRow key={`${row.keys?.join(":") || index}:${index}`}>
-            <TableCell className="max-w-xl break-all font-medium">{row.keys?.join(" / ") || "-"}</TableCell>
-            <TableCell className="nums">{formatNumber(row.clicks)}</TableCell>
-            <TableCell className="nums">{formatNumber(row.impressions)}</TableCell>
-            <TableCell className="nums">{formatPercent(row.ctr)}</TableCell>
-            <TableCell className="nums">{formatPosition(row.position)}</TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
-  );
-}
-
-function gscVerdictTone(value?: string) {
-  if (/pass|indexed|verdict_pass/i.test(value || "")) return "good";
-  if (/partial|neutral|unspecified/i.test(value || "")) return "warn";
-  return value ? "bad" : "outline";
-}
-
-function GscInspectionResults({ rows }: { rows: any[] }) {
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>URL</TableHead>
-          <TableHead>Verdict</TableHead>
-          <TableHead>Coverage</TableHead>
-          <TableHead>Indexing</TableHead>
-          <TableHead>Fetch</TableHead>
-          <TableHead>Robots</TableHead>
-          <TableHead>Canonical evidence</TableHead>
-          <TableHead>Rich results</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {rows.map((row) => {
-          const index = row.result?.indexStatusResult || {};
-          const rich = row.result?.richResultsResult || {};
-          return (
-            <TableRow key={row.inspectionUrl}>
-              <TableCell className="max-w-sm break-all font-medium">
-                <div>{row.inspectionUrl}</div>
-                <div className="mt-1 text-xs text-muted-foreground">{index.lastCrawlTime ? `Last crawl ${formatDate(index.lastCrawlTime)}` : "Last crawl unavailable"}</div>
-              </TableCell>
-              <TableCell>
-                <Badge variant={gscVerdictTone(index.verdict || row.error) as any}>{row.error ? "Error" : index.verdict || "Unknown"}</Badge>
-              </TableCell>
-              <TableCell className={cn("max-w-xs text-sm", row.error ? "text-destructive" : "text-muted-foreground")}>
-                {row.error || index.coverageState || "Coverage state unavailable"}
-              </TableCell>
-              <TableCell className="text-muted-foreground">{index.indexingState || "-"}</TableCell>
-              <TableCell className="text-muted-foreground">{index.pageFetchState || "-"}</TableCell>
-              <TableCell className="text-muted-foreground">{index.robotsTxtState || "-"}</TableCell>
-              <TableCell className="max-w-sm text-sm text-muted-foreground">
-                <div className="break-all">Google: {index.googleCanonical || "-"}</div>
-                <div className="mt-1 break-all">User: {index.userCanonical || "-"}</div>
-              </TableCell>
-              <TableCell className="text-muted-foreground">{rich.verdict || "-"}</TableCell>
-            </TableRow>
-          );
-        })}
-      </TableBody>
-    </Table>
-  );
+function aiJobActive(job?: AiJob | null) {
+  return job?.status === "queued" || job?.status === "running";
 }
 
 export function AiPage({ site }: { site: Site }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const jobParam = searchParams.get("job") || "";
   const [prompts, setPrompts] = useState<any[]>([]);
-  const [jobs, setJobs] = useState<any[]>([]);
+  const [jobs, setJobs] = useState<AiJob[]>([]);
+  // A job named in ?job= that the site-filtered list does not include.
+  const [linkedJob, setLinkedJob] = useState<{ id: string; job?: AiJob; error?: string } | null>(null);
   const [type, setType] = useState("seo.coach");
   const [context, setContext] = useState(`Site: ${site.name}\nDomain: ${site.domain}`);
-  const [activeJobId, setActiveJobId] = useState("");
   const [starting, setStarting] = useState(false);
-  const activeJob = jobs.find((job) => job.id === activeJobId) || jobs[0] || null;
+  const jobParamRef = useRef(jobParam);
+  jobParamRef.current = jobParam;
+  const loadToken = useRef(0);
+  const listedJob = jobParam ? jobs.find((job) => job.id === jobParam) : undefined;
+  const linked = linkedJob?.id === jobParam ? linkedJob : null;
+  const activeJob = jobParam ? listedJob || linked?.job || null : jobs[0] || null;
 
-  async function load() {
-    const [nextPrompts, nextJobs] = await Promise.all([
-      api.aiPrompts(),
-      api.aiJobs(),
-    ]);
-    setPrompts(nextPrompts);
-    setJobs(nextJobs);
-    setActiveJobId((current) => current && nextJobs.some((job: any) => job.id === current) ? current : nextJobs[0]?.id || "");
+  // Jobs are refreshed on their own so polling never refetches the prompts.
+  async function loadJobs() {
+    const token = ++loadToken.current;
+    const siteId = site.id;
+    const rows = await api.aiJobs(siteId);
+    if (token !== loadToken.current) return;
+    setJobs(rows);
+    const wanted = jobParamRef.current;
+    if (!wanted || rows.some((job) => job.id === wanted)) return;
+    try {
+      const job = await api.aiJob(wanted);
+      if (token === loadToken.current) setLinkedJob({ id: wanted, job });
+    } catch (err) {
+      if (token !== loadToken.current) return;
+      setLinkedJob({
+        id: wanted,
+        error: isNotFoundError(err) ? "This job is no longer saved in local SQLite." : err instanceof Error ? err.message : "Could not load this job",
+      });
+    }
   }
+
   useEffect(() => {
     setContext(`Site: ${site.name}\nDomain: ${site.domain}`);
-    load().catch(console.error);
+    api.aiPrompts().then(setPrompts).catch(console.error);
   }, [site.id, site.name, site.domain]);
+
   useEffect(() => {
-    if (!jobs.some((job) => job.status === "queued" || job.status === "running")) return;
-    const interval = window.setInterval(() => {
-      load().catch(console.error);
-    }, 1500);
-    return () => window.clearInterval(interval);
-  }, [jobs]);
+    loadJobs().catch(console.error);
+  }, [site.id, jobParam]);
+
+  // One sequential poller while any shown job is queued or running.
+  const polling = jobs.some(aiJobActive) || aiJobActive(linked?.job);
+  useEffect(() => {
+    if (!polling) return;
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      await loadJobs().catch(console.error);
+      if (!cancelled) timer = window.setTimeout(poll, AI_POLL_MS);
+    };
+    timer = window.setTimeout(poll, AI_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [polling, site.id]);
+
+  function selectJob(id: string) {
+    const next = new URLSearchParams(searchParams);
+    if (id) next.set("job", id);
+    else next.delete("job");
+    setSearchParams(next, { replace: true });
+  }
 
   async function submit(event: SyntheticEvent) {
     event.preventDefault();
-    if (starting) return;
+    if (starting || !context.trim()) return;
     setStarting(true);
     try {
-      const prompt = prompts.find((item) => item.key === type)?.template?.replace("{{context}}", context) || context;
-      const job = await api.createAiJob({ type, prompt });
-      if (job?.id) setActiveJobId(job.id);
-      await load();
+      // The backend fills the saved template for this workflow with the context.
+      const job = await api.createAiJob({ type, context, siteId: site.id });
+      if (job?.id) {
+        setJobs((rows) => [job, ...rows.filter((row) => row.id !== job.id)]);
+        selectJob(job.id);
+      }
+      await loadJobs();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not start the Codex job. Is the local Codex CLI available?");
     } finally {
@@ -506,10 +106,10 @@ export function AiPage({ site }: { site: Site }) {
       <PageHeader
         title="AI lab"
         description="SEO coach, keyword clustering, scan prioritization, competitor gaps, and AI visibility through local Codex medium jobs."
-        meta={`${formatNumber(jobs.length)} saved ${jobs.length === 1 ? "job" : "jobs"}`}
+        meta={`${formatNumber(jobs.length)} saved ${jobs.length === 1 ? "job" : "jobs"} for ${site.name} and jobs saved without a site`}
       />
       <div className="grid gap-6 2xl:grid-cols-[460px_minmax(0,1fr)]">
-        <ReportSection title="Run Codex" description="Jobs are queued in SQLite and run through your local Codex CLI.">
+        <ReportSection title="Run Codex" description="Jobs are queued in SQLite, saved with this site, and run through your local Codex CLI.">
           <form className="space-y-4" onSubmit={submit}>
             <Field label="Workflow">
               <Select value={type} onValueChange={setType}>
@@ -518,7 +118,7 @@ export function AiPage({ site }: { site: Site }) {
               </Select>
             </Field>
             <Field label="Context"><Textarea className="min-h-48" value={context} onChange={(e) => setContext(e.target.value)} /></Field>
-            <Button disabled={starting}><Bot /> {starting ? "Starting job" : "Start job"}</Button>
+            <Button disabled={starting || !context.trim()}><Bot /> {starting ? "Starting job" : "Start job"}</Button>
           </form>
         </ReportSection>
         <div className="space-y-6">
@@ -526,21 +126,35 @@ export function AiPage({ site }: { site: Site }) {
             title="Jobs"
             meta="Saved local Codex runs from SQLite."
             action={
-              <Button size="sm" variant="outline" type="button" onClick={() => load().catch(console.error)}>
+              <Button size="sm" variant="outline" type="button" onClick={() => loadJobs().catch(console.error)}>
                 <RefreshCw /> Refresh
               </Button>
             }
           >
-            {jobs.length ? <JobTable rows={jobs} selectedId={activeJob?.id || ""} onSelect={setActiveJobId} /> : <EmptyState title="No jobs" text="Start a local Codex workflow." />}
+            {jobs.length ? <JobTable rows={jobs} selectedId={activeJob?.id || ""} onSelect={selectJob} /> : <EmptyState title="No jobs" text="Start a local Codex workflow." />}
           </ReportSection>
-          <AiJobOutput job={activeJob} />
+          {jobParam && !activeJob ? (
+            <ReportSection title="Job output">
+              {linked?.error ? (
+                <EmptyState
+                  title="Job not found"
+                  text={linked.error}
+                  action={<Button variant="secondary" onClick={() => selectJob("")}>Show the newest job</Button>}
+                />
+              ) : (
+                <p className="text-sm text-muted-foreground" role="status">Loading the linked job…</p>
+              )}
+            </ReportSection>
+          ) : (
+            <AiJobOutput job={activeJob} />
+          )}
         </div>
       </div>
     </>
   );
 }
 
-function AiJobOutput({ job }: { job: any }) {
+function AiJobOutput({ job }: { job: AiJob | null }) {
   return (
     <ReportSection
       title="Job output"
@@ -563,8 +177,16 @@ function AiJobOutput({ job }: { job: any }) {
           ) : job.result_text ? (
             <pre className="max-h-[520px] overflow-auto rounded-lg bg-muted/45 p-4 text-sm leading-6 whitespace-pre-wrap">{job.result_text}</pre>
           ) : (
-            <EmptyState title={job.status === "queued" || job.status === "running" ? "Codex is working" : "No output yet"} text={job.message || "The saved job has not produced text yet."} />
+            <EmptyState title={aiJobActive(job) ? "Codex is working" : "No output yet"} text={job.message || "The saved job has not produced text yet."} />
           )}
+          {job.prompt ? (
+            <details className="group rounded-lg border border-border/60">
+              <summary className="cursor-pointer select-none px-3.5 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground">
+                Prompt sent to Codex
+              </summary>
+              <pre className="max-h-[420px] overflow-auto border-t border-border/60 p-3.5 text-xs leading-5 whitespace-pre-wrap text-foreground/80">{job.prompt}</pre>
+            </details>
+          ) : null}
         </div>
       ) : (
         <EmptyState title="No job selected" text="Start or select a local Codex job to read the complete output here." />

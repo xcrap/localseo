@@ -1,9 +1,9 @@
-import { useEffect, useState, type ChangeEvent, type SyntheticEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type SyntheticEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Activity, CheckCircle2, Download, Plus, RefreshCw, Search, Tags, Target, Trash2, Upload } from "lucide-react";
+import { Activity, CheckCircle2, ChevronLeft, ChevronRight, Download, RefreshCw, Search, Tags, Trash2 } from "lucide-react";
 import { api, type KeywordResult, type Site } from "../../api";
-import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsContent, TabsList, TabsTrigger, Textarea, toast } from "@/components/ui";
-import { EmptyState, Field, HistoryList, HistoryTable, InfoTip, PageHeader, ReportSection, SiteDomainField, StatusDot, TagList, formatDate, formatMetricStatus, formatNumber, keywordMetricClass, sourceLabel, sourceVariant } from "../shared";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, toast } from "@/components/ui";
+import { EmptyState, Field, HistoryList, HistoryTable, InfoTip, PageHeader, ReportSection, SiteDomainField, StatusDot, TagList, formatMetricStatus, formatNumber, keywordMetricClass, sourceLabel, sourceVariant } from "../shared";
 
 function SourceMeta({ source, extra }: { source?: string; extra?: ReactNode }) {
   return (
@@ -15,9 +15,19 @@ function SourceMeta({ source, extra }: { source?: string; extra?: ReactNode }) {
   );
 }
 
+// The backend returns between 5 and 100 suggestions per research run.
+const MIN_RESEARCH_LIMIT = 5;
+const MAX_RESEARCH_LIMIT = 100;
+
+function researchLimit(value: string) {
+  const number = Math.round(Number(value));
+  return Number.isFinite(number) && value.trim() ? Math.max(MIN_RESEARCH_LIMIT, Math.min(MAX_RESEARCH_LIMIT, number)) : 25;
+}
+
 export function KeywordsPage({ site }: { site: Site }) {
   const [query, setQuery] = useState(site.domain || "");
-  const [limit, setLimit] = useState(25);
+  // Raw text while typing ("1" on the way to "10"); clamped on blur and submit.
+  const [limitInput, setLimitInput] = useState("25");
   const [result, setResult] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
@@ -31,6 +41,8 @@ export function KeywordsPage({ site }: { site: Site }) {
     event.preventDefault();
     setLoading(true);
     try {
+      const limit = researchLimit(limitInput);
+      setLimitInput(String(limit));
       const data = await api.researchKeywords({ siteId: site.id, query, limit });
       setResult(data);
       setSelected(Object.fromEntries(data.rows.slice(0, 10).map((row) => [row.keyword, true])));
@@ -62,14 +74,12 @@ export function KeywordsPage({ site }: { site: Site }) {
           </Field>
           <Field label="Suggestion limit">
             <Input
-              value={limit}
+              value={limitInput}
               type="number"
-              min={1}
-              max={100}
-              onChange={(e) => {
-                const next = Number(e.target.value);
-                setLimit(e.target.value === "" || Number.isNaN(next) ? 1 : Math.max(1, Math.min(100, next)));
-              }}
+              min={MIN_RESEARCH_LIMIT}
+              max={MAX_RESEARCH_LIMIT}
+              onChange={(e) => setLimitInput(e.target.value)}
+              onBlur={() => setLimitInput(String(researchLimit(limitInput)))}
             />
           </Field>
           <Button disabled={loading || !query.trim()}><Search /> {loading ? "Researching" : "Research"}</Button>
@@ -119,7 +129,7 @@ function KeywordTable({
     <Table>
       <TableHeader>
         <TableRow>
-          {selected && <TableHead className="w-10"></TableHead>}
+          {selected && <TableHead className="w-10"><span className="sr-only">Select</span></TableHead>}
           <TableHead>Keyword</TableHead>
           <TableHead>Volume</TableHead>
           <TableHead>Difficulty</TableHead>
@@ -132,7 +142,7 @@ function KeywordTable({
           <TableRow key={row.keyword}>
             {selected && setSelected && (
               <TableCell>
-                <Checkbox checked={Boolean(selected[row.keyword])} onCheckedChange={(checked) => setSelected({ ...selected, [row.keyword]: checked === true })} />
+                <Checkbox aria-label={`Select ${row.keyword}`} checked={Boolean(selected[row.keyword])} onCheckedChange={(checked) => setSelected({ ...selected, [row.keyword]: checked === true })} />
               </TableCell>
             )}
             <TableCell className="font-medium">{row.keyword}</TableCell>
@@ -147,8 +157,12 @@ function KeywordTable({
   );
 }
 
+const SAVED_PAGE_SIZE = 100;
+
 export function SavedPage({ site }: { site: Site }) {
   const [rows, setRows] = useState<any[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [tags, setTags] = useState<any[]>([]);
   const [metricImports, setMetricImports] = useState<any[]>([]);
   const [search, setSearch] = useState("");
@@ -157,31 +171,52 @@ export function SavedPage({ site }: { site: Site }) {
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const requestRef = useRef(0);
   const selectedIds = Object.entries(selected).filter(([, checked]) => checked).map(([id]) => id);
+  const pageCount = Math.max(1, Math.ceil(total / SAVED_PAGE_SIZE));
 
-  async function load() {
+  async function load(nextPage = page) {
+    const token = ++requestRef.current;
     setLoading(true);
     try {
       const data = await api.querySavedKeywords(site.id, {
         search,
         tagNames: tagFilter ? [tagFilter] : [],
-        pageSize: 100,
+        page: nextPage,
+        pageSize: SAVED_PAGE_SIZE,
         sort: "created_at",
         order: "desc",
       });
+      if (token !== requestRef.current) return;
+      const nextTotal = Number(data.total ?? data.rows?.length ?? 0);
+      const lastPage = Math.max(1, Math.ceil(nextTotal / SAVED_PAGE_SIZE));
+      // After deletes the current page can fall past the end; step back once.
+      if (nextPage > lastPage && nextTotal > 0) {
+        await load(lastPage);
+        return;
+      }
       setRows(data.rows || []);
-      setTags(data.tags || await api.keywordTags(site.id));
-      setMetricImports(await api.keywordMetricImports(site.id));
+      setTotal(nextTotal);
+      setPage(Number(data.page || nextPage));
+      const [nextTags, nextImports] = await Promise.all([
+        data.tags ? Promise.resolve(data.tags) : api.keywordTags(site.id),
+        api.keywordMetricImports(site.id),
+      ]);
+      if (token !== requestRef.current) return;
+      setTags(nextTags);
+      setMetricImports(nextImports);
       setSelected({});
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not load saved keywords");
+      if (token === requestRef.current) toast.error(err instanceof Error ? err.message : "Could not load saved keywords");
     } finally {
-      setLoading(false);
+      if (token === requestRef.current) setLoading(false);
     }
   }
 
   useEffect(() => {
-    load().catch(console.error);
+    load(1).catch(console.error);
   }, [site.id]);
 
   async function applyTags(mode: "add" | "remove") {
@@ -201,12 +236,16 @@ export function SavedPage({ site }: { site: Site }) {
 
   async function removeSelected() {
     if (!selectedIds.length) return;
+    setDeleting(true);
     try {
       await api.removeSavedKeywords(site.id, selectedIds);
-      toast.success(`Deleted ${selectedIds.length} keywords.`);
+      toast.success(`Deleted ${formatNumber(selectedIds.length)} keywords.`);
+      setConfirmDelete(false);
       await load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not delete selected keywords");
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -245,7 +284,7 @@ export function SavedPage({ site }: { site: Site }) {
                 Export CSV
               </a>
             </Button>
-            <Button variant="outline" onClick={load} disabled={loading}><RefreshCw /> {loading ? "Refreshing" : "Refresh"}</Button>
+            <Button variant="outline" onClick={() => load()} disabled={loading}><RefreshCw /> {loading ? "Refreshing" : "Refresh"}</Button>
           </div>
         }
       />
@@ -263,7 +302,7 @@ export function SavedPage({ site }: { site: Site }) {
               </SelectContent>
             </Select>
           </Field>
-          <Button onClick={load} disabled={loading}><Search /> {loading ? "Loading" : "Apply"}</Button>
+          <Button onClick={() => load(1)} disabled={loading}><Search /> {loading ? "Loading" : "Apply"}</Button>
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-t border-border/60 pt-4">
           <div className="min-w-0 space-y-1">
@@ -293,13 +332,35 @@ export function SavedPage({ site }: { site: Site }) {
             </Field>
             <Button variant="secondary" onClick={() => applyTags("add")}><Tags /> Add tags</Button>
             <Button variant="outline" onClick={() => applyTags("remove")}>Remove tags</Button>
-            <Button variant="destructive" onClick={removeSelected}><Trash2 /> Delete {selectedIds.length}</Button>
+            <Button variant="destructive" onClick={() => setConfirmDelete(true)} disabled={deleting}><Trash2 /> Delete {formatNumber(selectedIds.length)}</Button>
           </div>
         </section>
       )}
-      <ReportSection title="Saved keyword list" meta={`${formatNumber(rows.length)} shown`}>
+      <ReportSection
+        title="Saved keyword list"
+        meta={
+          total > rows.length
+            ? `${formatNumber(total)} saved · showing ${formatNumber((page - 1) * SAVED_PAGE_SIZE + 1)}–${formatNumber((page - 1) * SAVED_PAGE_SIZE + rows.length)}`
+            : `${formatNumber(total)} saved`
+        }
+      >
         {rows.length ? (
-          <SavedKeywordsTable rows={rows} selected={selected} setSelected={setSelected} />
+          <div className="space-y-3">
+            <SavedKeywordsTable rows={rows} selected={selected} setSelected={setSelected} />
+            {pageCount > 1 ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[13px] text-muted-foreground">
+                <span className="nums">Page {formatNumber(page)} of {formatNumber(pageCount)}</span>
+                <div className="flex items-center gap-1.5">
+                  <Button size="sm" variant="outline" disabled={loading || page <= 1} onClick={() => load(page - 1)} aria-label="Previous page of saved keywords">
+                    <ChevronLeft /> Prev
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={loading || page >= pageCount} onClick={() => load(page + 1)} aria-label="Next page of saved keywords">
+                    Next <ChevronRight />
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+          </div>
         ) : (
           <EmptyState
             title={loading ? "Loading keywords" : "No saved keywords"}
@@ -311,6 +372,22 @@ export function SavedPage({ site }: { site: Site }) {
       <div className="mt-6">
         <HistoryList title="Keyword metric imports" rows={metricImports} labelKey="sourceName" labelTitle="Source file" />
       </div>
+      <AlertDialog open={confirmDelete} onOpenChange={(open) => !deleting && setConfirmDelete(open)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete {formatNumber(selectedIds.length)} saved {selectedIds.length === 1 ? "keyword" : "keywords"}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes the selected keywords and their tag assignments from the saved keyword list in local SQLite. Export a CSV first if you may need them again.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Keep keywords</AlertDialogCancel>
+            <AlertDialogAction type="button" onClick={removeSelected} disabled={deleting}>
+              {deleting ? "Deleting keywords" : `Delete ${formatNumber(selectedIds.length)}`}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
   );
 }
@@ -328,7 +405,7 @@ function SavedKeywordsTable({
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead className="w-10"></TableHead>
+          <TableHead className="w-10"><span className="sr-only">Select</span></TableHead>
           <TableHead>Keyword</TableHead>
           <TableHead>Volume</TableHead>
           <TableHead>Difficulty</TableHead>
@@ -341,7 +418,7 @@ function SavedKeywordsTable({
         {rows.map((row) => (
           <TableRow key={row.id}>
             <TableCell>
-              <Checkbox checked={Boolean(selected[row.id])} onCheckedChange={(checked) => setSelected({ ...selected, [row.id]: checked === true })} />
+              <Checkbox aria-label={`Select ${row.keyword}`} checked={Boolean(selected[row.id])} onCheckedChange={(checked) => setSelected({ ...selected, [row.id]: checked === true })} />
             </TableCell>
             <TableCell className="font-medium">{row.keyword}</TableCell>
             <TableCell className={keywordMetricClass(row.search_volume)}>{formatMetricStatus(row.search_volume)}</TableCell>
@@ -452,236 +529,6 @@ function SerpTable({ rows }: { rows: any[] }) {
             <TableCell>{row.domain}</TableCell>
             <TableCell className="max-w-md truncate">{row.title}</TableCell>
             <TableCell className="max-w-xs truncate text-muted-foreground">{row.url}</TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
-  );
-}
-
-export function RankPage({ site }: { site: Site }) {
-  const [trackers, setTrackers] = useState<any[]>([]);
-  const [form, setForm] = useState({ domain: site.domain, keywords: "" });
-  const [keywordDrafts, setKeywordDrafts] = useState<Record<string, string>>({});
-  const [selectedKeywords, setSelectedKeywords] = useState<Record<string, Record<string, boolean>>>({});
-  const [loading, setLoading] = useState("");
-
-  useEffect(() => {
-    setForm((current) => ({ ...current, domain: site.domain }));
-  }, [site.id, site.domain]);
-
-  async function load() {
-    try {
-      setTrackers(await api.rankTrackers(site.id));
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not load rank trackers");
-    }
-  }
-  useEffect(() => {
-    load().catch(console.error);
-  }, [site.id]);
-
-  async function create(event: SyntheticEvent) {
-    event.preventDefault();
-    setLoading("create");
-    try {
-      await api.createRankTracker({
-        siteId: site.id,
-        domain: form.domain,
-        keywords: form.keywords.split(/\n|,/).map((item) => item.trim()).filter(Boolean),
-      });
-      setForm({ domain: site.domain, keywords: "" });
-      toast.success("Rank tracker created.");
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not create rank tracker");
-    } finally {
-      setLoading("");
-    }
-  }
-
-  async function check(id: string) {
-    setLoading(id);
-    try {
-      await api.runRankCheck(id);
-      toast.success("Rank check finished.");
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Rank check failed");
-    } finally {
-      setLoading("");
-    }
-  }
-
-  async function addKeywords(trackerId: string) {
-    const keywords = (keywordDrafts[trackerId] || "").split(/\n|,/).map((item) => item.trim()).filter(Boolean);
-    if (!keywords.length) return;
-    setLoading(`add-${trackerId}`);
-    try {
-      await api.addRankKeywords(trackerId, keywords);
-      setKeywordDrafts({ ...keywordDrafts, [trackerId]: "" });
-      toast.success(`Added ${keywords.length} keywords.`);
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not add keywords");
-    } finally {
-      setLoading("");
-    }
-  }
-
-  async function removeKeywords(trackerId: string) {
-    const ids = Object.entries(selectedKeywords[trackerId] || {}).filter(([, checked]) => checked).map(([id]) => id);
-    if (!ids.length) return;
-    setLoading(`remove-${trackerId}`);
-    try {
-      await api.removeRankKeywords(trackerId, ids);
-      setSelectedKeywords({ ...selectedKeywords, [trackerId]: {} });
-      toast.success(`Removed ${ids.length} keywords.`);
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not remove keywords");
-    } finally {
-      setLoading("");
-    }
-  }
-
-  async function syncMetrics(trackerId: string) {
-    setLoading(`metrics-${trackerId}`);
-    try {
-      const result = await api.syncRankMetrics(trackerId);
-      toast.success(`Synced imported metrics for ${formatNumber(result.updated || 0)} keywords${result.skipped ? `; ${formatNumber(result.skipped)} still need CSV metrics` : ""}.`);
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not sync keyword metrics");
-    } finally {
-      setLoading("");
-    }
-  }
-
-  return (
-    <>
-      <PageHeader title="Rank tracking" description="Track keyword positions from real search results. Checks use a connected search data source when available, OpenSERP when configured, or DuckDuckGo live results." />
-      <div className="grid gap-6 2xl:grid-cols-[420px_minmax(0,1fr)]">
-        <ReportSection title="New tracker">
-          <form className="space-y-4" onSubmit={create}>
-            <Field label="Domain"><Input value={form.domain} onChange={(e) => setForm({ ...form, domain: e.target.value })} required /></Field>
-            <Field label="Keywords"><Textarea value={form.keywords} onChange={(e) => setForm({ ...form, keywords: e.target.value })} placeholder="one per line" /></Field>
-            <Button type="submit" disabled={loading === "create"}><Plus /> {loading === "create" ? "Adding" : "Add tracker"}</Button>
-          </form>
-        </ReportSection>
-        <div className="space-y-4">
-          {trackers.length ? trackers.map((tracker) => (
-            <ReportSection
-              key={tracker.id}
-              title={tracker.domain}
-              meta={`${formatNumber(tracker.keywords.length)} keywords · depth ${tracker.serp_depth}`}
-              action={
-                <Button variant="secondary" size="sm" onClick={() => check(tracker.id)} disabled={loading === tracker.id}>
-                  <Target /> {loading === tracker.id ? "Checking" : "Run check"}
-                </Button>
-              }
-            >
-              <Tabs defaultValue="latest">
-                <TabsList>
-                  <TabsTrigger value="latest">Latest</TabsTrigger>
-                  <TabsTrigger value="keywords">Keywords</TabsTrigger>
-                  <TabsTrigger value="runs">Runs</TabsTrigger>
-                </TabsList>
-                <TabsContent value="latest">
-                  {tracker.latest?.length ? <RankTable rows={tracker.latest} /> : <EmptyState title="No snapshots" text="Run a check to create the first local rank snapshot." />}
-                </TabsContent>
-                <TabsContent value="keywords">
-                  <div className="mb-4 space-y-3">
-                    <Field label="Add tracked keywords">
-                      <Textarea value={keywordDrafts[tracker.id] || ""} onChange={(event) => setKeywordDrafts({ ...keywordDrafts, [tracker.id]: event.target.value })} placeholder="add keywords, one per line" />
-                    </Field>
-                    <div className="flex flex-wrap gap-3">
-                      <Button variant="secondary" onClick={() => addKeywords(tracker.id)} disabled={loading === `add-${tracker.id}`}><Plus /> {loading === `add-${tracker.id}` ? "Adding keywords" : "Add keywords"}</Button>
-                      <Button variant="outline" onClick={() => syncMetrics(tracker.id)} disabled={loading === `metrics-${tracker.id}`}><RefreshCw /> {loading === `metrics-${tracker.id}` ? "Syncing metrics" : "Sync imported metrics"}</Button>
-                      <Button asChild variant="outline"><Link to="/saved"><Upload /> Import metrics</Link></Button>
-                      <Button variant="destructive" onClick={() => removeKeywords(tracker.id)} disabled={loading === `remove-${tracker.id}`}><Trash2 /> Remove selected</Button>
-                    </div>
-                  </div>
-                  <RankKeywordTable
-                    rows={tracker.keywords || []}
-                    selected={selectedKeywords[tracker.id] || {}}
-                    setSelected={(value) => setSelectedKeywords({ ...selectedKeywords, [tracker.id]: value })}
-                  />
-                </TabsContent>
-                <TabsContent value="runs">
-                  {tracker.runs?.length ? <RankRunsTable rows={tracker.runs} /> : <EmptyState title="No runs" text="Run a rank check to create history." />}
-                </TabsContent>
-              </Tabs>
-            </ReportSection>
-          )) : (
-            <EmptyState
-              title="No rank trackers"
-              text="Create a tracker for this site, add keywords, then run a local rank check."
-            />
-          )}
-        </div>
-      </div>
-    </>
-  );
-}
-
-function RankTable({ rows }: { rows: any[] }) {
-  return (
-    <Table>
-      <TableHeader><TableRow><TableHead>Keyword</TableHead><TableHead>Position</TableHead><TableHead>URL</TableHead></TableRow></TableHeader>
-      <TableBody>
-        {rows.map((row) => (
-          <TableRow key={`${row.keyword}:${row.checked_at}`}>
-            <TableCell className="font-medium">{row.keyword}</TableCell>
-            <TableCell className="nums">{row.position || "Not found"}</TableCell>
-            <TableCell className="max-w-md truncate text-muted-foreground">{row.url || "-"}</TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
-  );
-}
-
-function RankKeywordTable({
-  rows,
-  selected,
-  setSelected,
-}: {
-  rows: any[];
-  selected: Record<string, boolean>;
-  setSelected: (value: Record<string, boolean>) => void;
-}) {
-  if (!rows.length) return <EmptyState title="No keywords" text="Add keywords to track positions." />;
-  return (
-    <Table>
-      <TableHeader><TableRow><TableHead className="w-10"></TableHead><TableHead>Keyword</TableHead><TableHead>Volume</TableHead><TableHead>KD</TableHead><TableHead>CPC</TableHead><TableHead>Metrics</TableHead></TableRow></TableHeader>
-      <TableBody>
-        {rows.map((row) => (
-          <TableRow key={row.id}>
-            <TableCell><Checkbox checked={Boolean(selected[row.id])} onCheckedChange={(checked) => setSelected({ ...selected, [row.id]: checked === true })} /></TableCell>
-            <TableCell className="font-medium">{row.keyword}</TableCell>
-            <TableCell className={keywordMetricClass(row.search_volume)}>{formatMetricStatus(row.search_volume)}</TableCell>
-            <TableCell className={keywordMetricClass(row.keyword_difficulty)}>{formatMetricStatus(row.keyword_difficulty)}</TableCell>
-            <TableCell className={keywordMetricClass(row.cpc)}>{formatMetricStatus(row.cpc)}</TableCell>
-            <TableCell className="text-muted-foreground">{row.metrics_fetched_at ? formatDate(row.metrics_fetched_at) : "-"}</TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
-  );
-}
-
-function RankRunsTable({ rows }: { rows: any[] }) {
-  return (
-    <Table>
-      <TableHeader><TableRow><TableHead>Status</TableHead><TableHead>Message</TableHead><TableHead>Started</TableHead><TableHead>Finished</TableHead></TableRow></TableHeader>
-      <TableBody>
-        {rows.map((row) => (
-          <TableRow key={row.id}>
-            <TableCell><Badge variant={row.status === "completed" ? "good" : row.status === "failed" ? "bad" : "warn"}>{row.status}</Badge></TableCell>
-            <TableCell>{row.message}</TableCell>
-            <TableCell className="text-muted-foreground">{formatDate(row.started_at)}</TableCell>
-            <TableCell className="text-muted-foreground">{row.finished_at ? formatDate(row.finished_at) : "-"}</TableCell>
           </TableRow>
         ))}
       </TableBody>

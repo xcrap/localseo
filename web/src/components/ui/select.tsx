@@ -2,6 +2,7 @@ import * as React from "react";
 import * as SelectPrimitive from "@radix-ui/react-select";
 import { Check, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useFieldControlId } from "./field";
 
 function Select({ ...props }: React.ComponentProps<typeof SelectPrimitive.Root>) {
   return <SelectPrimitive.Root data-slot="select" {...props} />;
@@ -11,11 +12,13 @@ function SelectValue({ ...props }: React.ComponentProps<typeof SelectPrimitive.V
   return <SelectPrimitive.Value data-slot="select-value" {...props} />;
 }
 
-function SelectTrigger({ className, children, ...props }: React.ComponentProps<typeof SelectPrimitive.Trigger>) {
+function SelectTrigger({ className, children, id, ...props }: React.ComponentProps<typeof SelectPrimitive.Trigger>) {
+  const fieldId = useFieldControlId();
   return (
     <SelectPrimitive.Trigger
+      id={id ?? fieldId}
       className={cn(
-        "flex h-9 w-full items-center justify-between gap-2 rounded-md border border-transparent bg-white/5 px-3 py-2 text-sm transition-colors hover:bg-white/8 focus:bg-white/12 focus:outline-none data-[placeholder]:text-muted-foreground/80 [&>span]:truncate",
+        "flex h-9 w-full items-center justify-between gap-2 rounded-md border border-transparent bg-white/5 px-3 py-2 text-sm transition-colors hover:bg-white/8 focus:bg-white/12 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/70 data-[placeholder]:text-muted-foreground/80 [&>span]:truncate",
         className,
       )}
       {...props}

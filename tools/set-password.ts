@@ -13,5 +13,5 @@ const rl = createInterface({ input, output });
 const password = await rl.question(`New password for ${existing.email}: `);
 rl.close();
 
-createOrReplaceAdmin(existing.email, password);
-console.log("Password updated.");
+await createOrReplaceAdmin(existing.email, password);
+console.log("Password updated. Existing browser sessions were signed out.");
