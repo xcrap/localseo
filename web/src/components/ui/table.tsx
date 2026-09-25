@@ -1,4 +1,5 @@
 import * as React from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 function Table({ className, ...props }: React.ComponentProps<"table">) {
@@ -44,4 +45,54 @@ function TableCell({ className, ...props }: React.ComponentProps<"td">) {
   return <td data-slot="table-cell" className={cn("px-3 py-2.5 align-middle", className)} {...props} />;
 }
 
-export { Table, TableHeader, TableBody, TableHead, TableRow, TableCell };
+type TableSortDirection = "asc" | "desc";
+
+type TableSortState = {
+  sortKey: string;
+  direction: TableSortDirection;
+  toggleSort: (key: string) => void;
+};
+
+// Provided by a filtered/paged table wrapper. Tables rendered outside such a
+// wrapper keep plain, non-interactive headers.
+const TableSortContext = React.createContext<TableSortState | null>(null);
+
+function SortableTableHead({
+  sortKey,
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"th"> & { sortKey: string }) {
+  const sort = React.useContext(TableSortContext);
+  if (!sort) {
+    return (
+      <TableHead className={className} {...props}>
+        {children}
+      </TableHead>
+    );
+  }
+  const active = sort.sortKey === sortKey;
+  const Icon = active ? (sort.direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  return (
+    <TableHead
+      className={className}
+      aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
+      {...props}
+    >
+      <button
+        type="button"
+        onClick={() => sort.toggleSort(sortKey)}
+        className={cn(
+          "-mx-1 inline-flex items-center gap-1 rounded-sm px-1 uppercase tracking-[inherit] transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+          active ? "text-foreground" : "",
+        )}
+      >
+        {children}
+        <Icon aria-hidden className={cn("size-3", active ? "opacity-90" : "opacity-40")} />
+      </button>
+    </TableHead>
+  );
+}
+
+export { Table, TableHeader, TableBody, TableHead, TableRow, TableCell, SortableTableHead, TableSortContext };
+export type { TableSortDirection, TableSortState };

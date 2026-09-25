@@ -1,15 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { codexModel, codexReasoningEffort } from "./config";
 import { all, get, run } from "./db";
+import { badRequest, notFound } from "./errors";
 
-const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const codexTimeoutMs = Number(process.env.CODEX_TIMEOUT_MS || 600000);
-const runningJobs = new Set<string>();
+// Each job is a full Codex CLI process; run at most this many at once and keep
+// the rest queued in order.
+const maxConcurrentJobs = Math.max(1, Number(process.env.CODEX_MAX_CONCURRENT || 2) || 2);
+const pendingJobs: string[] = [];
+let runningJobCount = 0;
+// App credentials Codex never needs; keep them out of the spawned environment.
+const hiddenEnvKeys = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "MCP_TOKEN", "PAGESPEED_API_KEY"];
 
 export type AiJob = {
   id: string;
@@ -23,6 +27,8 @@ export type AiJob = {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  site_id: string | null;
+  scan_id: string | null;
 };
 
 export const promptTemplates = [
@@ -88,23 +94,47 @@ export function saveAiPrompt(key: string, template: string) {
   );
 }
 
-export function createAiJob(input: { type: string; prompt: string }) {
+// `context` (for example GET /api/scans/:id/ai-context) fills the saved
+// prompt template for `type` ({{context}}) when no prompt is given, or is
+// added to the prompt. `scanId` links the job to a scan and its site.
+export function createAiJob(input: { type?: unknown; prompt?: unknown; siteId?: unknown; scanId?: unknown; context?: unknown }) {
+  const type = typeof input?.type === "string" ? input.type.trim() : "";
+  const context = typeof input?.context === "string" ? input.context.trim() : "";
+  let prompt = typeof input?.prompt === "string" ? input.prompt.trim() : "";
+  if (!type) throw badRequest("AI job type is required.");
+  if (!prompt && context) {
+    seedAiPrompts();
+    prompt = get<{ template: string }>("SELECT template FROM ai_prompts WHERE key = ?", [type])?.template || "{{context}}";
+  }
+  if (context) prompt = prompt.includes("{{context}}") ? prompt.replaceAll("{{context}}", () => context) : `${prompt}\n\n${context}`;
+  if (!prompt) throw badRequest("AI job prompt is required.");
+  let siteId = typeof input?.siteId === "string" && input.siteId ? input.siteId : null;
+  if (siteId && !get("SELECT id FROM sites WHERE id = ?", [siteId])) throw notFound("Site not found.");
+  const scanId = typeof input?.scanId === "string" && input.scanId ? input.scanId : null;
+  if (scanId) {
+    const scan = get<{ site_id: string }>("SELECT site_id FROM scans WHERE id = ?", [scanId]);
+    if (!scan) throw notFound("Scan not found.");
+    if (siteId && scan.site_id !== siteId) throw badRequest("That scan belongs to another site.");
+    siteId = scan.site_id;
+  }
   const id = randomUUID();
   run(
-    "INSERT INTO ai_jobs (id, type, prompt, status, message) VALUES (?, ?, ?, 'queued', 'Queued')",
-    [id, input.type, input.prompt],
+    "INSERT INTO ai_jobs (id, type, prompt, status, message, site_id, scan_id) VALUES (?, ?, ?, 'queued', 'Queued', ?, ?)",
+    [id, type, prompt, siteId, scanId],
   );
-  queueMicrotask(() => {
-    runAiJob(id).catch((error) => {
-      failJob(id, error instanceof Error ? error.message : "Codex job failed");
-    });
-  });
+  pendingJobs.push(id);
+  queueMicrotask(startQueuedJobs);
   return getAiJob(id)!;
 }
 
-export function listAiJobs(limit?: number) {
-  if (limit && limit > 0) {
-    return all<AiJob>("SELECT * FROM ai_jobs ORDER BY created_at DESC LIMIT ?", [limit]);
+// Without a site, every job is listed. With a site, the list keeps that site's
+// jobs plus jobs saved without a site (older jobs, MCP jobs with no siteId).
+export function listAiJobs(siteId?: string) {
+  if (siteId) {
+    return all<AiJob>(
+      "SELECT * FROM ai_jobs WHERE site_id = ? OR site_id IS NULL ORDER BY created_at DESC",
+      [siteId],
+    );
   }
   return all<AiJob>("SELECT * FROM ai_jobs ORDER BY created_at DESC");
 }
@@ -113,83 +143,78 @@ export function getAiJob(id: string) {
   return get<AiJob>("SELECT * FROM ai_jobs WHERE id = ?", [id]);
 }
 
-function updateJob(id: string, patch: Partial<AiJob>) {
-  const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
-  if (entries.length === 0) return;
-  const set = entries.map(([key]) => `${key} = ?`).join(", ");
-  run(`UPDATE ai_jobs SET ${set} WHERE id = ?`, [...entries.map(([, value]) => value), id]);
+function startQueuedJobs() {
+  while (runningJobCount < maxConcurrentJobs && pendingJobs.length) {
+    const id = pendingJobs.shift()!;
+    runningJobCount += 1;
+    runAiJob(id)
+      .catch((error) => failJob(id, error instanceof Error ? error.message : "Codex job failed"))
+      .finally(() => {
+        runningJobCount -= 1;
+        startQueuedJobs();
+      });
+  }
 }
 
 function failJob(id: string, message: string) {
-  updateJob(id, {
-    status: "failed",
-    message: "Failed",
-    error: message.slice(0, 2000),
-    finished_at: new Date().toISOString(),
-  });
-  runningJobs.delete(id);
+  run(
+    "UPDATE ai_jobs SET status = 'failed', message = 'Failed', error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [message.slice(0, 2000), id],
+  );
 }
 
 async function runAiJob(id: string) {
-  if (runningJobs.has(id)) return;
-  runningJobs.add(id);
   const job = getAiJob(id);
-  if (job?.status !== "queued") {
-    runningJobs.delete(id);
-    return;
-  }
-  updateJob(id, {
-    status: "running",
-    message: "Codex is working",
-    started_at: new Date().toISOString(),
-  });
-  try {
-    const result = await runCodex(job.prompt);
-    updateJob(id, {
-      status: "completed",
-      message: "Completed",
-      result_text: result.text,
-      result_json: result.json ? JSON.stringify(result.json) : null,
-      finished_at: new Date().toISOString(),
-    });
-  } catch (error) {
-    failJob(id, error instanceof Error ? error.message : "Codex job failed");
-  } finally {
-    runningJobs.delete(id);
-  }
+  if (job?.status !== "queued") return;
+  run(
+    "UPDATE ai_jobs SET status = 'running', message = 'Codex is working', started_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [id],
+  );
+  const result = await runCodex(job.prompt);
+  run(
+    "UPDATE ai_jobs SET status = 'completed', message = 'Completed', result_text = ?, result_json = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [result.text, result.json ? JSON.stringify(result.json) : null, id],
+  );
+}
+
+// Codex runs read-only in an empty per-job directory, never in the app checkout
+// (which holds database/ with Google tokens and .env). The prompt goes after
+// "--" so text starting with "-" can never be parsed as a CLI option.
+export function codexArgs(prompt: string, workDir: string, outputPath: string) {
+  const args = [
+    "codex",
+    "--search",
+    "--ask-for-approval",
+    "never",
+    "exec",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--color",
+    "never",
+    "-C",
+    workDir,
+    "-s",
+    "read-only",
+  ];
+  const model = codexModel();
+  const effort = codexReasoningEffort();
+  if (model) args.push("--model", model);
+  if (effort) args.push("--config", `model_reasoning_effort="${effort}"`);
+  args.push("-o", outputPath, "--", prompt);
+  return args;
 }
 
 async function runCodex(prompt: string): Promise<{ text: string; json: unknown | null }> {
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "local-seo-codex-"));
-  mkdirSync(tempDir, { recursive: true });
-  const outputPath = path.join(tempDir, "last-message.txt");
+  const workDir = await mkdtemp(path.join(os.tmpdir(), "local-seo-codex-"));
+  const outputPath = path.join(workDir, "last-message.txt");
   try {
-    const args = [
-      "codex",
-      "--search",
-      "--ask-for-approval",
-      "never",
-      "exec",
-      "--ephemeral",
-      "--skip-git-repo-check",
-      "--color",
-      "never",
-      "-C",
-      rootDir,
-      "-s",
-      "read-only",
-    ];
-    const model = codexModel();
-    const effort = codexReasoningEffort();
-    if (model) args.push("--model", model);
-    if (effort) args.push("--config", `model_reasoning_effort="${effort}"`);
-    args.push("-o", outputPath, prompt);
-
-    const proc = Bun.spawn(args, {
-      cwd: rootDir,
+    const env = { ...process.env };
+    for (const key of hiddenEnvKeys) delete env[key];
+    const proc = Bun.spawn(codexArgs(prompt, workDir, outputPath), {
+      cwd: workDir,
       stdout: "pipe",
       stderr: "pipe",
-      env: process.env,
+      env,
     });
     const stdoutPromise = new Response(proc.stdout).text();
     const stderrPromise = new Response(proc.stderr).text();
@@ -209,7 +234,7 @@ async function runCodex(prompt: string): Promise<{ text: string; json: unknown |
     const text = (await readFile(outputPath, "utf8").catch(() => stdout)).trim();
     return { text, json: parseMaybeJson(text) };
   } finally {
-    await rm(tempDir, { recursive: true, force: true });
+    await rm(workDir, { recursive: true, force: true });
   }
 }
 

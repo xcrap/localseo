@@ -1,8 +1,8 @@
-import { cloneElement, isValidElement, useEffect, useId, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
+import { cloneElement, isValidElement, useEffect, useId, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Activity, BarChart3, Bot, Cable, CalendarDays, Check, ChevronDown, FileSearch, Gauge, Globe2, Info, Link2, Plus, Search, Sparkles, TableProperties, Target, Zap } from "lucide-react";
+import { Activity, BarChart3, Bot, Cable, Check, ChevronDown, FileSearch, Gauge, Globe2, Info, Lightbulb, Link2, Plus, Search, Sparkles, TableProperties, Target, Zap } from "lucide-react";
 import type { Site } from "../api";
-import { Badge, Button, Calendar, Input, Label, Popover, PopoverContent, PopoverTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui";
+import { Badge, Button, FieldControlIdProvider, Input, Label, Popover, PopoverContent, PopoverTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, SortableTableHead, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 export const navGroups: { label: string; items: { to: string; label: string; icon: any }[] }[] = [
@@ -28,6 +28,7 @@ export const navGroups: { label: string; items: { to: string; label: string; ico
     items: [
       { to: "/rank", label: "Rank tracking", icon: Target },
       { to: "/gsc", label: "Search Console", icon: BarChart3 },
+      { to: "/insights", label: "Insights", icon: Lightbulb },
     ],
   },
   {
@@ -41,6 +42,30 @@ export const navGroups: { label: string; items: { to: string; label: string; ico
   },
 ];
 export const navItems = navGroups.flatMap((group) => group.items);
+
+// Scan report sections, addressable as /scans/:id?tab=<value>.
+export const scanTabs = [
+  { value: "overview", label: "Overview" },
+  { value: "changes", label: "Changes" },
+  { value: "progress", label: "Progress" },
+  { value: "issues", label: "Issues" },
+  { value: "checks", label: "Checks" },
+  { value: "metadata", label: "Metadata" },
+  { value: "pages", label: "Pages" },
+  { value: "links", label: "Links" },
+  { value: "images", label: "Images" },
+  { value: "assets", label: "Assets" },
+  { value: "speed", label: "Speed" },
+  { value: "crawl", label: "Robots/Sitemap" },
+  { value: "raw", label: "Evidence" },
+] as const;
+
+// Insights sections, addressable as /insights?tab=<value>.
+export const insightTabs = [
+  { value: "gsc-crawl", label: "Search Console × crawl" },
+  { value: "cannibalization", label: "Cannibalization" },
+  { value: "decay", label: "Content decay" },
+] as const;
 
 export const defaultKeywordLocationCode = 2840;
 export const defaultKeywordLanguageCode = "en";
@@ -442,50 +467,15 @@ export function Field({
   const generatedId = useId();
   const fallbackId = `field-${generatedId.replace(/:/g, "")}`;
   const childId = isValidElement(children) ? ((children.props as { id?: string }).id || fallbackId) : undefined;
+  // Plain inputs take the id directly; composite controls (Select, DatePicker)
+  // read it from context and put it on their focusable trigger button.
   const field = isValidElement(children)
     ? cloneElement(children as ReactElement<{ id?: string }>, { id: childId })
     : children;
   return (
     <div className="space-y-3">
       <Label htmlFor={childId}>{label}</Label>
-      {field}
-    </div>
-  );
-}
-
-export function FilteredRows({
-  rows,
-  placeholder = "Filter rows…",
-  minRows = 6,
-  children,
-}: {
-  rows: any[];
-  placeholder?: string;
-  minRows?: number;
-  children: (rows: any[]) => ReactNode;
-}) {
-  const [query, setQuery] = useState("");
-  const trimmed = query.trim().toLowerCase();
-  const filtered = useMemo(() => {
-    if (!trimmed) return rows;
-    return rows.filter((row) => JSON.stringify(row).toLowerCase().includes(trimmed));
-  }, [rows, trimmed]);
-  if (rows.length < minRows) return <>{children(rows)}</>;
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder={placeholder}
-          aria-label={placeholder}
-          className="h-8 max-w-72 text-[13px]"
-        />
-        <span className="whitespace-nowrap text-[13px] text-muted-foreground">
-          {trimmed ? `${formatNumber(filtered.length)} of ${formatNumber(rows.length)}` : `${formatNumber(rows.length)} rows`}
-        </span>
-      </div>
-      {filtered.length ? children(filtered) : <EmptyState title="No matching rows" text="Nothing in this table matches the filter." />}
+      <FieldControlIdProvider id={childId}>{field}</FieldControlIdProvider>
     </div>
   );
 }
@@ -584,33 +574,6 @@ export function formatDateLabel(value: string) {
     day: "numeric",
     year: "numeric",
   }).format(date);
-}
-
-export function DatePicker({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <Popover>
-      <PopoverTrigger asChild>
-        <Button type="button" variant="outline" className="w-full justify-start text-left font-normal">
-          <CalendarDays className="size-4" />
-          {formatDateLabel(value)}
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-auto p-3">
-        <Calendar
-          mode="single"
-          selected={parseDateInput(value)}
-          onSelect={(date) => date && onChange(formatDateInput(date))}
-          autoFocus
-        />
-      </PopoverContent>
-    </Popover>
-  );
 }
 
 export function EmptyState({ title, text, action, icon }: { title: string; text: string; action?: ReactNode; icon?: any }) {
@@ -833,16 +796,76 @@ export function formatPosition(value: unknown) {
   return number.toFixed(1);
 }
 
-export function formatDate(value: string) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+const zonelessTimestamp = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)$/;
+const dateOnlyValue = /^\d{4}-\d{2}-\d{2}$/;
+
+// SQLite CURRENT_TIMESTAMP values ("2026-07-04 02:52:51") are UTC but carry no
+// zone, so the browser would read them as local time. Zone-less timestamps are
+// parsed as UTC; plain dates stay local calendar dates.
+export function parseTimestamp(value: unknown) {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === "number") {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const zoneless = raw.match(zonelessTimestamp);
+  const date = zoneless
+    ? new Date(`${zoneless[1]}T${zoneless[2]}Z`)
+    : dateOnlyValue.test(raw)
+      ? new Date(`${raw}T00:00:00`)
+      : new Date(raw);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function timestampMs(value: unknown) {
+  return parseTimestamp(value)?.getTime() ?? 0;
+}
+
+export function formatDate(value: unknown) {
+  if (value == null || value === "") return "-";
+  const date = parseTimestamp(value);
+  if (!date) return String(value);
+  const withTime = !(typeof value === "string" && dateOnlyValue.test(value.trim()));
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
+    ...(date.getFullYear() !== new Date().getFullYear() ? { year: "numeric" as const } : {}),
+    ...(withTime ? { hour: "2-digit" as const, minute: "2-digit" as const } : {}),
   }).format(date);
+}
+
+export function formatDuration(ms: unknown) {
+  const total = Math.round(Number(ms) / 1000);
+  if (!Number.isFinite(total) || total < 0) return "-";
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+export function downloadFile(filename: string, content: string, type: string) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function fileSlug(value: string) {
+  const slug = String(value || "")
+    .replace(/^https?:\/\//i, "")
+    .replace(/[^a-z0-9]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+  return slug || "export";
 }
 
 export function sourceLabel(source?: string) {
@@ -931,7 +954,7 @@ export function MetricTile({ label, value, hint, tone = "default" }: MetricTileP
     <div className="min-w-0 rounded-xl border border-border/70 bg-muted px-4.5 py-4 transition-colors hover:border-input">
       <div className="eyebrow-muted truncate">{label}</div>
       <div className={cn("metric mt-1.5 text-[1.7rem] leading-none", valueColor)}>{value}</div>
-      {hint ? <div className="mt-1.5 truncate text-xs leading-5 text-muted-foreground">{hint}</div> : null}
+      {hint ? <div className="mt-1.5 line-clamp-2 text-xs leading-5 text-muted-foreground">{hint}</div> : null}
     </div>
   );
 }
@@ -944,34 +967,46 @@ export function MetricTileGrid({ children, className }: { children: ReactNode; c
   );
 }
 
-export function scanProgress(scan: any) {
-  if (!scan) return 0;
-  if (scan.status === "completed" || scan.status === "failed") return 100;
-  const limit = Number(scan.result?.limits?.maxPages || 100);
-  const pageProgress = Math.min(70, Math.round((Number(scan.pages_crawled || 0) / Math.max(1, limit)) * 70));
-  const phase = scan.result?.phase || "";
-  const phaseProgress = phase.includes("links")
-    ? 76
-    : phase.includes("images")
-      ? 84
-      : phase.includes("assets")
-        ? 90
-        : phase.includes("deduplicating")
-          ? 94
-          : 8;
-  return Math.min(96, Math.max(8, pageProgress, phaseProgress));
+// Honest live numbers from the crawler: pages crawled against the saved page
+// limit, queue size, speed and elapsed time. No percentage is invented for the
+// link/image/asset phases because the crawler does not report one.
+export function scanLiveProgress(scan: any) {
+  const progress = scan?.result?.progress || {};
+  const optionalNumber = (value: unknown) =>
+    value != null && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
+  const limit = metricNumber(scan?.result?.limits?.maxPages);
+  const crawled = metricNumber(progress.pagesCrawled, metricNumber(scan?.pages_crawled));
+  const startedAt = parseTimestamp(progress.startedAt);
+  const elapsedMs =
+    optionalNumber(progress.elapsedMs) ?? (startedAt && scanIsActive(scan) ? Date.now() - startedAt.getTime() : null);
+  return {
+    crawled,
+    limit,
+    queued: optionalNumber(progress.queued),
+    currentUrl: String(progress.currentUrl || ""),
+    pagesPerSecond: optionalNumber(progress.pagesPerSecond),
+    elapsedMs,
+    crawlPercent: limit > 0 ? Math.min(100, (crawled / limit) * 100) : null,
+  };
+}
+
+export function scanCrawlLabel(scan: any) {
+  const live = scanLiveProgress(scan);
+  return live.limit
+    ? `${formatNumber(live.crawled)} of ${formatNumber(live.limit)} max pages`
+    : `${formatNumber(live.crawled)} pages crawled`;
 }
 
 export function scanIsActive(scan: any) {
   return scan?.status === "queued" || scan?.status === "running";
 }
 
-export function sortScanRows(rows: any[]) {
-  return [...rows].sort((a, b) => {
-    const bTime = new Date(b.created_at || b.updated_at || 0).getTime();
-    const aTime = new Date(a.created_at || a.updated_at || 0).getTime();
-    return bTime - aTime;
-  });
+export function scanTime(row: any) {
+  return timestampMs(row?.created_at || row?.updated_at);
+}
+
+export function sortScanRows<T>(rows: T[]) {
+  return [...rows].sort((a, b) => scanTime(b) - scanTime(a));
 }
 
 export function upsertScanRow(rows: any[], scan: any) {
@@ -983,6 +1018,7 @@ export function scanPhaseKey(scan: any) {
   const phase = String(scan?.result?.phase || scan?.result?.summary?.phase || "").toLowerCase();
   if (scan?.status === "queued") return "queued";
   if (scan?.status === "failed") return "failed";
+  if (scan?.status === "cancelled") return "cancelled";
   if (scan?.status === "completed" || phase === "completed") return "completed";
   if (phase.includes("deduplicating")) return "report";
   if (phase.includes("css images")) return "images";
@@ -998,6 +1034,7 @@ export function scanPhaseLabel(scan: any) {
   const labels: Record<string, string> = {
     queued: "Queued",
     failed: "Failed",
+    cancelled: "Cancelled",
     completed: "Completed",
     report: "Building report",
     assets: "Checking CSS and JavaScript",
@@ -1411,7 +1448,19 @@ export function pageH1Status(page: any) {
 export function ScanLinksTable({ rows }: { rows: any[] }) {
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>URL</TableHead><TableHead>Type</TableHead><TableHead>Status</TableHead><TableHead>Affected pages</TableHead><TableHead>References</TableHead><TableHead>Hops</TableHead><TableHead>Anchor</TableHead><TableHead>Final URL</TableHead><TableHead>First found on</TableHead></TableRow></TableHeader>
+      <TableHeader>
+        <TableRow>
+          <SortableTableHead sortKey="url">URL</SortableTableHead>
+          <SortableTableHead sortKey="type">Type</SortableTableHead>
+          <SortableTableHead sortKey="status">Status</SortableTableHead>
+          <SortableTableHead sortKey="affectedPages">Affected pages</SortableTableHead>
+          <SortableTableHead sortKey="referenceCount">References</SortableTableHead>
+          <SortableTableHead sortKey="redirectChain.length">Hops</SortableTableHead>
+          <TableHead>Anchor</TableHead>
+          <TableHead>Final URL</TableHead>
+          <SortableTableHead sortKey="from">First found on</SortableTableHead>
+        </TableRow>
+      </TableHeader>
       <TableBody>
         {rows.map((row, index) => {
           const status = row.finalStatus != null && row.status != null && row.finalStatus !== row.status
@@ -1484,21 +1533,19 @@ export function JobTable({
   );
 }
 
-// One-word verdicts under the health dial — the label was redundant, so it
-// editorializes instead. Tiers match scoreTone's color breaks.
+// Neutral verdict for the scan score, which is the share of crawled pages
+// without high-severity issues. Tiers match scoreTone's color breaks; the score
+// says nothing about medium or low findings, so neither does the verdict.
 export function scoreVerdict(score: number) {
   const value = Math.max(0, Math.min(100, Math.round(Number(score) || 0)));
-  if (value >= 100) return "Flawless";
-  if (value >= 90) return "Impressive";
-  if (value >= 80) return "Looking sharp";
-  if (value >= 70) return "Respectable";
-  if (value >= 60) return "Almost there";
-  if (value >= 45) return "Needs love";
-  if (value >= 30) return "Rough ride";
-  if (value >= 15) return "Ouch";
-  if (value >= 1) return "Jesus Christ";
-  return "Send help";
+  if (value >= 100) return "No blockers";
+  if (value >= 85) return "Few blockers";
+  if (value >= 60) return "Some blockers";
+  if (value >= 30) return "Many blockers";
+  return "Mostly blocked";
 }
+
+export const scoreMeaning = "Pages without high-severity issues";
 
 export function scoreTone(score: number) {
   if (score >= 85) return "var(--good)";

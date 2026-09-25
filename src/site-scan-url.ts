@@ -55,7 +55,9 @@ export async function probeScanUrl(url: string) {
 
   try {
     const head = await request("HEAD");
-    if (![403, 405, 501].includes(head.status)) return head;
+    // Same fallback statuses as the crawler's resource checks: some servers
+    // answer HEAD with 403/404/405/501 but serve the page on GET.
+    if (![403, 404, 405, 501].includes(head.status)) return head;
   } catch {
     // Try GET below. Some hosts reject or time out HEAD.
   }

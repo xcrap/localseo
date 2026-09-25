@@ -19,8 +19,13 @@ export default defineConfig(({ mode }) => {
     build: {
       rollupOptions: {
         output: {
+          // Only the framework core gets its own long-cached chunk. Other
+          // libraries follow their importers, so code used by one lazy page
+          // (e.g. the date picker) loads with that page instead of up front.
           manualChunks(id) {
-            return id.includes("node_modules") ? "vendor" : undefined;
+            return /node_modules\/(react|react-dom|react-router|react-router-dom|scheduler)\//.test(id)
+              ? "react-vendor"
+              : undefined;
           },
         },
       },

@@ -4,24 +4,75 @@ import { createHash, randomUUID } from "node:crypto";
 import { getConfigValue } from "./config";
 import { all, get, jsonParse, run } from "./db";
 import { fetchText, fetchWithRedirectTrace } from "./http";
+import { parseRobots, type RobotsVerdict, robotsMatcher, testRobots } from "./robots";
 import { localHostFirst, probeScanUrl, unreachableScanUrlError } from "./site-scan-url";
+import { readStructuredData } from "./structured-data";
 
-const SCAN_RESULT_VERSION = 2;
+export { parseRobots, testRobots };
+
+// Version 3: link-first crawl order, one issue per affected source page for
+// resource checks, and page issues stored once in result.issues.
+// Version 4: robots.txt rules per URL, canonical/hreflang/sitemap URL checks,
+// soft 404 probe, near-duplicate content, and structured data validation.
+// Scans are only compared with scans that share the same crawl semantics.
+const SCAN_RESULT_VERSION = 4;
+
+// Thrown for request problems the API should answer with a 4xx status.
+export class ScanRequestError extends Error {
+  constructor(
+    readonly status: 400 | 404,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 function getSite(siteId: string) {
   return get<any>("SELECT * FROM sites WHERE id = ?", [siteId]);
 }
 
+function siteIgnoreRules(siteId: string) {
+  return all<any>("SELECT * FROM scan_issue_ignores WHERE site_id = ?", [siteId]);
+}
+
+// Views derived from result.issues on read, for scans of every version: each
+// page's own issues list (stored once, in result.issues, since version 3) and
+// issue groups named by the issue-type catalog.
+function withIssueViews(row: any) {
+  const result = row?.result;
+  if (!result || !Array.isArray(result.issues)) return row;
+  const byUrl = new Map<string, any[]>();
+  for (const issue of result.issues) {
+    const rows = byUrl.get(issue.url) || [];
+    rows.push(issue);
+    byUrl.set(issue.url, rows);
+  }
+  return {
+    ...row,
+    result: {
+      ...result,
+      issueGroups: groupIssueSummary(result.issues.filter((issue: any) => !issue.ignored)),
+      ...(Array.isArray(result.pages)
+        ? { pages: result.pages.map((page: any) => ({ ...page, issues: byUrl.get(page.url) || [] })) }
+        : {}),
+    },
+  };
+}
+
 function publicScanRow(row: any) {
   if (!row) return null;
-  const { site_id: siteId, site_name: siteName, site_domain: siteDomain, result_json, ...rest } = row;
-  return applyIssueIgnores({
-    ...rest,
-    site_id: siteId,
-    ...(siteName ? { site_name: siteName } : {}),
-    ...(siteDomain ? { site_domain: siteDomain } : {}),
-    result: jsonParse(result_json, null),
-  });
+  const { site_id: siteId, site_name: siteName, site_domain: siteDomain, result_json, summary_json: _summary, ...rest } = row;
+  const publicRow = applyIssueIgnores(
+    {
+      ...rest,
+      site_id: siteId,
+      ...(siteName ? { site_name: siteName } : {}),
+      ...(siteDomain ? { site_domain: siteDomain } : {}),
+      result: jsonParse(result_json, null),
+    },
+    siteIgnoreRules(siteId),
+  );
+  return withIssueViews(publicRow);
 }
 
 // Ignore rules match by page identity, not raw URL string. The same page can be
@@ -51,56 +102,47 @@ function issueMatchesIgnore(issue: any, rules: any[]) {
   );
 }
 
+function filterComparison(comparison: any, rules: any[]) {
+  const keep = (rows: any[] = []) => rows.filter((issue: any) => !issueMatchesIgnore(issue, rules));
+  const newIssues = keep(comparison.newIssues);
+  const fixedIssues = keep(comparison.fixedIssues);
+  const severityChanges = keep(comparison.severityChanges);
+  if (
+    newIssues.length === (comparison.newIssues || []).length &&
+    fixedIssues.length === (comparison.fixedIssues || []).length &&
+    severityChanges.length === (comparison.severityChanges || []).length
+  ) {
+    return comparison;
+  }
+  return {
+    ...comparison,
+    summary: {
+      ...(comparison.summary || {}),
+      newIssues: newIssues.length,
+      fixedIssues: fixedIssues.length,
+      severityChanges: severityChanges.length,
+    },
+    newIssues,
+    fixedIssues,
+    severityChanges,
+    ...(comparison.regressions ? { regressions: comparisonRegressions(newIssues, comparison.pageChanges || []) } : {}),
+  };
+}
+
 // Saved scan evidence stays untouched in SQLite; ignore rules are applied when
 // scans are read, so restoring a rule instantly brings the issues and their
 // score impact back on every saved report.
-function applyIssueIgnores(row: any) {
+function applyIssueIgnores(row: any, rules: any[]) {
   const result = row?.result;
-  if (!result || !Array.isArray(result.issues)) return row;
-  const rules = all<any>("SELECT * FROM scan_issue_ignores WHERE site_id = ?", [row.site_id]);
-  if (!rules.length) return row;
+  if (!result || !Array.isArray(result.issues) || !rules.length) return row;
   const issues = result.issues.map((issue: any) =>
     issueMatchesIgnore(issue, rules) ? { ...issue, ignored: true } : issue,
   );
   const activeIssues = issues.filter((issue: any) => !issue.ignored);
   const ignoredCount = issues.length - activeIssues.length;
-  const comparison = result.comparison;
-  const filteredComparison = comparison
-    ? {
-        ...comparison,
-        newIssues: (comparison.newIssues || []).filter((issue: any) => !issueMatchesIgnore(issue, rules)),
-        fixedIssues: (comparison.fixedIssues || []).filter((issue: any) => !issueMatchesIgnore(issue, rules)),
-        severityChanges: (comparison.severityChanges || []).filter(
-          (issue: any) => !issueMatchesIgnore(issue, rules),
-        ),
-      }
-    : null;
-  if (filteredComparison) {
-    filteredComparison.summary = {
-      ...(comparison.summary || {}),
-      newIssues: filteredComparison.newIssues.length,
-      fixedIssues: filteredComparison.fixedIssues.length,
-      severityChanges: filteredComparison.severityChanges.length,
-    };
-  }
-  const comparisonChanged = Boolean(
-    comparison &&
-      ((comparison.newIssues || []).length !== filteredComparison?.newIssues.length ||
-        (comparison.fixedIssues || []).length !== filteredComparison?.fixedIssues.length ||
-        (comparison.severityChanges || []).length !== filteredComparison?.severityChanges.length),
-  );
-  if (!ignoredCount && !comparisonChanged) return row;
+  const comparison = result.comparison ? filterComparison(result.comparison, rules) : null;
+  if (!ignoredCount && comparison === result.comparison) return row;
   const pages = Array.isArray(result.pages) ? result.pages : [];
-  const flaggedPages = pages.map((page: any) =>
-    Array.isArray(page.issues) && page.issues.length
-      ? {
-          ...page,
-          issues: page.issues.map((issue: any) =>
-            issueMatchesIgnore(issue, rules) ? { ...issue, ignored: true } : issue,
-          ),
-        }
-      : page,
-  );
   return {
     ...row,
     score: row.status === "completed" ? healthScore(pages, activeIssues) : row.score,
@@ -108,22 +150,80 @@ function applyIssueIgnores(row: any) {
     ignored_issue_count: ignoredCount,
     result: {
       ...result,
-      summary: scanSummary(
-        activeIssues,
-        pages,
-        result.links || [],
-        result.images || [],
-        result.assets || [],
-        result.imageInventory || [],
-        result.linkInventory || [],
-        result.parameterUrls || [],
-        result.phase || "completed",
-      ),
+      // Crawl-derived counts stay as saved; only issue-derived counts change.
+      summary: { ...(result.summary || {}), ...issueSummary(activeIssues) },
       issues,
-      issueGroups: groupIssueSummary(activeIssues),
-      pages: flaggedPages,
-      ...(filteredComparison ? { comparison: filteredComparison } : {}),
+      ...(comparison ? { comparison } : {}),
     },
+  };
+}
+
+// Scan lists never parse result_json. Each row keeps a small precomputed
+// summary (summary_json) with the ignore rules already applied, rewritten on
+// every progress save and whenever the site's ignore rules change.
+function liteScanResult(result: any) {
+  if (!result) return null;
+  return {
+    scanVersion: result.scanVersion ?? null,
+    phase: result.phase || "",
+    ...(result.startUrl ? { startUrl: result.startUrl } : {}),
+    limits: result.limits || null,
+    summary: result.summary || null,
+    progress: result.progress || null,
+  };
+}
+
+function storedScanSummary(publicRow: any) {
+  return JSON.stringify({
+    score: publicRow.score,
+    issueCount: publicRow.issue_count,
+    ignoredIssueCount: Number(publicRow.ignored_issue_count || 0),
+    result: liteScanResult(publicRow.result),
+  });
+}
+
+function refreshScanSummary(scanId: string, rules: any[]) {
+  const row = get<any>("SELECT * FROM scans WHERE id = ?", [scanId]);
+  if (!row) return;
+  const publicRow = applyIssueIgnores({ ...row, result: jsonParse(row.result_json, null) }, rules);
+  run("UPDATE scans SET summary_json = ? WHERE id = ?", [storedScanSummary(publicRow), scanId]);
+}
+
+function refreshSiteScanSummaries(siteId: string) {
+  const rules = siteIgnoreRules(siteId);
+  for (const row of all<{ id: string }>("SELECT id FROM scans WHERE site_id = ?", [siteId])) {
+    refreshScanSummary(row.id, rules);
+  }
+}
+
+// Scans saved before summary_json existed get their summary computed once, on
+// the first list read, then stay on the fast path.
+function backfillScanSummaries() {
+  const rows = all<{ id: string; site_id: string }>("SELECT id, site_id FROM scans WHERE summary_json IS NULL");
+  const rulesBySite = new Map<string, any[]>();
+  for (const row of rows) {
+    const rules = rulesBySite.get(row.site_id) || siteIgnoreRules(row.site_id);
+    rulesBySite.set(row.site_id, rules);
+    refreshScanSummary(row.id, rules);
+  }
+}
+
+const scanListColumns = `
+  scans.id, scans.site_id, scans.url, scans.status, scans.score, scans.pages_crawled,
+  scans.issue_count, scans.error, scans.created_at, scans.updated_at, scans.summary_json
+`;
+
+function liteScanRow(row: any) {
+  const { summary_json, site_name: siteName, site_domain: siteDomain, ...rest } = row;
+  const stored = jsonParse<any>(summary_json, null);
+  return {
+    ...rest,
+    ...(siteName ? { site_name: siteName } : {}),
+    ...(siteDomain ? { site_domain: siteDomain } : {}),
+    score: stored?.score ?? rest.score,
+    issue_count: stored?.issueCount ?? rest.issue_count,
+    ignored_issue_count: stored?.ignoredIssueCount ?? 0,
+    result: stored?.result ?? null,
   };
 }
 
@@ -148,6 +248,7 @@ export function createIssueIgnore(siteId: string, input: { type?: string; url?: 
     `,
     [randomUUID(), site.id, issueType, url, note],
   );
+  refreshSiteScanSummaries(site.id);
   return get<any>("SELECT * FROM scan_issue_ignores WHERE site_id = ? AND issue_type = ? AND url = ?", [
     site.id,
     issueType,
@@ -159,50 +260,88 @@ export function deleteIssueIgnore(siteId: string, ignoreId: string) {
   const site = getSite(siteId);
   if (!site) throw new Error("Site not found.");
   const info = run("DELETE FROM scan_issue_ignores WHERE id = ? AND site_id = ?", [ignoreId, site.id]);
-  return { deleted: Number(info.changes || 0) > 0 };
+  const deleted = Number(info.changes || 0) > 0;
+  if (deleted) refreshSiteScanSummaries(site.id);
+  return { deleted };
 }
 
 export function clearIssueIgnores(siteId: string) {
   const site = getSite(siteId);
   if (!site) throw new Error("Site not found.");
   const info = run("DELETE FROM scan_issue_ignores WHERE site_id = ?", [site.id]);
-  return { deleted: Number(info.changes || 0) };
+  const deleted = Number(info.changes || 0);
+  if (deleted) refreshSiteScanSummaries(site.id);
+  return { deleted };
 }
 
 export function listScans(siteId: string) {
-  return all<any>("SELECT * FROM scans WHERE site_id = ? ORDER BY created_at DESC", [
-    siteId,
-  ]).map(publicScanRow);
+  backfillScanSummaries();
+  return all<any>(`SELECT ${scanListColumns} FROM scans WHERE site_id = ? ORDER BY created_at DESC`, [siteId]).map(
+    liteScanRow,
+  );
 }
 
 export function listAllScans() {
+  backfillScanSummaries();
   return all<any>(`
     SELECT
-      scans.*,
+      ${scanListColumns},
       sites.name AS site_name,
       sites.domain AS site_domain
     FROM scans
     LEFT JOIN sites ON sites.id = scans.site_id
     ORDER BY scans.created_at DESC
-  `).map(publicScanRow);
+  `).map(liteScanRow);
 }
 
 export function getScan(scanId: string) {
-  const row = get<any>("SELECT * FROM scans WHERE id = ?", [scanId]);
+  const row = get<any>(
+    `
+    SELECT scans.*, sites.name AS site_name, sites.domain AS site_domain
+    FROM scans
+    LEFT JOIN sites ON sites.id = scans.site_id
+    WHERE scans.id = ?
+    `,
+    [scanId],
+  );
   return publicScanRow(row);
+}
+
+// Scan execution lives in this process. Each queued or running scan keeps an
+// abort controller so cancel/delete can stop its crawl and in-flight requests.
+const runningScans = new Map<string, { controller: AbortController; done: Promise<void> }>();
+
+export async function cancelScan(scanId: string) {
+  const row = get<any>("SELECT id, status FROM scans WHERE id = ?", [scanId]);
+  if (!row) throw new ScanRequestError(404, "Scan not found.");
+  if (row.status !== "queued" && row.status !== "running") {
+    throw new ScanRequestError(400, `Only queued or running scans can be cancelled (this scan is ${row.status}).`);
+  }
+  const running = runningScans.get(scanId);
+  running?.controller.abort();
+  run("UPDATE scans SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [scanId]);
+  // Aborting stops in-flight requests at once; wait for the crawler to save
+  // its partial results so the response is the final cancelled scan.
+  await running?.done;
+  const lite = get<any>(`SELECT ${scanListColumns} FROM scans WHERE id = ?`, [scanId]);
+  return lite ? liteScanRow(lite) : null;
 }
 
 export function deleteScan(siteId: string, scanId: string) {
   const site = getSite(siteId);
   if (!site) throw new Error("Site not found.");
   const info = run("DELETE FROM scans WHERE id = ? AND site_id = ?", [scanId, site.id]);
-  return { deleted: Number(info.changes || 0) > 0 };
+  const deleted = Number(info.changes || 0) > 0;
+  if (deleted) runningScans.get(scanId)?.controller.abort();
+  return { deleted };
 }
 
 export function clearScans(siteId: string) {
   const site = getSite(siteId);
   if (!site) throw new Error("Site not found.");
+  const ids = all<{ id: string }>("SELECT id FROM scans WHERE site_id = ?", [site.id]);
   const info = run("DELETE FROM scans WHERE site_id = ?", [site.id]);
+  for (const row of ids) runningScans.get(row.id)?.controller.abort();
   return { deleted: Number(info.changes || 0) };
 }
 
@@ -217,15 +356,25 @@ export async function startScan(siteId: string, url: string) {
     "INSERT INTO scans (id, site_id, url, status, updated_at) VALUES (?, ?, ?, 'queued', CURRENT_TIMESTAMP)",
     [scanId, site.id, url.trim()],
   );
-  queueMicrotask(() => {
-    runLocalScan(scanId).catch((error) => {
+  const controller = new AbortController();
+  // Runs on the next microtask, after startScan has returned the queued row.
+  const done = Promise.resolve()
+    .then(() => runLocalScan(scanId, controller.signal))
+    .catch((error) => {
+      // A cancelled or deleted scan already has its final state.
+      if (controller.signal.aborted) return;
       run(
         "UPDATE scans SET status = 'failed', error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         [error instanceof Error ? error.message : "Scan failed", scanId],
       );
-    });
-  });
+    })
+    .finally(() => runningScans.delete(scanId));
+  runningScans.set(scanId, { controller, done });
   return getScan(scanId);
+}
+
+export function scanIssueTypeList() {
+  return Object.entries(scanIssueTypes).map(([type, info]) => ({ type, ...info }));
 }
 
 type ScanIssueSeverity = "high" | "medium" | "low";
@@ -246,6 +395,155 @@ type ScanIssueCategory =
   | "sitemap"
   | "robots"
   | "crawl";
+
+type ScanIssueTypeInfo = {
+  title: string;
+  category: ScanIssueCategory;
+  severity: ScanIssueSeverity;
+  why: string;
+  fix: string;
+};
+
+// Static guidance for every issue type the scanner emits. `severity` is the
+// usual severity; a few checks raise or lower it from the evidence (for
+// example very long titles, or plain HTTP on a local development host).
+export const scanIssueTypes: Record<string, ScanIssueTypeInfo> = {
+  "robots-missing": { title: "robots.txt missing", category: "robots", severity: "low", why: "Crawlers look for /robots.txt to learn crawl rules and sitemap locations.", fix: "Publish a robots.txt at the site root, even if it only lists the sitemap." },
+  "robots-blocks-all": { title: "robots.txt blocks all crawling", category: "robots", severity: "high", why: "Disallow: / for all user agents stops search engines from crawling any page.", fix: "Remove the global Disallow: / unless the whole site must stay out of search." },
+  "robots-sitemap-missing": { title: "robots.txt has no sitemap", category: "robots", severity: "low", why: "A Sitemap directive helps crawlers find the preferred sitemap quickly.", fix: "Add a Sitemap: line with the absolute sitemap URL to robots.txt." },
+  "robots-blocked-page": { title: "Blocked by robots.txt", category: "robots", severity: "medium", why: "robots.txt disallows this URL for Googlebot, so Google cannot crawl its content.", fix: "Narrow or remove the Disallow rule if the page should be crawled; use noindex, not robots.txt, to keep a page out of search." },
+  "robots-blocked-in-sitemap": { title: "Sitemap URL blocked by robots.txt", category: "robots", severity: "medium", why: "The sitemap asks Google to crawl a URL that robots.txt forbids, which sends conflicting signals.", fix: "Remove blocked URLs from the sitemap, or allow them in robots.txt." },
+  "robots-blocked-linked": { title: "Links to URLs blocked by robots.txt", category: "robots", severity: "low", why: "Internal links to disallowed URLs lead crawlers to pages they may not fetch.", fix: "Confirm the blocked destinations are intentional, or link to crawlable URLs instead." },
+  "sitemap-fetch-failed": { title: "Sitemap fetch failed", category: "sitemap", severity: "medium", why: "A sitemap that errors or does not parse cannot help crawlers discover URLs.", fix: "Fix the sitemap response status, XML syntax, or the reference to it." },
+  "sitemap-too-large": { title: "Sitemap too large", category: "sitemap", severity: "medium", why: "Sitemaps over the 50 MB protocol limit are rejected by search engines and were not parsed here.", fix: "Split the sitemap into smaller files listed in a sitemap index." },
+  "sitemap-missing-or-empty": { title: "No sitemap URLs", category: "sitemap", severity: "medium", why: "Without an XML sitemap, crawlers rely only on links to find pages.", fix: "Publish an XML sitemap of indexable URLs and reference it from robots.txt." },
+  "sitemap-too-many-urls": { title: "Sitemap lists over 50,000 URLs", category: "sitemap", severity: "medium", why: "The sitemap protocol allows at most 50,000 URLs (or child sitemaps) per file; search engines may reject larger files.", fix: "Split the sitemap into files of up to 50,000 URLs and list them in a sitemap index." },
+  "sitemap-url-redirect": { title: "Redirecting URL in sitemap", category: "sitemap", severity: "medium", why: "Sitemaps should list final URLs; redirecting entries waste crawl budget and blur the preferred URL.", fix: "Replace the sitemap entry with the URL it redirects to." },
+  "sitemap-url-error": { title: "Broken URL in sitemap", category: "sitemap", severity: "medium", why: "Sitemap entries that return 4xx/5xx or fail to load point crawlers at pages that cannot be indexed.", fix: "Remove the entry, restore the page, or list its live replacement." },
+  "sitemap-url-canonicalized": { title: "Canonicalized URL in sitemap", category: "sitemap", severity: "medium", why: "The listed page names another URL as canonical, so the sitemap and the page disagree on the preferred URL.", fix: "List only canonical URLs in the sitemap." },
+  "sitemap-larger-than-crawl-limit": { title: "Sitemap larger than crawl limit", category: "sitemap", severity: "low", why: "This local scan crawls fewer URLs than the sitemap lists, so coverage is partial.", fix: "Raise the site's crawl page limit or scan important sections separately." },
+  "page-missing-from-sitemap": { title: "Page missing from sitemap", category: "sitemap", severity: "low", why: "Indexable pages left out of the sitemap may be discovered and recrawled more slowly.", fix: "Add important indexable pages to the XML sitemap." },
+  "noindex-page-in-sitemap": { title: "Noindex page in sitemap", category: "sitemap", severity: "medium", why: "Sitemaps should list only pages you want indexed; noindex entries send mixed signals.", fix: "Remove noindex pages from the sitemap, or drop the noindex if the page should rank." },
+  "temporary-redirect": { title: "Temporary redirect", category: "crawl", severity: "low", why: "302/307 redirects tell search engines the move is temporary, so the old URL may stay indexed.", fix: "Use 301 or 308 for permanent moves." },
+  "redirected-url": { title: "Redirected URL", category: "crawl", severity: "low", why: "Crawling redirecting URLs wastes crawl budget and adds latency.", fix: "Link directly to the final URL." },
+  "redirect-chain": { title: "Redirect chain", category: "crawl", severity: "medium", why: "Each extra hop slows users and crawlers, and long chains may not be followed.", fix: "Redirect straight to the final destination in one hop." },
+  "redirect-loop": { title: "Redirect loop", category: "crawl", severity: "high", why: "A redirect cycle never reaches a page, so neither users nor crawlers can load it.", fix: "Break the cycle so the URL resolves to one final response." },
+  "redirect-failed": { title: "Redirect failed", category: "crawl", severity: "high", why: "The redirect has an invalid or unsupported location, or too many hops, so it never resolves.", fix: "Point the redirect at a valid http(s) URL and keep the chain short." },
+  "redirect-off-site": { title: "Redirect to another domain", category: "crawl", severity: "low", why: "An internal URL that leaves the site hands its visitors and link signals to another domain.", fix: "Confirm the cross-domain redirect is intentional, or link to the external URL directly." },
+  "page-http-error": { title: "HTTP error page", category: "crawl", severity: "high", why: "Pages returning 4xx/5xx cannot be indexed and break user journeys.", fix: "Restore the page or redirect the URL to a live equivalent." },
+  "crawl-failed": { title: "Page failed to load", category: "crawl", severity: "high", why: "The crawler could not get any response (DNS, TLS, timeout, or connection error).", fix: "Check DNS, TLS certificates, firewall rules, and server availability." },
+  "non-html-page": { title: "Non-HTML URL in crawl", category: "crawl", severity: "medium", why: "A linked URL returned a non-HTML response, so it was not audited as a page.", fix: "Keep feeds, data, and files out of primary navigation unless intentionally linked." },
+  "url-too-long": { title: "Long URL", category: "crawl", severity: "low", why: "Long URLs are harder to read, share, and keep stable.", fix: "Use short, descriptive paths and drop unneeded parameters." },
+  "meta-refresh": { title: "Meta refresh redirect", category: "crawl", severity: "medium", why: "Client-side refresh redirects are slower and less reliable than HTTP redirects.", fix: "Replace the meta refresh with a 301/308 HTTP redirect." },
+  "tracking-parameters-in-url": { title: "Tracking parameters in URL", category: "crawl", severity: "low", why: "Tracking parameters create duplicate crawlable URLs for the same content.", fix: "Strip tracking parameters from crawlable URLs and canonicalize variants." },
+  "soft-404": { title: "Soft 404", category: "crawl", severity: "medium", why: "A URL that does not exist answers with a 2xx page, so missing and mistyped URLs look like real pages to search engines.", fix: "Return HTTP 404 or 410 for URLs that do not exist, instead of a 200 page or a redirect to one." },
+  "crawl-depth-deep": { title: "Deep page", category: "crawl", severity: "low", why: "Pages more than three clicks from the start page get less crawl attention and link equity.", fix: "Link important pages from navigation, hubs, or higher-level pages." },
+  "orphan-page": { title: "Orphan page", category: "crawl", severity: "medium", why: "The page is only in the sitemap; no crawled page links to it.", fix: "Add internal links from relevant pages." },
+  "no-pages-crawled": { title: "No pages crawled", category: "crawl", severity: "high", why: "The scan found no HTML pages, so there is no evidence to audit.", fix: "Check the scan URL, redirects, DNS, TLS, and firewall rules." },
+  "page-not-https": { title: "Page served over HTTP", category: "security", severity: "high", why: "Plain HTTP pages are unencrypted and marked not secure by browsers.", fix: "Serve the page over HTTPS and redirect HTTP to HTTPS." },
+  "external-blank-missing-noopener": { title: "target=_blank without noopener", category: "security", severity: "low", why: "New-tab links without noopener let the opened page access window.opener.", fix: "Add rel=\"noopener\" (or noreferrer) to external target=\"_blank\" links." },
+  "title-missing": { title: "Missing title", category: "metadata", severity: "high", why: "The title is the main headline in search results and browser tabs.", fix: "Add a unique, descriptive title tag." },
+  "title-multiple": { title: "Multiple title tags", category: "metadata", severity: "medium", why: "Several title tags make the page title ambiguous.", fix: "Keep exactly one title tag in the document head." },
+  "title-length": { title: "Title length", category: "metadata", severity: "low", why: "Very short titles under-describe the page; long ones get truncated in results.", fix: "Keep titles around 30-60 characters." },
+  "description-missing": { title: "Missing meta description", category: "metadata", severity: "high", why: "Without a description, search engines pick a snippet that may not sell the page.", fix: "Add a unique meta description summarizing the page." },
+  "description-multiple": { title: "Multiple meta descriptions", category: "metadata", severity: "medium", why: "Several descriptions make the intended snippet ambiguous.", fix: "Keep one meta description per page." },
+  "description-length": { title: "Meta description length", category: "metadata", severity: "low", why: "Short descriptions waste snippet space; long ones get truncated.", fix: "Keep descriptions around 70-160 characters." },
+  "favicon-missing": { title: "Missing favicon", category: "metadata", severity: "low", why: "Search results and browser tabs show the site icon.", fix: "Add a link rel=\"icon\" to a site icon." },
+  "duplicate-title": { title: "Duplicate title", category: "metadata", severity: "medium", why: "Identical titles make pages compete and blur which one should rank.", fix: "Write a unique title for each indexable page." },
+  "duplicate-description": { title: "Duplicate meta description", category: "metadata", severity: "low", why: "Repeated descriptions make results look alike and less relevant.", fix: "Write a unique description for each important page." },
+  "h1-count": { title: "Missing or multiple H1", category: "headings", severity: "medium", why: "One clear H1 states the page topic for users and crawlers.", fix: "Use exactly one descriptive H1." },
+  "h1-empty": { title: "Empty H1", category: "headings", severity: "low", why: "Empty headings add no meaning and confuse the outline.", fix: "Remove empty H1 tags or give them text." },
+  "heading-empty": { title: "Empty headings", category: "headings", severity: "low", why: "Empty headings break the document outline for assistive tech and crawlers.", fix: "Remove empty heading tags or add text." },
+  "heading-hierarchy-jump": { title: "Skipped heading levels", category: "headings", severity: "low", why: "Jumping levels (e.g. H2 to H4) makes the content structure harder to follow.", fix: "Nest headings in order without skipping levels." },
+  "h2-missing": { title: "No H2 on long page", category: "headings", severity: "low", why: "Long content without sections is harder to scan and understand.", fix: "Break long content into H2 sections." },
+  "duplicate-h1": { title: "Duplicate H1", category: "headings", severity: "low", why: "The same H1 on several pages suggests overlapping topics.", fix: "Give each page an H1 that reflects its unique purpose." },
+  "canonical-missing": { title: "Missing canonical", category: "canonicals", severity: "medium", why: "Without a canonical, search engines guess the preferred URL among variants.", fix: "Add a self-referencing canonical, or point it at the preferred URL." },
+  "canonical-invalid": { title: "Invalid canonical", category: "canonicals", severity: "medium", why: "A canonical that is not a valid URL is ignored.", fix: "Use a valid absolute or root-relative canonical URL." },
+  "canonical-multiple": { title: "Multiple canonicals", category: "canonicals", severity: "medium", why: "Conflicting canonical tags are usually ignored.", fix: "Keep one canonical tag per page." },
+  "canonical-http-on-https": { title: "HTTP canonical on HTTPS page", category: "canonicals", severity: "medium", why: "Canonicalizing to HTTP points search engines at the insecure version.", fix: "Point canonicals at the HTTPS URL." },
+  "canonical-cross-domain": { title: "Cross-domain canonical", category: "canonicals", severity: "medium", why: "A canonical to another domain asks search engines to index that domain instead.", fix: "Confirm the cross-domain canonical is intentional." },
+  "canonical-points-to-redirect": { title: "Canonical points to redirect", category: "canonicals", severity: "low", why: "Canonicals should name the final URL, not one that redirects.", fix: "Point the canonical at the final indexable URL." },
+  "canonical-target-redirect": { title: "Canonical URL redirects", category: "canonicals", severity: "medium", why: "The canonical names a URL that redirects, so search engines get two conflicting preferred URLs.", fix: "Point the canonical at the final URL the redirect lands on." },
+  "canonical-target-error": { title: "Canonical URL is broken", category: "canonicals", severity: "high", why: "The canonical names a URL that returns 4xx/5xx or does not load, so the hint is ignored or consolidates into a dead page.", fix: "Point the canonical at a live, indexable URL." },
+  "canonical-target-noindex": { title: "Canonical URL is noindex", category: "canonicals", severity: "high", why: "The canonical names a page marked noindex, so neither page may be indexed.", fix: "Canonicalize to an indexable page, or remove noindex from the canonical URL." },
+  "canonical-chain": { title: "Canonical chain", category: "canonicals", severity: "medium", why: "The canonical URL itself canonicalizes to another URL, so search engines have to follow a chain of hints.", fix: "Point every canonical directly at the final preferred URL." },
+  "canonical-not-self": { title: "Canonical points elsewhere", category: "canonicals", severity: "low", why: "An indexable page canonicalizing to another URL may be dropped from the index.", fix: "Use a self-referencing canonical unless the page is intentionally consolidated." },
+  noindex: { title: "Noindex page", category: "indexability", severity: "high", why: "A noindex directive keeps the page out of search results.", fix: "Remove noindex from pages that should rank." },
+  "meta-robots-nofollow": { title: "Nofollow page", category: "indexability", severity: "medium", why: "Page-level nofollow stops crawlers from following any link on the page.", fix: "Remove nofollow from the robots directives unless intended." },
+  "restrictive-snippet-directive": { title: "Restrictive snippet directives", category: "indexability", severity: "low", why: "noarchive/nosnippet limit how the page appears in search results.", fix: "Confirm the restriction is intentional." },
+  "html-lang-missing": { title: "Missing html lang", category: "indexability", severity: "low", why: "The lang attribute tells browsers, screen readers, and crawlers the page language.", fix: "Set lang on the html element, e.g. lang=\"en\"." },
+  "charset-missing": { title: "Missing charset", category: "indexability", severity: "low", why: "Without a charset declaration, text can be decoded incorrectly.", fix: "Declare <meta charset=\"utf-8\"> early in the head." },
+  "html-lang-invalid": { title: "Invalid html lang", category: "localization", severity: "low", why: "An invalid language code gives no usable language signal.", fix: "Use a valid BCP 47 tag such as en, en-US, or pt-PT." },
+  "hreflang-invalid": { title: "Invalid hreflang link", category: "localization", severity: "medium", why: "Hreflang entries without a code or valid URL are ignored.", fix: "Give every hreflang link a language code and a valid URL." },
+  "hreflang-code-invalid": { title: "Invalid hreflang code", category: "localization", severity: "medium", why: "Unrecognized language codes break the alternate-language set.", fix: "Use valid language or language-region codes, plus x-default." },
+  "hreflang-duplicate": { title: "Duplicate hreflang", category: "localization", severity: "low", why: "Two URLs for the same language code conflict.", fix: "Keep one alternate URL per hreflang value." },
+  "hreflang-missing-return": { title: "Missing hreflang return link", category: "localization", severity: "medium", why: "Hreflang pairs must link to each other; an alternate page that does not link back makes search engines ignore the pair.", fix: "Add a matching hreflang link back to this page on every alternate page." },
+  "hreflang-target-error": { title: "Hreflang URL not 200", category: "localization", severity: "medium", why: "Hreflang alternates should be live, final URLs; redirects and errors break the language set.", fix: "Point hreflang links at the final 200 URL of each language version." },
+  "hreflang-missing-self": { title: "Missing self-referencing hreflang", category: "localization", severity: "low", why: "Each page in an hreflang set should list itself as well as its alternates.", fix: "Add an hreflang link for this page's own language pointing at its own URL." },
+  "hreflang-x-default-missing": { title: "Missing hreflang x-default", category: "localization", severity: "low", why: "x-default names the fallback page for unmatched languages.", fix: "Add an x-default alternate when there is a default or selector page." },
+  "viewport-missing": { title: "Missing viewport", category: "performance", severity: "medium", why: "Without a viewport tag, mobile browsers render a zoomed-out desktop layout.", fix: "Add <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">." },
+  "viewport-not-responsive": { title: "Non-responsive viewport", category: "performance", severity: "low", why: "A viewport without width=device-width does not adapt to the screen.", fix: "Use width=device-width, initial-scale=1." },
+  "slow-page": { title: "Page response over 4s", category: "performance", severity: "medium", why: "Slow responses hurt users and reduce how much crawlers fetch.", fix: "Investigate server time, redirects, caching, and HTML weight." },
+  "page-response-slow": { title: "Page response over 2s", category: "performance", severity: "low", why: "Responses over two seconds feel slow and delay rendering.", fix: "Improve server response time and caching." },
+  "heavy-html": { title: "Heavy HTML", category: "performance", severity: "low", why: "HTML over 1 MB is slow to download and parse.", fix: "Reduce markup, inline data, and unused HTML." },
+  "html-compression-missing": { title: "HTML not compressed", category: "performance", severity: "low", why: "Uncompressed HTML transfers several times more bytes than needed.", fix: "Enable Brotli or gzip for HTML responses." },
+  "render-blocking-javascript": { title: "Render-blocking scripts", category: "performance", severity: "low", why: "Synchronous scripts in the head delay first render.", fix: "Use defer, async, or type=module, or move scripts out of the head." },
+  "too-many-assets": { title: "Too many CSS/JS assets", category: "performance", severity: "low", why: "Many separate asset requests add overhead to every page load.", fix: "Bundle, remove, or defer non-critical CSS and JavaScript." },
+  "image-lazy-loading-missing": { title: "Images not lazy loaded", category: "performance", severity: "low", why: "Below-the-fold images downloaded upfront compete with critical content.", fix: "Add loading=\"lazy\" to images outside the initial viewport." },
+  "thin-content": { title: "Thin content", category: "content", severity: "medium", why: "Pages with little visible text rarely satisfy search intent.", fix: "Add useful content, or noindex/consolidate pages not meant to rank." },
+  "duplicate-content": { title: "Duplicate content", category: "content", severity: "medium", why: "Identical body content on several URLs splits signals between them.", fix: "Canonicalize, consolidate, or rewrite the duplicates." },
+  "near-duplicate-content": { title: "Near-duplicate content", category: "content", severity: "medium", why: "Pages whose main text is almost identical compete for the same queries and may be folded together by search engines.", fix: "Differentiate the pages, or consolidate them and canonicalize to one URL." },
+  "image-src-missing": { title: "Image without source", category: "images", severity: "high", why: "An img tag with no src renders a broken image.", fix: "Remove the tag or give it a valid image URL." },
+  "image-fallback-src-missing": { title: "Picture missing fallback src", category: "images", severity: "low", why: "Clients that ignore <source> need the img src fallback.", fix: "Keep a valid src on the img inside picture elements." },
+  "image-srcset-invalid": { title: "Invalid srcset", category: "images", severity: "medium", why: "Malformed srcset candidates cannot be loaded.", fix: "Fix the srcset URLs and descriptors." },
+  "image-alt-missing": { title: "Missing alt text", category: "images", severity: "medium", why: "Alt text describes images to screen readers and image search.", fix: "Add descriptive alt text, or mark decorative images explicitly." },
+  "image-alt-empty": { title: "Empty alt text", category: "images", severity: "low", why: "Empty alt hides meaningful content images from assistive tech.", fix: "Describe the image, or mark it decorative with role=\"presentation\"." },
+  "image-alt-generic": { title: "Generic alt text", category: "images", severity: "low", why: "Alt like \"image\" or the file name tells users nothing.", fix: "Describe what the image shows and why it is there." },
+  "image-alt-too-long": { title: "Alt text too long", category: "images", severity: "low", why: "Very long alt text is tedious for screen reader users.", fix: "Keep alt concise; put long explanations in page copy." },
+  "image-alt-duplicate": { title: "Duplicate alt text", category: "images", severity: "low", why: "Different images sharing one alt text are indistinguishable.", fix: "Give each meaningful image its own alt text." },
+  "image-dimensions-missing": { title: "Unsized images", category: "images", severity: "low", why: "Images without reserved space cause layout shift while loading.", fix: "Set width/height, CSS dimensions, or an aspect ratio." },
+  "image-srcset-missing": { title: "Large images without srcset", category: "images", severity: "low", why: "Without responsive sources, small screens download oversized images.", fix: "Provide srcset/sizes candidates for large images." },
+  "mixed-content-images": { title: "Mixed-content images", category: "images", severity: "medium", why: "HTTP images on HTTPS pages are blocked or flagged by browsers.", fix: "Serve images over HTTPS." },
+  "broken-image": { title: "Broken image", category: "images", severity: "high", why: "The image URL fails, so visitors see a broken image.", fix: "Restore the image or update the URL." },
+  "image-certificate-error": { title: "Image certificate error", category: "images", severity: "medium", why: "The image host's TLS certificate could not be verified.", fix: "Check the certificate in a trusted client; fix it or move the image." },
+  "image-redirects": { title: "Redirecting image", category: "images", severity: "low", why: "Image redirects add a request before the image loads.", fix: "Reference the final image URL directly." },
+  "image-invalid-content-type": { title: "Image wrong content type", category: "images", severity: "medium", why: "The image URL does not return an image, so it will not render.", fix: "Serve a real image file with an image/* Content-Type." },
+  "image-extension-mismatch": { title: "Image extension mismatch", category: "images", severity: "low", why: "A file extension that disagrees with the Content-Type confuses caches and crawlers.", fix: "Match the file extension to the served image format." },
+  "large-image": { title: "Large image", category: "images", severity: "low", why: "Images over 500 KB slow page loads, especially on mobile.", fix: "Compress, resize, or serve modern formats such as WebP/AVIF." },
+  "mixed-content-links": { title: "Mixed-content links", category: "links", severity: "low", why: "HTTP links from HTTPS pages send users to insecure URLs.", fix: "Update links to their HTTPS versions." },
+  "empty-anchor-text": { title: "Links without anchor text", category: "links", severity: "low", why: "Links with no text or label give no context about their destination.", fix: "Add visible anchor text or an aria-label." },
+  "internal-nofollow": { title: "Nofollow internal links", category: "links", severity: "low", why: "Nofollow on internal links withholds crawl flow from your own pages.", fix: "Remove nofollow from internal links unless intended." },
+  "no-internal-links": { title: "No internal links", category: "links", severity: "medium", why: "A page without internal links is a dead end for users and crawlers.", fix: "Link to related pages and navigation." },
+  "too-many-links": { title: "Too many links", category: "links", severity: "low", why: "Hundreds of links dilute link equity and overwhelm users.", fix: "Keep navigation and body links focused." },
+  "internal-links-with-tracking-parameters": { title: "Internal links with tracking parameters", category: "links", severity: "low", why: "Tracked internal links create duplicate URLs and skew analytics.", fix: "Link to clean URLs internally; keep tagging for inbound campaigns." },
+  "broken-internal-link": { title: "Broken internal link", category: "links", severity: "high", why: "Links to failing URLs on your site waste crawl budget and frustrate users.", fix: "Fix or remove the link, or redirect the URL to a live page." },
+  "broken-external-link": { title: "Broken external link", category: "links", severity: "medium", why: "Links to failing external URLs hurt user trust.", fix: "Update the link to a working URL or remove it." },
+  "link-redirect-loop": { title: "Link redirect loop", category: "links", severity: "high", why: "The linked URL redirects in a cycle and never loads.", fix: "Fix the redirect cycle or link to a working final URL." },
+  "internal-link-certificate-error": { title: "Internal link certificate error", category: "links", severity: "medium", why: "The linked URL's TLS certificate could not be verified.", fix: "Check the certificate in a trusted client and fix it." },
+  "external-link-certificate-error": { title: "External link certificate error", category: "links", severity: "medium", why: "The external URL's TLS certificate could not be verified.", fix: "Check the certificate in a trusted client before treating the link as broken." },
+  "internal-link-redirects": { title: "Redirecting internal link", category: "links", severity: "medium", why: "Internal links through redirects add latency and waste crawl budget.", fix: "Link directly to the final URL." },
+  "external-link-redirects": { title: "Redirecting external link", category: "links", severity: "low", why: "External links through redirects add latency and may drift over time.", fix: "Link directly to the final destination." },
+  "structured-data-missing": { title: "No structured data", category: "structured-data", severity: "low", why: "Structured data helps search engines understand entities and enables rich results.", fix: "Add relevant JSON-LD such as Organization, BreadcrumbList, or Article." },
+  "structured-data-invalid": { title: "Invalid structured data", category: "structured-data", severity: "medium", why: "JSON-LD that does not parse is ignored.", fix: "Fix the JSON syntax in the JSON-LD blocks." },
+  "structured-data-missing-required": { title: "Structured data missing required properties", category: "structured-data", severity: "medium", why: "Items without the properties Google requires are not eligible for rich results.", fix: "Add the listed required properties to each structured data item." },
+  "structured-data-missing-recommended": { title: "Structured data missing recommended properties", category: "structured-data", severity: "low", why: "Recommended properties give search engines more detail for rich results.", fix: "Add the listed recommended properties where the information exists on the page." },
+  "open-graph-incomplete": { title: "Incomplete Open Graph", category: "social", severity: "low", why: "Missing og:title/og:description make shared links render poorly.", fix: "Add og:title and og:description." },
+  "open-graph-image-missing": { title: "Missing Open Graph image", category: "social", severity: "low", why: "Shared links without og:image show no preview image.", fix: "Add an og:image with an absolute URL." },
+  "open-graph-image-invalid": { title: "Invalid Open Graph image", category: "social", severity: "low", why: "A relative or invalid og:image URL is not loaded by social platforms.", fix: "Use an absolute https URL for og:image." },
+  "twitter-card-missing": { title: "Missing Twitter card", category: "social", severity: "low", why: "Without twitter:card, X/Twitter shows a minimal preview.", fix: "Add twitter:card metadata." },
+  "mixed-content-assets": { title: "Mixed-content CSS/JS", category: "assets", severity: "medium", why: "HTTP scripts and stylesheets on HTTPS pages are blocked by browsers.", fix: "Serve CSS and JavaScript over HTTPS." },
+  "broken-css": { title: "Broken CSS", category: "assets", severity: "high", why: "A failing stylesheet leaves the page unstyled or broken.", fix: "Restore the file, fix the URL, or remove the reference." },
+  "broken-javascript": { title: "Broken JavaScript", category: "assets", severity: "high", why: "A failing script can break page features and rendering.", fix: "Restore the file, fix the URL, or remove the reference." },
+  "asset-certificate-error": { title: "Asset certificate error", category: "assets", severity: "medium", why: "The asset host's TLS certificate could not be verified.", fix: "Check the certificate in a trusted client; fix it or move the asset." },
+  "css-invalid-content-type": { title: "CSS wrong content type", category: "assets", severity: "medium", why: "Browsers refuse stylesheets served with a non-CSS Content-Type.", fix: "Serve the stylesheet as text/css." },
+  "javascript-invalid-content-type": { title: "JavaScript wrong content type", category: "assets", severity: "medium", why: "Scripts served with the wrong Content-Type may be blocked.", fix: "Serve scripts with a JavaScript Content-Type." },
+  "large-css": { title: "Large CSS file", category: "assets", severity: "low", why: "Stylesheets over 500 KB block rendering longer.", fix: "Split, minify, compress, or remove unused CSS." },
+  "large-javascript": { title: "Large JavaScript file", category: "assets", severity: "low", why: "Scripts over 500 KB take long to download and execute.", fix: "Split, minify, compress, or defer the script." },
+};
+
+function scanIssueTitle(issue: any) {
+  return scanIssueTypes[String(issue?.type || "")]?.title || String(issue?.message || issue?.type || "Issue");
+}
 
 const scanLimits = {
   maxPages: 100,
@@ -270,7 +568,53 @@ function scanLimitsFor(maxPages: number): typeof scanLimits {
   };
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// Resolves after ms, or right away once the scan is cancelled.
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+// Runs tasks with a global concurrency cap and a per-host cap, so resource
+// checks finish quickly without sending bursts to any single server.
+async function runBounded<T>(
+  items: T[],
+  hostOf: (item: T) => string,
+  hostLimit: (host: string) => number,
+  task: (item: T) => Promise<void>,
+  signal: AbortSignal,
+  concurrency = 6,
+) {
+  const pending = [...items];
+  const activeByHost = new Map<string, number>();
+  const running = new Set<Promise<void>>();
+  while (pending.length && !signal.aborted) {
+    const index = pending.findIndex((item) => {
+      const host = hostOf(item);
+      return (activeByHost.get(host) || 0) < hostLimit(host);
+    });
+    if (running.size >= concurrency || index < 0) {
+      await Promise.race(running);
+      continue;
+    }
+    const [item] = pending.splice(index, 1);
+    const host = hostOf(item);
+    activeByHost.set(host, (activeByHost.get(host) || 0) + 1);
+    const job: Promise<void> = task(item).finally(() => {
+      activeByHost.set(host, (activeByHost.get(host) || 1) - 1);
+      running.delete(job);
+    });
+    running.add(job);
+  }
+  await Promise.all(running);
+}
 
 function cleanText(value: string) {
   return value.replace(/\s+/g, " ").trim();
@@ -465,7 +809,8 @@ function imageClassification(input: {
   const src = input.src.toLowerCase();
   if (
     (width > 0 && width <= 2 && height > 0 && height <= 2) ||
-    /(pixel|beacon|tracking|analytics|collect|transparent|spacer)/i.test(src)
+    // Whole tokens only: "/collect" is a tracking endpoint, "/collections/" is not.
+    /(?:^|[^a-z0-9])(?:pixel|beacon|tracking|analytics|collect|transparent|spacer)(?:[^a-z0-9]|$)/i.test(src)
   ) {
     return "tracking";
   }
@@ -504,6 +849,46 @@ function contentFingerprint(value: string) {
     .trim();
   if (normalized.length < 300) return "";
   return createHash("sha1").update(normalized).digest("hex");
+}
+
+// Near-duplicate detection: a 64-bit simhash of the page's 3-word shingles,
+// stored as 16 hex characters. Similar texts differ in few bits.
+const SIMHASH_MIN_WORDS = 50;
+const NEAR_DUPLICATE_MAX_DISTANCE = 3;
+
+function hash32(value: string, seed: number) {
+  let hash = seed;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(hash ^ value.charCodeAt(index), 0x01000193);
+  }
+  // murmur3 finalizer, so every output bit depends on every input bit.
+  hash = Math.imul(hash ^ (hash >>> 16), 0x85ebca6b);
+  hash = Math.imul(hash ^ (hash >>> 13), 0xc2b2ae35);
+  return (hash ^ (hash >>> 16)) >>> 0;
+}
+
+function contentSimhash(text: string) {
+  const words = text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (words.length < SIMHASH_MIN_WORDS) return "";
+  const weights = new Int32Array(64);
+  for (let index = 0; index + 2 < words.length; index += 1) {
+    const shingle = `${words[index]} ${words[index + 1]} ${words[index + 2]}`;
+    const halves = [hash32(shingle, 0x811c9dc5), hash32(shingle, 0x2f6b1d27)];
+    for (let bit = 0; bit < 64; bit += 1) {
+      weights[bit] += (halves[bit >> 5] >>> (bit & 31)) & 1 ? 1 : -1;
+    }
+  }
+  const halves = [0, 0];
+  for (let bit = 0; bit < 64; bit += 1) {
+    if (weights[bit] > 0) halves[bit >> 5] |= 1 << (bit & 31);
+  }
+  return halves.map((half) => (half >>> 0).toString(16).padStart(8, "0")).join("");
+}
+
+function bitCount32(value: number) {
+  let bits = value - ((value >>> 1) & 0x55555555);
+  bits = (bits & 0x33333333) + ((bits >>> 2) & 0x33333333);
+  return (Math.imul((bits + (bits >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24) & 0xff;
 }
 
 function firstH1Fingerprint(value: string) {
@@ -573,7 +958,6 @@ function issuePriority(severity: ScanIssueSeverity) {
 
 function pushScanIssue(
   issues: any[],
-  pageIssues: any[] | undefined,
   issue: {
     url: string;
     severity: ScanIssueSeverity;
@@ -589,7 +973,6 @@ function pushScanIssue(
     ...issue,
   };
   issues.push(row);
-  pageIssues?.push(row);
   return row;
 }
 
@@ -614,7 +997,9 @@ function groupIssueSummary(issues: any[]) {
       category: issue.category,
       type: issue.type,
       severity: issue.severity,
-      message: issue.message,
+      // Groups are named by issue type, not by whichever page came first.
+      title: scanIssueTitle(issue),
+      message: scanIssueTitle(issue),
       recommendation: issue.recommendation,
       count: 0,
       urls: [],
@@ -622,7 +1007,6 @@ function groupIssueSummary(issues: any[]) {
     existing.count += 1;
     if (issuePriority(issue.severity) > issuePriority(existing.severity)) {
       existing.severity = issue.severity;
-      existing.message = issue.message;
       existing.recommendation = issue.recommendation;
     }
     if (issue.url && existing.urls.length < 8 && !existing.urls.includes(issue.url)) {
@@ -657,6 +1041,32 @@ function comparisonIssue(issue: any, change: string, extra: Record<string, unkno
   };
 }
 
+// A short list a report can show as "Regressions": new high/medium issues and
+// pages that stopped being indexable or stopped answering 2xx.
+function comparisonRegressions(newIssues: any[], pageChanges: any[]) {
+  const isSuccess = (value: unknown) => Number(value) >= 200 && Number(value) < 300;
+  const pages = [
+    ...pageChanges
+      .filter((change) => change.type === "became-non-indexable")
+      .map((change) => ({ url: change.url, change: "became-non-indexable", before: change.before, after: change.after })),
+    ...pageChanges
+      .filter((change) => change.type === "http-status-changed" && isSuccess(change.before) && !isSuccess(change.after))
+      .map((change) => ({ url: change.url, change: "became-non-200", before: change.before, after: change.after })),
+  ];
+  const newHighIssues = newIssues.filter((issue) => issue.severity === "high").length;
+  const newMediumIssues = newIssues.filter((issue) => issue.severity === "medium").length;
+  const becameNonIndexable = pages.filter((page) => page.change === "became-non-indexable").length;
+  const becameNon200 = pages.length - becameNonIndexable;
+  return {
+    total: newHighIssues + newMediumIssues + pages.length,
+    newHighIssues,
+    newMediumIssues,
+    becameNonIndexable,
+    becameNon200,
+    pages: pages.slice(0, 20),
+  };
+}
+
 function emptyScanComparison(reason: string, previousScan?: any) {
   return {
     available: false,
@@ -664,6 +1074,7 @@ function emptyScanComparison(reason: string, previousScan?: any) {
     previousScanId: previousScan?.id || null,
     previousCreatedAt: previousScan?.created_at || null,
     summary: { newIssues: 0, fixedIssues: 0, severityChanges: 0, regressions: 0, pageChanges: 0 },
+    regressions: comparisonRegressions([], []),
     newIssues: [],
     fixedIssues: [],
     severityChanges: [],
@@ -671,15 +1082,80 @@ function emptyScanComparison(reason: string, previousScan?: any) {
   };
 }
 
-function buildScanComparison(previousScan: any, pages: any[], issues: any[], limits: typeof scanLimits) {
+// Field-level changes for one page that exists in both scans.
+function comparePageRows(previous: any, page: any) {
+  const changes: any[] = [];
+  const addChange = (type: string, label: string, field: string, before: unknown, after: unknown, regression = false) => {
+    changes.push({ type, label, url: page.url, field, before, after, regression });
+  };
+  if (typeof previous.indexable === "boolean" && typeof page.indexable === "boolean" && previous.indexable !== page.indexable) {
+    addChange(
+      page.indexable ? "became-indexable" : "became-non-indexable",
+      page.indexable ? "Page became indexable" : "Page became non-indexable",
+      "Indexability",
+      previous.indexable ? "Indexable" : "Non-indexable",
+      page.indexable ? "Indexable" : "Non-indexable",
+      !page.indexable,
+    );
+  }
+  const previousStatus = Number(previous.status || 0);
+  const currentStatus = Number(page.status || 0);
+  if (previousStatus !== currentStatus) {
+    addChange(
+      "http-status-changed",
+      "HTTP status changed",
+      "HTTP status",
+      previousStatus || "Unknown",
+      currentStatus || "Unknown",
+      (previousStatus < 300 && (currentStatus >= 300 || !currentStatus)) || (previousStatus < 400 && currentStatus >= 400),
+    );
+  }
+  const previousFinalUrl = normalizedUrl(String(previous.finalUrl || previous.url || ""));
+  const currentFinalUrl = normalizedUrl(String(page.finalUrl || page.url || ""));
+  if (previousFinalUrl !== currentFinalUrl) {
+    addChange("redirect-target-changed", "Redirect destination changed", "Final URL", previousFinalUrl, currentFinalUrl, true);
+  }
+  const fields = [
+    { key: "title", label: "Title changed", field: "Title" },
+    { key: "description", label: "Meta description changed", field: "Meta description" },
+    { key: "h1", label: "H1 changed", field: "H1" },
+    { key: "wordCount", label: "Word count changed", field: "Word count" },
+  ];
+  for (const item of fields) {
+    const before = previous[item.key] ?? "";
+    const after = page[item.key] ?? "";
+    if (String(before) !== String(after)) {
+      addChange(`${item.key}-changed`, item.label, item.field, before, after);
+    }
+  }
+  if (Boolean(previous.sitemapListed) !== Boolean(page.sitemapListed)) {
+    addChange(
+      page.sitemapListed ? "page-added-to-sitemap" : "page-removed-from-sitemap",
+      page.sitemapListed ? "Page added to sitemap" : "Page removed from sitemap",
+      "Sitemap",
+      previous.sitemapListed ? "Listed" : "Not listed",
+      page.sitemapListed ? "Listed" : "Not listed",
+      !page.sitemapListed && page.indexable === true,
+    );
+  }
+  return changes;
+}
+
+function buildScanComparison(
+  previousScan: any,
+  pages: any[],
+  issues: any[],
+  limits: typeof scanLimits,
+  scanVersion = SCAN_RESULT_VERSION,
+) {
   const previousResult = jsonParse<any>(previousScan?.result_json, null);
   if (!previousScan || !previousResult) {
     return emptyScanComparison("no-previous-scan");
   }
-  if (Number(previousResult.scanVersion || 0) !== SCAN_RESULT_VERSION) {
+  if (Number(previousResult.scanVersion || 0) !== Number(scanVersion || 0)) {
     return emptyScanComparison("incompatible-version", previousScan);
   }
-  if (Number(previousResult.limits?.maxPages || 0) !== Number(limits.maxPages || 0)) {
+  if (Number(previousResult.limits?.maxPages || 0) !== Number(limits?.maxPages || 0)) {
     return emptyScanComparison("scope-changed", previousScan);
   }
 
@@ -715,81 +1191,17 @@ function buildScanComparison(previousScan: any, pages: any[], issues: any[], lim
   });
 
   const pageChanges: any[] = [];
-  const addPageChange = (
-    type: string,
-    label: string,
-    url: string,
-    field: string,
-    before: unknown,
-    after: unknown,
-    regression = false,
-  ) => {
-    pageChanges.push({ type, label, url, field, before, after, regression });
-  };
-
   for (const [key, page] of currentPageMap) {
     const previous = previousPageMap.get(key);
-    if (!previous) {
-      addPageChange("page-added", "Page discovered", page.url, "Page", "Not crawled", "Crawled");
-      continue;
-    }
-    if (typeof previous.indexable === "boolean" && typeof page.indexable === "boolean" && previous.indexable !== page.indexable) {
-      addPageChange(
-        page.indexable ? "became-indexable" : "became-non-indexable",
-        page.indexable ? "Page became indexable" : "Page became non-indexable",
-        page.url,
-        "Indexability",
-        previous.indexable ? "Indexable" : "Non-indexable",
-        page.indexable ? "Indexable" : "Non-indexable",
-        !page.indexable,
-      );
-    }
-    const previousStatus = Number(previous.status || 0);
-    const currentStatus = Number(page.status || 0);
-    if (previousStatus !== currentStatus) {
-      addPageChange(
-        "http-status-changed",
-        "HTTP status changed",
-        page.url,
-        "HTTP status",
-        previousStatus || "Unknown",
-        currentStatus || "Unknown",
-        (previousStatus < 300 && currentStatus >= 300) || (previousStatus < 400 && currentStatus >= 400),
-      );
-    }
-    const previousFinalUrl = normalizedUrl(String(previous.finalUrl || previous.url || ""));
-    const currentFinalUrl = normalizedUrl(String(page.finalUrl || page.url || ""));
-    if (previousFinalUrl !== currentFinalUrl) {
-      addPageChange("redirect-target-changed", "Redirect destination changed", page.url, "Final URL", previousFinalUrl, currentFinalUrl, true);
-    }
-    const fields = [
-      { key: "title", label: "Title changed", field: "Title" },
-      { key: "description", label: "Meta description changed", field: "Meta description" },
-      { key: "h1", label: "H1 changed", field: "H1" },
-      { key: "wordCount", label: "Word count changed", field: "Word count" },
-    ];
-    for (const item of fields) {
-      const before = previous[item.key] ?? "";
-      const after = page[item.key] ?? "";
-      if (String(before) !== String(after)) {
-        addPageChange(`${item.key}-changed`, item.label, page.url, item.field, before, after);
-      }
-    }
-    if (Boolean(previous.sitemapListed) !== Boolean(page.sitemapListed)) {
-      addPageChange(
-        page.sitemapListed ? "page-added-to-sitemap" : "page-removed-from-sitemap",
-        page.sitemapListed ? "Page added to sitemap" : "Page removed from sitemap",
-        page.url,
-        "Sitemap",
-        previous.sitemapListed ? "Listed" : "Not listed",
-        page.sitemapListed ? "Listed" : "Not listed",
-        !page.sitemapListed && page.indexable === true,
-      );
+    if (previous) {
+      pageChanges.push(...comparePageRows(previous, page));
+    } else {
+      pageChanges.push({ type: "page-added", label: "Page discovered", url: page.url, field: "Page", before: "Not crawled", after: "Crawled", regression: false });
     }
   }
   for (const [key, page] of previousPageMap) {
     if (!currentPageMap.has(key)) {
-      addPageChange("page-removed", "Page no longer crawled", page.url, "Page", "Crawled", "Not crawled", true);
+      pageChanges.push({ type: "page-removed", label: "Page no longer crawled", url: page.url, field: "Page", before: "Crawled", after: "Not crawled", regression: true });
     }
   }
 
@@ -804,10 +1216,136 @@ function buildScanComparison(previousScan: any, pages: any[], issues: any[], lim
       regressions: pageChanges.filter((change) => change.regression).length,
       pageChanges: pageChanges.length,
     },
+    regressions: comparisonRegressions(newIssues, pageChanges),
     newIssues,
     fixedIssues,
     severityChanges,
     pageChanges,
+  };
+}
+
+// The most recent completed scan of the same site and start URL that was
+// created before scanId — the baseline for "what changed" views.
+function previousCompletedScan(siteId: string, scanId: string, startUrl: string) {
+  const startKey = normalizedUrlKey(httpStartUrl(startUrl));
+  const candidate = all<any>(
+    `
+    SELECT id, created_at, url FROM scans
+    WHERE site_id = ?
+      AND status = 'completed'
+      AND rowid < (SELECT rowid FROM scans WHERE id = ?)
+    ORDER BY rowid DESC
+    LIMIT 50
+    `,
+    [siteId, scanId],
+  ).find((row) => normalizedUrlKey(httpStartUrl(String(row.url || ""))) === startKey);
+  if (!candidate) return null;
+  const row = get<any>("SELECT result_json FROM scans WHERE id = ?", [candidate.id]);
+  return row ? { ...candidate, result_json: row.result_json } : null;
+}
+
+function httpStartUrl(value: string) {
+  return /^https?:\/\//i.test(value) ? value : `https://${value}`;
+}
+
+// Compare any two scans of the same site; baseId is the older baseline.
+export function compareScans(scanId: string, baseId: string) {
+  const current = get<any>("SELECT * FROM scans WHERE id = ?", [scanId]);
+  const base = get<any>("SELECT * FROM scans WHERE id = ?", [baseId]);
+  if (!current || !base) throw new ScanRequestError(404, "Scan not found.");
+  if (current.site_id !== base.site_id) {
+    throw new ScanRequestError(400, "Scans can only be compared within the same site.");
+  }
+  const result = jsonParse<any>(current.result_json, {}) || {};
+  const comparison = buildScanComparison(
+    base,
+    Array.isArray(result.pages) ? result.pages : [],
+    Array.isArray(result.issues) ? result.issues : [],
+    result.limits,
+    result.scanVersion,
+  );
+  return filterComparison(comparison, siteIgnoreRules(current.site_id));
+}
+
+// One page of a saved scan with its issues, link graph, images, and the
+// changes since the same page in the previous completed scan.
+export function getScanPage(scanId: string, pageUrl: string) {
+  if (!pageUrl) throw new ScanRequestError(400, "Pass the page URL as ?url=.");
+  const scan = getScan(scanId);
+  if (!scan) throw new ScanRequestError(404, "Scan not found.");
+  const result = scan.result || {};
+  const pages: any[] = Array.isArray(result.pages) ? result.pages : [];
+  // The saved page URL, then the URL it was requested as or landed on, then
+  // any of those under the same normalized URL key.
+  const requestedKey = normalizedUrlKey(pageUrl);
+  const page =
+    pages.find((row) => row.url === pageUrl) ||
+    pages.find((row) => row.finalUrl === pageUrl || row.requestedUrl === pageUrl) ||
+    pages.find((row) =>
+      [row.url, row.finalUrl, row.requestedUrl].some((value) => value && normalizedUrlKey(String(value)) === requestedKey),
+    );
+  if (!page) throw new ScanRequestError(404, "Page not found in this scan.");
+  const pageKeys = new Set(
+    [page.url, page.finalUrl, page.requestedUrl].filter(Boolean).map((value) => normalizedUrlKey(String(value))),
+  );
+  const pageUrls = new Set([page.url, page.requestedUrl].filter(Boolean));
+  const issues = (Array.isArray(result.issues) ? result.issues : []).filter((issue: any) => pageUrls.has(issue.url));
+
+  // Anchors come from the saved link inventory; checked links add any other
+  // source pages the capped inventory did not keep.
+  const inlinks = new Map<string, { from: string; anchor?: string; nofollow?: boolean }>();
+  for (const link of Array.isArray(result.linkInventory) ? result.linkInventory : []) {
+    if (link.type !== "internal" || !pageKeys.has(normalizedUrlKey(String(link.href || ""))) || inlinks.has(link.from)) continue;
+    inlinks.set(link.from, { from: link.from, anchor: link.anchor || undefined, nofollow: /\bnofollow\b/i.test(link.rel || "") });
+  }
+  const checkedLinks: any[] = Array.isArray(result.links) ? result.links : [];
+  for (const link of checkedLinks) {
+    if (link.type !== "internal" || !pageKeys.has(normalizedUrlKey(String(link.url || "")))) continue;
+    for (const from of Array.isArray(link.sourcePages) ? link.sourcePages : link.from ? [link.from] : []) {
+      if (!inlinks.has(from)) inlinks.set(from, { from });
+    }
+  }
+  const linkChecks = new Map(checkedLinks.map((link) => [link.url, link]));
+  const outlinks = (Array.isArray(result.linkInventory) ? result.linkInventory : [])
+    .filter((link: any) => link.from === page.url)
+    .map((link: any) => {
+      const check = linkChecks.get(link.href);
+      return {
+        href: link.href,
+        anchor: link.anchor,
+        rel: link.rel,
+        type: link.type,
+        ...(check ? { ok: check.ok, status: check.status, finalStatus: check.finalStatus, finalUrl: check.finalUrl } : {}),
+      };
+    });
+  const imageChecks = new Map((Array.isArray(result.images) ? result.images : []).map((image: any) => [image.url, image]));
+  const images = (Array.isArray(result.imageInventory) ? result.imageInventory : [])
+    .filter((image: any) => image.from === page.url)
+    .map((image: any) => {
+      const check: any = imageChecks.get(image.src);
+      return {
+        ...image,
+        ...(check ? { ok: check.ok, status: check.status, finalStatus: check.finalStatus, contentType: check.contentType, contentLength: check.contentLength } : {}),
+      };
+    });
+
+  const previousScan = previousCompletedScan(scan.site_id, scan.id, result.startUrl || scan.url);
+  const previousPages: any[] = jsonParse<any>(previousScan?.result_json, null)?.pages || [];
+  const previousPage = previousPages.find((row) => pageKeys.has(normalizedUrlKey(String(row.url || ""))));
+  return {
+    page,
+    issues,
+    inlinks: [...inlinks.values()],
+    outlinks,
+    images,
+    previous: previousScan && previousPage
+      ? {
+          scanId: previousScan.id,
+          createdAt: previousScan.created_at,
+          url: previousPage.url,
+          changes: comparePageRows(previousPage, page),
+        }
+      : null,
   };
 }
 
@@ -819,23 +1357,30 @@ export function resourceFailureKind(error: unknown) {
   return "request";
 }
 
-async function checkResource(url: string, method: "HEAD" | "GET" = "HEAD") {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+const resourceCheckTimeoutMs = 12000;
+
+async function checkResource(url: string, signal?: AbortSignal) {
+  // Each request gets its own timeout so a slow HEAD cannot eat the GET retry.
+  const requestSignal = () => {
+    const timeout = AbortSignal.timeout(resourceCheckTimeoutMs);
+    return signal ? AbortSignal.any([timeout, signal]) : timeout;
+  };
   try {
     let trace = await fetchWithRedirectTrace(url, {
-      method,
-      signal: controller.signal,
+      method: "HEAD",
+      signal: requestSignal(),
       headers: {
         "User-Agent": "LocalSEO/0.1 (+https://localhost)",
         Accept: "*/*",
-        ...(method === "GET" ? { Range: "bytes=0-2048" } : {}),
       },
     });
-    if (method === "HEAD" && [403, 405, 501].includes(trace.finalStatus)) {
+    // Some sites serve the page on GET but return 404 for HEAD.
+    // Confirm with a real content request before reporting a broken resource.
+    if ([403, 404, 405, 501].includes(trace.finalStatus)) {
+      await trace.response.body?.cancel().catch(() => undefined);
       trace = await fetchWithRedirectTrace(url, {
         method: "GET",
-        signal: controller.signal,
+        signal: requestSignal(),
         headers: {
           "User-Agent": "LocalSEO/0.1 (+https://localhost)",
           Accept: "*/*",
@@ -844,6 +1389,7 @@ async function checkResource(url: string, method: "HEAD" | "GET" = "HEAD") {
       });
     }
     const { response } = trace;
+    await response.body?.cancel().catch(() => undefined);
     // A ranged GET reports the partial length in Content-Length; the true total
     // is in Content-Range ("bytes 0-2048/524288"). Prefer that so size checks work.
     const rangeTotal = Number((response.headers.get("content-range") || "").split("/")[1]) || null;
@@ -865,79 +1411,42 @@ async function checkResource(url: string, method: "HEAD" | "GET" = "HEAD") {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Request failed";
-    return {
-      ok: false,
-      status: null,
-      finalStatus: null,
-      finalUrl: url,
-      redirected: false,
-      redirectChain: [],
-      redirectLoop: false,
-      redirectError: "",
-      contentType: "",
-      contentLength: null,
-      error: message,
-      failureKind: resourceFailureKind(message),
-    };
-  } finally {
-    clearTimeout(timeout);
+    return failedResourceCheck(url, message);
   }
 }
 
-function parseRobots(text: string) {
-  const sitemaps: string[] = [];
-  let disallowCount = 0;
-  let blocksAll = false;
-  let crawlDelaySeconds = 0;
-  // Track the user-agent group each directive belongs to. `Disallow: /` only
-  // blocks our crawl when it applies to `*` (or all agents), so a targeted block
-  // like `User-agent: GPTBot\nDisallow: /` must not flag the whole site.
-  let currentAgents: string[] = [];
-  let sawDirectiveInGroup = false;
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.replace(/#.*/, "").trim();
-    if (!line) continue;
-    const [rawKey, ...rest] = line.split(":");
-    const key = rawKey.trim().toLowerCase();
-    const value = rest.join(":").trim();
-    if (key === "sitemap" && value) {
-      if (value) sitemaps.push(value);
-      continue;
-    }
-    if (key === "user-agent") {
-      // Consecutive user-agent lines share the same following directive block.
-      if (sawDirectiveInGroup) {
-        currentAgents = [];
-        sawDirectiveInGroup = false;
-      }
-      currentAgents.push(value.toLowerCase());
-      continue;
-    }
-    if (key === "disallow") {
-      sawDirectiveInGroup = true;
-      const appliesToAll = currentAgents.length === 0 || currentAgents.includes("*");
-      if (appliesToAll) {
-        disallowCount += 1;
-        if (value === "/") blocksAll = true;
-      }
-    } else if (key === "allow") {
-      sawDirectiveInGroup = true;
-    } else if (key === "crawl-delay") {
-      sawDirectiveInGroup = true;
-      const appliesToAll = currentAgents.length === 0 || currentAgents.includes("*");
-      const seconds = Number(value);
-      if (appliesToAll && Number.isFinite(seconds) && seconds > 0) {
-        crawlDelaySeconds = Math.max(crawlDelaySeconds, seconds);
-      }
-    }
-  }
-  return { sitemaps: [...new Set(sitemaps)], disallowCount, blocksAll, crawlDelaySeconds };
+function failedResourceCheck(url: string, message: string) {
+  return {
+    ok: false,
+    status: null,
+    finalStatus: null,
+    finalUrl: url,
+    redirected: false,
+    redirectChain: [],
+    redirectLoop: false,
+    redirectError: "",
+    contentType: "",
+    contentLength: null,
+    error: message,
+    failureKind: resourceFailureKind(message),
+  };
 }
 
-async function readRobots(origin: string) {
+// Google reads the first 500 KiB of robots.txt and ignores the rest.
+const MAX_ROBOTS_BYTES = 500 * 1024;
+
+// How Google treats a robots.txt response that is not a 2xx: a redirect that
+// never resolves or a 4xx (except 429) means there are no rules, so every URL
+// is allowed; 429, 5xx, and unreachable hosts mean the whole site is treated
+// as disallowed until robots.txt answers again.
+function robotsResponseAllowsAll(status: number | null | undefined) {
+  return typeof status === "number" && status >= 300 && status < 500 && status !== 429;
+}
+
+async function readRobots(origin: string, signal: AbortSignal) {
   const url = `${origin}/robots.txt`;
   try {
-    const response = await fetchText(url);
+    const response = await fetchText(url, 15000, { signal, maxBytes: MAX_ROBOTS_BYTES });
     if (!response.ok) {
       return {
         exists: false,
@@ -948,6 +1457,7 @@ async function readRobots(origin: string) {
         sitemaps: [],
         disallowCount: 0,
         blocksAll: false,
+        groups: [],
       };
     }
     return {
@@ -966,7 +1476,62 @@ async function readRobots(origin: string) {
       sitemaps: [],
       disallowCount: 0,
       blocksAll: false,
+      groups: [],
       error: error instanceof Error ? error.message : "Could not fetch robots.txt",
+    };
+  }
+}
+
+// Tests one URL against the site's robots.txt, fetched live or passed in as a
+// draft, with the same Googlebot matcher the crawler uses.
+export async function testSiteRobots(siteId: string, input: { url?: unknown; userAgent?: unknown; robotsTxt?: unknown }) {
+  const site = getSite(siteId);
+  if (!site) throw new ScanRequestError(404, "Site not found.");
+  const url = String(input?.url || "").trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new ScanRequestError(400, "Pass an absolute http(s) URL as url.");
+  }
+  if (!/^https?:$/.test(parsed.protocol) || !sameSiteUrl(url, site.domain)) {
+    throw new ScanRequestError(400, `The URL must be on ${site.domain}.`);
+  }
+  const userAgent = String(input?.userAgent || "").trim() || "Googlebot";
+  const robotsUrl = `${parsed.origin}/robots.txt`;
+  if (typeof input?.robotsTxt === "string") {
+    return { ...testRobots(input.robotsTxt, url, userAgent), robotsUrl, source: "provided", fetchedStatus: null };
+  }
+  const response = await fetchText(robotsUrl, 15000, { maxBytes: MAX_ROBOTS_BYTES }).catch(() => null);
+  const fetchedStatus = response ? response.finalStatus : null;
+  if (response?.ok) {
+    return { ...testRobots(response.text, url, userAgent), robotsUrl, source: "live", fetchedStatus };
+  }
+  return { allowed: robotsResponseAllowsAll(fetchedStatus), matchedRule: null, userAgentGroup: "", robotsUrl, source: "live", fetchedStatus };
+}
+
+// One request for a URL that cannot exist on the site. A 2xx answer, directly
+// or after redirects, means missing pages look like real pages (a soft 404).
+// The path is fixed per origin so the finding keeps its identity across scans.
+async function probeSoftNotFound(origin: string, signal: AbortSignal) {
+  const probeUrl = `${origin}/localseo-404-check-${createHash("sha1").update(origin).digest("hex").slice(0, 12)}`;
+  try {
+    const response = await fetchText(probeUrl, 15000, { signal, maxBytes: 64 * 1024 });
+    return {
+      probeUrl,
+      status: response.finalStatus,
+      sourceStatus: response.status,
+      finalUrl: response.url,
+      redirectChain: response.redirectChain,
+      soft404: response.finalStatus >= 200 && response.finalStatus < 300,
+    };
+  } catch (error) {
+    return {
+      probeUrl,
+      status: null,
+      finalUrl: probeUrl,
+      soft404: false,
+      error: error instanceof Error ? error.message : "Request failed",
     };
   }
 }
@@ -984,7 +1549,11 @@ function collectXmlLocs(node: any, locs = new Set<string>()) {
   return locs;
 }
 
-async function readSitemaps(origin: string, robotsSitemaps: string[]) {
+// The sitemap protocol caps files at 50 MB uncompressed; larger files are
+// rejected by search engines, so they are reported instead of half-parsed.
+const MAX_SITEMAP_BYTES = 50 * 1024 * 1024;
+
+async function readSitemaps(origin: string, robotsSitemaps: string[], signal: AbortSignal) {
   const candidates = [...new Set([
     ...robotsSitemaps.map((item) => {
       try {
@@ -1000,12 +1569,25 @@ async function readSitemaps(origin: string, robotsSitemaps: string[]) {
   const urls = new Set<string>();
   const queue = [...candidates];
   const seen = new Set<string>();
-  while (queue.length > 0 && sitemaps.length < 25) {
+  while (queue.length > 0 && sitemaps.length < 25 && !signal.aborted) {
     const sitemapUrl = queue.shift()!;
     if (seen.has(sitemapUrl)) continue;
     seen.add(sitemapUrl);
     try {
-      const response = await fetchText(sitemapUrl);
+      const response = await fetchText(sitemapUrl, 30000, { signal, maxBytes: MAX_SITEMAP_BYTES });
+      if (response.ok && response.truncated) {
+        sitemaps.push({
+          url: sitemapUrl,
+          status: response.finalStatus,
+          sourceStatus: response.status,
+          redirectChain: response.redirectChain,
+          ok: false,
+          truncated: true,
+          urlCount: 0,
+          error: "Sitemap is larger than 50 MB uncompressed and was not parsed.",
+        });
+        continue;
+      }
       if (!response.ok) {
         sitemaps.push({
           url: sitemapUrl,
@@ -1050,22 +1632,67 @@ async function readSitemaps(origin: string, robotsSitemaps: string[]) {
   return { sitemaps, urls: [...urls] };
 }
 
-function scanSummary(
-  issues: any[],
-  pages: any[],
-  checkedLinks: any[],
-  checkedImages: any[],
-  checkedAssets: any[],
-  imageInventory: any[],
-  linkInventory: any[],
-  parameterUrls: any[],
-  phase: string,
-) {
-  const bySeverity = severityCounts(issues);
+// Summary fields derived from open issues only. Ignore rules recompute these
+// on read; crawl-derived fields stay as saved.
+function issueSummary(issues: any[]) {
   const byCategory = issues.reduce<Record<string, number>>((acc, issue) => {
     acc[issue.category] = (acc[issue.category] || 0) + 1;
     return acc;
   }, {});
+  const countType = (...types: string[]) => issues.filter((issue) => types.includes(issue.type)).length;
+  const countCategory = (...categories: string[]) => issues.filter((issue) => categories.includes(issue.category)).length;
+  return {
+    openIssues: issues.length,
+    bySeverity: severityCounts(issues),
+    byCategory,
+    thinPages: countType("thin-content"),
+    noH1Pages: issues.filter((issue) => issue.type === "h1-count" && /Missing H1/i.test(issue.message)).length,
+    duplicateH1Pages: countType("duplicate-h1"),
+    duplicateContentPages: countType("duplicate-content"),
+    orphanPages: countType("orphan-page"),
+    deepPages: countType("crawl-depth-deep"),
+    pagesMissingFromSitemap: countType("page-missing-from-sitemap"),
+    noindexPagesInSitemap: countType("noindex-page-in-sitemap"),
+    largeImages: countType("large-image"),
+    imageExtensionMismatches: countType("image-extension-mismatch"),
+    largeAssets: countType("large-css", "large-javascript"),
+    renderBlockingScripts: countType("render-blocking-javascript"),
+    emptyAnchorLinks: countType("empty-anchor-text"),
+    internalNofollowLinks: countType("internal-nofollow"),
+    imagesMissingDimensions: countType("image-dimensions-missing"),
+    imagesMissingSrcset: countType("image-srcset-missing"),
+    imagesMissingLazyLoading: countType("image-lazy-loading-missing"),
+    imageIssues: countCategory("images"),
+    assetIssues: countCategory("assets"),
+    metadataIssues: countCategory("metadata"),
+    duplicateIssues: issues.filter((issue) => issue.type.startsWith("duplicate-")).length,
+    missingTitles: countType("title-missing"),
+    titleLengthIssues: countType("title-length"),
+    missingDescriptions: countType("description-missing"),
+    descriptionLengthIssues: countType("description-length"),
+    missingAlt: countType("image-alt-missing", "image-alt-empty"),
+    genericAlt: countType("image-alt-generic"),
+    longAlt: countType("image-alt-too-long"),
+    schemaIssues: countCategory("structured-data"),
+    socialIssues: countCategory("social"),
+    securityIssues: countCategory("security"),
+    performanceIssues: countCategory("performance", "assets"),
+  };
+}
+
+function scanSummary(input: {
+  issues: any[];
+  pages: any[];
+  checkedLinks: any[];
+  checkedImages: any[];
+  checkedAssets: any[];
+  imageInventory: any[];
+  linkInventory: any[];
+  parameterUrlCount: number;
+  parameterUrlTargetCount: number;
+  phase: string;
+}) {
+  const { pages, checkedLinks, checkedImages, checkedAssets, imageInventory, linkInventory } = input;
   const pageLoadTimes = pages
     .map((page) => Number(page.loadMs))
     .filter((value) => Number.isFinite(value) && value >= 0)
@@ -1086,16 +1713,12 @@ function scanSummary(
       Array.isArray(link.sourcePages) && link.sourcePages.length ? link.sourcePages : link.from ? [link.from] : [],
     ),
   );
-  const unverifiedLinks = checkedLinks.filter((link) => link.ok === false && link.failureKind === "tls-certificate");
-  const unverifiedImages = checkedImages.filter(
-    (image) => image.ok === false && image.failureKind === "tls-certificate",
-  );
-  const unverifiedAssets = checkedAssets.filter(
-    (asset) => asset.ok === false && asset.failureKind === "tls-certificate",
-  );
+  const unverified = (rows: any[]) => rows.filter((row) => row.ok === false && row.failureKind === "tls-certificate").length;
+  const broken = (rows: any[]) => rows.filter((row) => !row.ok && row.failureKind !== "tls-certificate").length;
   return {
-    phase,
+    phase: input.phase,
     pages: pages.length,
+    failedPages: pages.filter((page) => page.error).length,
     measuredPageLoads: pageLoadTimes.length,
     averagePageLoadMs,
     medianPageLoadMs: loadPercentile(50),
@@ -1107,31 +1730,19 @@ function scanSummary(
     indexablePages: pages.filter((page) => page.indexable === true).length,
     nonIndexablePages: pages.filter((page) => page.indexable === false).length,
     unknownIndexabilityPages: pages.filter((page) => typeof page.indexable !== "boolean").length,
-    thinPages: issues.filter((issue) => issue.type === "thin-content").length,
-    noH1Pages: issues.filter((issue) => issue.type === "h1-count" && /Missing H1/i.test(issue.message)).length,
-    duplicateH1Pages: issues.filter((issue) => issue.type === "duplicate-h1").length,
-    duplicateContentPages: issues.filter((issue) => issue.type === "duplicate-content").length,
-    orphanPages: issues.filter((issue) => issue.type === "orphan-page").length,
-    deepPages: issues.filter((issue) => issue.type === "crawl-depth-deep").length,
     sitemapUrls: [...new Set(pages.flatMap((page) => page.sitemapListed ? [page.url] : []))].length,
-    pagesMissingFromSitemap: issues.filter((issue) => issue.type === "page-missing-from-sitemap").length,
-    noindexPagesInSitemap: issues.filter((issue) => issue.type === "noindex-page-in-sitemap").length,
     checkedLinks: checkedLinks.length,
-    brokenLinks: checkedLinks.filter((link) => !link.ok && link.failureKind !== "tls-certificate").length,
-    unverifiedLinks: unverifiedLinks.length,
+    brokenLinks: broken(checkedLinks),
+    unverifiedLinks: unverified(checkedLinks),
     checkedImages: checkedImages.length,
-    brokenImages: checkedImages.filter((image) => !image.ok && image.failureKind !== "tls-certificate").length,
-    unverifiedImages: unverifiedImages.length,
+    brokenImages: broken(checkedImages),
+    unverifiedImages: unverified(checkedImages),
     redirectedImages: checkedImages.filter((image) => image.redirected || (image.finalUrl && image.finalUrl !== image.url)).length,
     cssImageResources: checkedImages.filter((image) => image.purpose === "css-url" || image.purpose === "external-css-url").length,
     pictureSourceImages: checkedImages.filter((image) => image.purpose === "picture-source" || image.purpose === "source-srcset").length,
-    largeImages: issues.filter((issue) => issue.type === "large-image").length,
-    imageExtensionMismatches: issues.filter((issue) => issue.type === "image-extension-mismatch").length,
     checkedAssets: checkedAssets.length,
-    brokenAssets: checkedAssets.filter((asset) => !asset.ok && asset.failureKind !== "tls-certificate").length,
-    unverifiedAssets: unverifiedAssets.length,
-    largeAssets: issues.filter((issue) => issue.type === "large-css" || issue.type === "large-javascript").length,
-    renderBlockingScripts: issues.filter((issue) => issue.type === "render-blocking-javascript").length,
+    brokenAssets: broken(checkedAssets),
+    unverifiedAssets: unverified(checkedAssets),
     redirectedLinks: redirectingLinks.length,
     redirectedLinkTargets: redirectingLinks.length,
     redirectedLinkPages: redirectingLinkPages.size,
@@ -1148,39 +1759,24 @@ function scanSummary(
     ),
     internalLinks: linkInventory.filter((link) => link.type === "internal").length,
     externalLinks: linkInventory.filter((link) => link.type === "external").length,
-    parameterUrls: parameterUrls.length,
-    parameterUrlTargets: new Set(parameterUrls.map((row) => row.crawlUrl || row.path || row.url)).size,
-    emptyAnchorLinks: issues.filter((issue) => issue.type === "empty-anchor-text").length,
-    internalNofollowLinks: issues.filter((issue) => issue.type === "internal-nofollow").length,
+    parameterUrls: input.parameterUrlCount,
+    parameterUrlTargets: input.parameterUrlTargetCount,
     imageTags: imageInventory.length,
     imageTagsWithIssues: imageInventory.filter((image) => image.issues?.length).length,
-    imagesMissingDimensions: issues.filter((issue) => issue.type === "image-dimensions-missing").length,
-    imagesMissingSrcset: issues.filter((issue) => issue.type === "image-srcset-missing").length,
-    imagesMissingLazyLoading: issues.filter((issue) => issue.type === "image-lazy-loading-missing").length,
-    imageIssues: issues.filter((issue) => issue.category === "images").length,
-    assetIssues: issues.filter((issue) => issue.category === "assets").length,
-    metadataIssues: issues.filter((issue) => issue.category === "metadata").length,
-    duplicateIssues: issues.filter((issue) => issue.type.startsWith("duplicate-")).length,
-    missingTitles: issues.filter((issue) => issue.type === "title-missing").length,
-    titleLengthIssues: issues.filter((issue) => issue.type === "title-length").length,
-    missingDescriptions: issues.filter((issue) => issue.type === "description-missing").length,
-    descriptionLengthIssues: issues.filter((issue) => issue.type === "description-length").length,
-    missingAlt: issues.filter((issue) => issue.type === "image-alt-missing" || issue.type === "image-alt-empty").length,
-    genericAlt: issues.filter((issue) => issue.type === "image-alt-generic").length,
-    longAlt: issues.filter((issue) => issue.type === "image-alt-too-long").length,
-    schemaIssues: issues.filter((issue) => issue.category === "structured-data").length,
-    socialIssues: issues.filter((issue) => issue.category === "social").length,
-    securityIssues: issues.filter((issue) => issue.category === "security").length,
-    performanceIssues: issues.filter((issue) => issue.category === "performance" || issue.category === "assets").length,
-    bySeverity,
-    byCategory,
+    ...issueSummary(input.issues),
   };
 }
+
+// Stored evidence lists that can grow with site size keep a bounded sample
+// plus the true count.
+const MAX_STORED_SITEMAP_URLS = 1000;
+const MAX_STORED_PARAMETER_URLS = 500;
 
 function scanResult(input: {
   startUrl: string;
   origin: string;
   phase: string;
+  progress: Record<string, unknown>;
   pages: any[];
   issues: any[];
   checkedLinks: any[];
@@ -1189,31 +1785,31 @@ function scanResult(input: {
   imageInventory: any[];
   linkInventory: any[];
   parameterUrls: any[];
+  parameterUrlCount: number;
+  parameterUrlTargetCount: number;
   robots: any;
   sitemap: any;
+  softNotFound: any;
   limits: typeof scanLimits;
   comparison?: any;
 }) {
   const sortedIssues = [...input.issues].sort((a, b) => issuePriority(b.severity) - issuePriority(a.severity));
+  const sitemapUrls: string[] = Array.isArray(input.sitemap?.urls) ? input.sitemap.urls : [];
   return {
     scanVersion: SCAN_RESULT_VERSION,
     startUrl: input.startUrl,
     origin: input.origin,
     phase: input.phase,
     limits: input.limits,
-    summary: scanSummary(
-      sortedIssues,
-      input.pages,
-      input.checkedLinks,
-      input.checkedImages,
-      input.checkedAssets,
-      input.imageInventory,
-      input.linkInventory,
-      input.parameterUrls,
-      input.phase,
-    ),
+    progress: input.progress,
+    summary: scanSummary({ ...input, issues: sortedIssues }),
     robots: input.robots,
-    sitemap: input.sitemap,
+    sitemap: {
+      ...input.sitemap,
+      urls: sitemapUrls.slice(0, MAX_STORED_SITEMAP_URLS),
+      urlCount: sitemapUrls.length,
+    },
+    ...(input.softNotFound ? { softNotFound: input.softNotFound } : {}),
     pages: input.pages,
     issues: sortedIssues,
     issueGroups: groupIssueSummary(sortedIssues),
@@ -1222,14 +1818,360 @@ function scanResult(input: {
     images: input.checkedImages,
     imageInventory: input.imageInventory,
     assets: input.checkedAssets,
-    parameterUrls: input.parameterUrls,
+    parameterUrls: input.parameterUrls.slice(0, MAX_STORED_PARAMETER_URLS),
     ...(input.comparison ? { comparison: input.comparison } : {}),
   };
 }
 
-async function runLocalScan(scanId: string) {
+function saveScanResult(scanId: string, siteId: string, status: string, score: number, result: any) {
+  const publicRow = applyIssueIgnores(
+    { status, score, issue_count: result.issues.length, site_id: siteId, result },
+    siteIgnoreRules(siteId),
+  );
+  run(
+    `
+    UPDATE scans
+    SET status = ?,
+        score = ?,
+        pages_crawled = ?,
+        issue_count = ?,
+        result_json = ?,
+        summary_json = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+    `,
+    [status, score, result.pages.length, result.issues.length, JSON.stringify(result), storedScanSummary(publicRow), scanId],
+  );
+}
+
+// Effective robots directives for a Google-style crawler: generic rules plus
+// googlebot-scoped ones. X-Robots-Tag values may carry a user-agent prefix
+// ("googlebot: noindex", "otherbot: noindex, nofollow"); rules for other bots
+// are ignored.
+const robotsValueDirectives = new Set(["unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"]);
+
+export function robotsDirectives(metaContents: string[], xRobotsTag: string) {
+  const directives: string[] = [];
+  for (const content of metaContents) {
+    for (const part of content.split(",")) {
+      const directive = part.trim().toLowerCase();
+      if (directive) directives.push(directive);
+    }
+  }
+  let agent = "";
+  for (const part of xRobotsTag.split(",")) {
+    let directive = part.trim();
+    const prefixed = /^([a-z0-9_.-]+)\s*:\s*(.*)$/i.exec(directive);
+    if (prefixed && !robotsValueDirectives.has(prefixed[1].toLowerCase())) {
+      agent = prefixed[1].toLowerCase();
+      directive = prefixed[2];
+    }
+    directive = directive.trim().toLowerCase();
+    if (directive && (!agent || agent === "googlebot")) directives.push(directive);
+  }
+  return directives;
+}
+
+// Post-crawl checks of the URLs crawled pages point at (canonicals, hreflang)
+// and of sitemap entries. They only use responses the scan observed: crawled
+// requests, checked links, crawled pages' final URLs, and URLs checked for
+// these checks.
+const MAX_STORED_HREFLANG = 50;
+const MAX_URLS_PER_SITEMAP = 50_000;
+
+function knownUrlResponses(crawledResources: Map<string, any>, checkedLinks: any[], pages: any[]) {
+  const responses = new Map<string, any>(crawledResources);
+  for (const link of checkedLinks) {
+    if (!responses.has(link.url)) responses.set(link.url, link);
+  }
+  // A crawled page's final URL answered directly with the page's final status.
+  for (const page of pages) {
+    const finalUrl = page.finalUrl || page.url;
+    if (typeof page.finalStatus === "number" && !page.redirectError && !responses.has(finalUrl)) {
+      responses.set(finalUrl, { ok: page.finalStatus < 400, status: page.finalStatus, finalStatus: page.finalStatus, finalUrl, redirected: false, redirectChain: [] });
+    }
+  }
+  return responses;
+}
+
+// Certificate failures are unverified, not broken (as in the link checks), so
+// they never count as evidence against a URL here.
+function observedResponse(responses: Map<string, any>, url: string) {
+  const response = responses.get(url);
+  return response && response.failureKind !== "tls-certificate" ? response : null;
+}
+
+// Audited HTML page rows by the URL that served them.
+function htmlPagesByFinalUrl(pages: any[]) {
+  return new Map<string, any>(pages.filter((page) => page.isHtml).map((page) => [page.finalUrl || page.url, page]));
+}
+
+function isSelfUrl(value: string, page: any) {
+  return normalizedUrl(value) === normalizedUrl(page.finalUrl || page.url);
+}
+
+// The canonical of an audited page when it names another URL. A canonical
+// naming a hop of the page's own redirect is reported as
+// canonical-points-to-redirect instead.
+function canonicalTargetUrl(page: any) {
+  const canonical = String(page.canonical || "");
+  if (!page.isHtml || Number(page.finalStatus) >= 400 || !/^https?:\/\//i.test(canonical) || isSelfUrl(canonical, page)) return "";
+  if ((page.redirectChain || []).some((hop: any) => normalizedUrl(hop.url) === normalizedUrl(canonical))) return "";
+  return canonical;
+}
+
+function responseEvidence(response: any) {
+  return {
+    status: response.status,
+    finalStatus: response.finalStatus,
+    finalUrl: response.finalUrl,
+    ...(response.redirectChain?.length ? { redirectChain: response.redirectChain } : {}),
+    ...(response.error ? { error: response.error, failureKind: response.failureKind } : {}),
+  };
+}
+
+function pushCanonicalTargetIssues(issues: any[], pages: any[], responses: Map<string, any>, pagesByFinalUrl: Map<string, any>) {
+  for (const page of pages) {
+    const canonical = canonicalTargetUrl(page);
+    const response = canonical ? observedResponse(responses, canonical) : null;
+    if (!response) continue;
+    const evidence = { canonical, ...responseEvidence(response) };
+    if (!response.ok) {
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "high",
+        category: "canonicals",
+        type: "canonical-target-error",
+        message: response.finalStatus ? `Canonical URL returns HTTP ${response.finalStatus}` : "Canonical URL could not be loaded",
+        recommendation: "Point the canonical at a live, indexable URL.",
+        evidence,
+      });
+      continue;
+    }
+    if (response.redirected) {
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "medium",
+        category: "canonicals",
+        type: "canonical-target-redirect",
+        message: `Canonical URL redirects with HTTP ${response.status}`,
+        recommendation: "Point the canonical directly at the final URL the redirect lands on.",
+        evidence,
+      });
+      continue;
+    }
+    const target = pagesByFinalUrl.get(response.finalUrl);
+    if (!target) continue;
+    if (target.indexabilityReason === "noindex") {
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "high",
+        category: "canonicals",
+        type: "canonical-target-noindex",
+        message: "Canonical URL is marked noindex",
+        recommendation: "Canonicalize to an indexable page, or remove noindex from the canonical URL.",
+        evidence: { ...evidence, robotsMeta: target.robotsMeta, xRobotsTag: target.xRobotsTag },
+      });
+    }
+    const targetCanonical = canonicalTargetUrl(target);
+    if (targetCanonical) {
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "medium",
+        category: "canonicals",
+        type: "canonical-chain",
+        message: "Canonical URL canonicalizes to another URL",
+        recommendation: "Point the canonical directly at the final preferred URL.",
+        evidence: { ...evidence, targetCanonical },
+      });
+    }
+  }
+}
+
+// Fills each page's hreflang rows with the alternate's status and whether a
+// crawled alternate links back, then reports failing and one-way alternates.
+function pushHreflangIssues(
+  issues: any[],
+  pages: any[],
+  hreflangByPage: Map<string, { lang: string; href: string }[]>,
+  responses: Map<string, any>,
+  pagesByFinalUrl: Map<string, any>,
+) {
+  for (const page of pages) {
+    const entries = hreflangByPage.get(page.url) || [];
+    if (!entries.length) continue;
+    const failing: any[] = [];
+    const missingReturn: any[] = [];
+    const rows = entries.map((entry) => {
+      const response = observedResponse(responses, entry.href);
+      const target = response?.ok && !response.redirected ? pagesByFinalUrl.get(response.finalUrl) : undefined;
+      const returnLink = target ? (hreflangByPage.get(target.url) || []).some((link) => isSelfUrl(link.href, page)) : null;
+      if (response && (!response.ok || response.redirected || response.status !== 200)) {
+        failing.push({ ...entry, ...responseEvidence(response) });
+      }
+      if (returnLink === false) missingReturn.push(entry);
+      return { lang: entry.lang, href: entry.href, targetStatus: response?.status ?? null, returnLink };
+    });
+    page.hreflang = rows.slice(0, MAX_STORED_HREFLANG);
+    if (failing.length) {
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "medium",
+        category: "localization",
+        type: "hreflang-target-error",
+        message: `${failing.length} hreflang URLs do not answer HTTP 200 directly`,
+        recommendation: "Point hreflang links at the final 200 URL of each language version.",
+        evidence: { count: failing.length, targets: failing.slice(0, 20) },
+      });
+    }
+    if (missingReturn.length) {
+      pushScanIssue(issues, {
+        url: page.url,
+        severity: "medium",
+        category: "localization",
+        type: "hreflang-missing-return",
+        message: `${missingReturn.length} hreflang alternates do not link back to this page`,
+        recommendation: "Add a matching hreflang link back to this page on every alternate page.",
+        evidence: { count: missingReturn.length, targets: missingReturn.slice(0, 20) },
+      });
+    }
+  }
+}
+
+// Same-site sitemap entries with direct evidence: URLs the scan requested or
+// checked, plus entries naming a crawled page under another spelling (those
+// are checked so their own response is known). Nothing is inferred.
+function sitemapEntriesToAudit(sitemapUrls: string[], pages: any[], responses: Map<string, any>, startUrl: string) {
+  const pageKeys = new Set(
+    pages.flatMap((page) => [page.url, page.finalUrl, page.requestedUrl].filter(Boolean).map((url: string) => normalizedUrlKey(url))),
+  );
+  return [...new Set(sitemapUrls)].filter(
+    (url) => sameSiteUrl(url, startUrl) && (responses.has(url) || pageKeys.has(normalizedUrlKey(url))),
+  );
+}
+
+function pushSitemapUrlIssues(issues: any[], sitemapUrls: string[], responses: Map<string, any>, pagesByFinalUrl: Map<string, any>) {
+  for (const url of sitemapUrls) {
+    const response = observedResponse(responses, url);
+    if (!response) continue;
+    const evidence = responseEvidence(response);
+    if (!response.ok) {
+      pushScanIssue(issues, {
+        url,
+        severity: "medium",
+        category: "sitemap",
+        type: "sitemap-url-error",
+        message: response.finalStatus ? `Sitemap URL returns HTTP ${response.finalStatus}` : "Sitemap URL could not be loaded",
+        recommendation: "Remove the entry, restore the page, or list its live replacement.",
+        evidence,
+      });
+    } else if (response.redirected) {
+      pushScanIssue(issues, {
+        url,
+        severity: "medium",
+        category: "sitemap",
+        type: "sitemap-url-redirect",
+        message: `Sitemap URL redirects with HTTP ${response.status}`,
+        recommendation: "List the final URL in the sitemap instead of the redirecting one.",
+        evidence,
+      });
+    } else {
+      const page = pagesByFinalUrl.get(response.finalUrl);
+      const canonical = page ? canonicalTargetUrl(page) : "";
+      if (canonical) {
+        pushScanIssue(issues, {
+          url,
+          severity: "medium",
+          category: "sitemap",
+          type: "sitemap-url-canonicalized",
+          message: "Sitemap URL canonicalizes to another URL",
+          recommendation: "List only canonical URLs in the sitemap.",
+          evidence: { ...evidence, canonical },
+        });
+      }
+    }
+  }
+}
+
+// Pairs of indexable pages whose main-text simhashes differ in at most
+// NEAR_DUPLICATE_MAX_DISTANCE bits. Exact duplicates are reported as
+// duplicate-content instead. Pairwise popcounts stay cheap at 1,000 pages.
+function pushNearDuplicateIssues(issues: any[], pages: any[]) {
+  const candidates = pages.filter((page) => page.indexable && page.contentSimhash);
+  const hashes = candidates.map((page) => [
+    Number.parseInt(page.contentSimhash.slice(0, 8), 16),
+    Number.parseInt(page.contentSimhash.slice(8), 16),
+  ]);
+  const exactDuplicates = (a: any, b: any) =>
+    a.contentFingerprint && a.contentFingerprint === b.contentFingerprint && a.wordCount >= 120 && b.wordCount >= 120;
+  const matches = candidates.map(() => [] as { url: string; similarity: number }[]);
+  for (let a = 0; a < candidates.length; a += 1) {
+    for (let b = a + 1; b < candidates.length; b += 1) {
+      const distance = bitCount32(hashes[a][0] ^ hashes[b][0]) + bitCount32(hashes[a][1] ^ hashes[b][1]);
+      if (distance > NEAR_DUPLICATE_MAX_DISTANCE || exactDuplicates(candidates[a], candidates[b])) continue;
+      const similarity = Math.round(((64 - distance) / 64) * 1000) / 1000;
+      matches[a].push({ url: candidates[b].url, similarity });
+      matches[b].push({ url: candidates[a].url, similarity });
+    }
+  }
+  for (const [index, page] of candidates.entries()) {
+    const duplicates = matches[index].sort((a, b) => b.similarity - a.similarity);
+    if (!duplicates.length) continue;
+    page.nearDuplicates = duplicates.slice(0, 20);
+    pushScanIssue(issues, {
+      url: page.url,
+      severity: "medium",
+      category: "content",
+      type: "near-duplicate-content",
+      message: `Main text is nearly identical to ${duplicates.length} other page${duplicates.length === 1 ? "" : "s"}`,
+      recommendation: "Differentiate the pages, or consolidate them and canonicalize to one URL.",
+      evidence: { duplicateCount: duplicates.length, duplicates: page.nearDuplicates },
+    });
+  }
+}
+
+function pushRobotsBlockedIssues(
+  issues: any[],
+  pages: any[],
+  sitemapUrls: string[],
+  robotsCheck: (url: string) => RobotsVerdict | null,
+  robotsUrl: string,
+) {
+  const verdictEvidence = (verdict: RobotsVerdict) => ({ rule: verdict.matchedRule, userAgentGroup: verdict.userAgentGroup, robotsUrl });
+  for (const page of pages) {
+    const verdict = page.robotsBlocked ? robotsCheck(page.url) : null;
+    if (!verdict) continue;
+    pushScanIssue(issues, {
+      url: page.url,
+      severity: "medium",
+      category: "robots",
+      type: "robots-blocked-page",
+      message: "robots.txt disallows this URL for Googlebot",
+      recommendation: "Narrow or remove the Disallow rule if the page should be crawled; use noindex, not robots.txt, to keep a page out of search.",
+      evidence: verdictEvidence(verdict),
+    });
+  }
+  // Every sitemap entry is checked; issues keep a bounded sample plus the count.
+  const blocked = [...new Set(sitemapUrls)].flatMap((url) => {
+    const verdict = robotsCheck(url);
+    return verdict && !verdict.allowed ? [{ url, verdict }] : [];
+  });
+  for (const { url, verdict } of blocked.slice(0, MAX_STORED_SITEMAP_URLS)) {
+    pushScanIssue(issues, {
+      url,
+      severity: "medium",
+      category: "robots",
+      type: "robots-blocked-in-sitemap",
+      message: "Sitemap lists a URL that robots.txt disallows for Googlebot",
+      recommendation: "Remove blocked URLs from the sitemap, or allow them in robots.txt.",
+      evidence: { ...verdictEvidence(verdict), blockedSitemapUrls: blocked.length },
+    });
+  }
+}
+
+async function runLocalScan(scanId: string, signal: AbortSignal) {
   const scan = get<any>("SELECT * FROM scans WHERE id = ?", [scanId]);
-  if (!scan) return;
+  if (!scan || signal.aborted) return;
   run("UPDATE scans SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [
     scanId,
   ]);
@@ -1245,16 +2187,27 @@ async function runLocalScan(scanId: string) {
   const limits = scanLimitsFor(maxPages);
   // Pacing only matters against real remote hosts; localhost targets crawl at full speed.
   const politeTarget = crawlSpeed === "polite" && !localHostFirst(new URL(startUrl).hostname);
+  const localTarget = localHostFirst(new URL(startUrl).hostname);
   let pageDelayMs = 400;
   let consecutiveRateLimits = 0;
   const startKey = normalizedUrlKey(startUrl);
   const visited = new Set<string>();
   const processedContent = new Set<string>();
+  // Crawl outward from the start URL by links first. Sitemap URLs are only
+  // pulled when the link queue drains, so a large sitemap cannot use up the
+  // page budget before link-discovered pages are reached.
   const queued = new Set<string>([startKey]);
-  const queue = [startUrl];
+  const linkQueue = [startUrl];
+  const sitemapTargets: { url: string; key: string }[] = [];
+  let sitemapCursor = 0;
+  // Depth is the shortest known link path from the start URL. Pages reached
+  // only through the sitemap have no link depth.
   const depthByUrl = new Map<string, number>([[startKey, 0]]);
   const discoveryByUrl = new Map<string, string>([[startKey, "start-url"]]);
   const internalInlinks = new Map<string, number>();
+  // Responses the crawl already fetched, keyed by exact URL, so link and
+  // resource checks reuse them instead of requesting the same URL again.
+  const crawledResources = new Map<string, any>();
   const pages: any[] = [];
   const issues: any[] = [];
   const checkedLinks: any[] = [];
@@ -1264,26 +2217,43 @@ async function runLocalScan(scanId: string) {
   const linkInventory: any[] = [];
   const parameterUrls: any[] = [];
   const parameterUrlKeys = new Set<string>();
+  const parameterTargetKeys = new Set<string>();
   const linksToCheck = new Map<string, any>();
   const imagesToCheck = new Map<string, any>();
   const assetsToCheck = new Map<string, any>();
-  const pageIssueMap = new Map<string, any[]>();
   let phase = "starting";
   let robots: any = { exists: false, sitemaps: [] };
   let sitemap: any = { sitemaps: [], urls: [] };
-
-  const pageBucket = (url: string) => {
-    const existing = pageIssueMap.get(url);
-    if (existing) return existing;
-    const next: any[] = [];
-    pageIssueMap.set(url, next);
-    return next;
+  let sitemapUrlSet = new Set<string>();
+  let softNotFound: any = null;
+  // Googlebot verdicts for URLs on the robots.txt origin, set once robots.txt
+  // answered with rules (2xx) or with a status that means "no rules".
+  let robotsVerdictFor: ((url: string) => RobotsVerdict) | null = null;
+  const robotsVerdicts = new Map<string, RobotsVerdict | null>();
+  const robotsCheck = (url: string) => {
+    if (!robotsVerdictFor) return null;
+    if (!robotsVerdicts.has(url)) {
+      let sameOrigin = false;
+      try {
+        sameOrigin = new URL(url).origin === origin;
+      } catch {
+        sameOrigin = false;
+      }
+      robotsVerdicts.set(url, sameOrigin ? robotsVerdictFor(url) : null);
+    }
+    return robotsVerdicts.get(url) ?? null;
   };
+  // Every resolved hreflang alternate per page URL; page rows keep a capped copy.
+  const hreflangByPage = new Map<string, { lang: string; href: string }[]>();
+  const startedAtMs = Date.now();
+  let progressUrl = startUrl;
+  let pendingChecks = 0;
+  let lastPersistAt = 0;
 
-  const recordRedirectIssues = (url: string, pageIssues: any[], response: any) => {
+  const recordRedirectIssues = (url: string, response: any) => {
     if (response.redirected) {
       const temporaryRedirect = response.status === 302 || response.status === 307;
-      pushScanIssue(issues, pageIssues, {
+      pushScanIssue(issues, {
         url,
         severity: "low",
         category: "crawl",
@@ -1303,7 +2273,7 @@ async function runLocalScan(scanId: string) {
       });
     }
     if (response.redirectChain.length > 1 && !response.redirectLoop) {
-      pushScanIssue(issues, pageIssues, {
+      pushScanIssue(issues, {
         url,
         severity: "medium",
         category: "crawl",
@@ -1314,7 +2284,7 @@ async function runLocalScan(scanId: string) {
       });
     }
     if (response.redirectLoop) {
-      pushScanIssue(issues, pageIssues, {
+      pushScanIssue(issues, {
         url,
         severity: "high",
         category: "crawl",
@@ -1324,7 +2294,7 @@ async function runLocalScan(scanId: string) {
         evidence: { redirectChain: response.redirectChain, error: response.redirectError },
       });
     } else if (response.redirectError) {
-      pushScanIssue(issues, pageIssues, {
+      pushScanIssue(issues, {
         url,
         severity: "high",
         category: "crawl",
@@ -1341,6 +2311,10 @@ async function runLocalScan(scanId: string) {
     const key = normalizedUrlKey(url);
     if (parameterUrlKeys.has(key)) return;
     parameterUrlKeys.add(key);
+    const target = crawlUrl || withoutQueryUrl(url);
+    parameterTargetKeys.add(target);
+    // Counts cover every variant; only a bounded sample of rows is kept.
+    if (parameterUrls.length >= MAX_STORED_PARAMETER_URLS) return;
     try {
       const parsed = new URL(url);
       parameterUrls.push({
@@ -1349,18 +2323,32 @@ async function runLocalScan(scanId: string) {
         source,
         path: `${parsed.origin}${parsed.pathname}`,
         query: parsed.search.replace(/^\?/, ""),
-        crawlUrl: crawlUrl || withoutQueryUrl(url),
+        crawlUrl: target,
       });
     } catch {
-      parameterUrls.push({ url, from, source, crawlUrl: crawlUrl || withoutQueryUrl(url) });
+      parameterUrls.push({ url, from, source, crawlUrl: target });
     }
   };
 
-  const persistProgress = (status = "running") => {
-    const result = scanResult({
+  const progress = () => {
+    const elapsedMs = Date.now() - startedAtMs;
+    return {
+      currentUrl: progressUrl,
+      pagesCrawled: pages.length,
+      queued: phase === "crawling" ? linkQueue.length + sitemapTargets.length - sitemapCursor : pendingChecks,
+      startedAt: new Date(startedAtMs).toISOString(),
+      elapsedMs,
+      pagesPerSecond: elapsedMs > 0 ? Math.round((pages.length * 100_000) / elapsedMs) / 100 : 0,
+      phase,
+    };
+  };
+
+  const currentResult = (comparison?: any) =>
+    scanResult({
       startUrl,
       origin,
       phase,
+      progress: progress(),
       pages,
       issues,
       checkedLinks,
@@ -1369,55 +2357,90 @@ async function runLocalScan(scanId: string) {
       imageInventory,
       linkInventory,
       parameterUrls,
+      parameterUrlCount: parameterUrlKeys.size,
+      parameterUrlTargetCount: parameterTargetKeys.size,
       robots,
       sitemap,
+      softNotFound,
       limits,
+      comparison,
     });
-    run(
-      `
-      UPDATE scans
-      SET status = ?,
-          pages_crawled = ?,
-          issue_count = ?,
-          result_json = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-      `,
-      [status, pages.length, issues.length, JSON.stringify(result), scanId],
-    );
+
+  // Progress saves serialize the whole result, so they are throttled; the
+  // final save (completed/cancelled) always writes everything.
+  const persistProgress = (force = false) => {
+    if (signal.aborted) return;
+    const now = Date.now();
+    if (!force && now - lastPersistAt < 1000) return;
+    lastPersistAt = now;
+    saveScanResult(scanId, scan.site_id, "running", 0, currentResult());
+  };
+
+  // Aggregate counters (inlinks, depth, discovery) keep changing while the
+  // crawl runs; settle them on every page row before reporting.
+  const settlePages = () => {
+    for (const page of pages) {
+      const keys = [page.url, page.finalUrl || page.url, page.requestedUrl || page.url].map(normalizedUrlKey);
+      page.internalInlinks = Math.max(Number(page.internalInlinks || 0), ...keys.map((key) => internalInlinks.get(key) || 0));
+      const depths = keys.map((key) => depthByUrl.get(key)).filter((depth): depth is number => depth !== undefined);
+      if (typeof page.depth === "number") depths.push(page.depth);
+      page.depth = depths.length ? Math.min(...depths) : null;
+      page.discovery = keys.map((key) => discoveryByUrl.get(key)).find(Boolean) || page.discovery || "internal-link";
+      page.sitemapListed = sitemapUrlSet.has(keys[0]) || sitemapUrlSet.has(keys[1]);
+      page.sitemapSourceListed = keys[2] !== keys[0] && sitemapUrlSet.has(keys[2]);
+      const robotsVerdict = robotsCheck(page.url);
+      if (robotsVerdict) page.robotsBlocked = !robotsVerdict.allowed;
+    }
+  };
+
+  // Cancel keeps whatever evidence was gathered and stops the scan.
+  const throwIfCancelled = () => {
+    if (!signal.aborted) return;
+    settlePages();
+    saveScanResult(scanId, scan.site_id, "cancelled", 0, currentResult());
+    throw new Error("Scan cancelled.");
+  };
+
+  const nextCrawlUrl = () => {
+    const linked = linkQueue.shift();
+    if (linked) return linked;
+    while (sitemapCursor < sitemapTargets.length) {
+      const target = sitemapTargets[sitemapCursor++];
+      if (visited.has(target.key) || processedContent.has(target.key)) continue;
+      if (!discoveryByUrl.has(target.key)) discoveryByUrl.set(target.key, "sitemap");
+      return target.url;
+    }
+    return null;
   };
 
   phase = "robots";
-  robots = await readRobots(origin);
+  robots = await readRobots(origin, signal);
+  throwIfCancelled();
+  if (robots.exists || robotsResponseAllowsAll(robots.status)) {
+    robotsVerdictFor = robotsMatcher(robots.groups || [], "Googlebot");
+  }
   const robotsDelaySeconds = Number((robots as any).crawlDelaySeconds || 0);
   if (politeTarget && robotsDelaySeconds > 0) {
     pageDelayMs = Math.max(pageDelayMs, Math.min(robotsDelaySeconds * 1000, 10_000));
   }
-  sitemap = await readSitemaps(origin, robots.sitemaps || []);
-  const sitemapUrlSet = new Set((sitemap.urls || []).map((url: string) => {
+  sitemap = await readSitemaps(origin, robots.sitemaps || [], signal);
+  throwIfCancelled();
+  sitemapUrlSet = new Set((sitemap.urls || []).map((url: string) => {
     const absolute = absoluteHttpUrl(String(url), origin);
     return absolute ? pageCrawlTarget(absolute, startUrl)?.key || normalizedUrlKey(absolute) : normalizedUrlKey(url);
   }));
+  const sitemapTargetKeys = new Set<string>();
   for (const sitemapUrl of sitemap.urls || []) {
     const absolute = absoluteHttpUrl(String(sitemapUrl), origin);
     const target = absolute ? pageCrawlTarget(absolute, startUrl) : null;
     if (absolute && target?.parameterized) addParameterUrl(absolute, "sitemap", undefined, target.url);
-    if (
-      absolute &&
-      sameSiteUrl(absolute, startUrl) &&
-      target &&
-      target.key !== startKey &&
-      !queued.has(target.key) &&
-      queue.length + visited.size < limits.maxQueuedUrls
-    ) {
-      queued.add(target.key);
-      queue.push(target.url);
-      depthByUrl.set(target.key, 0);
-      discoveryByUrl.set(target.key, "sitemap");
+    if (absolute && target && sameSiteUrl(absolute, startUrl) && !sitemapTargetKeys.has(target.key)) {
+      sitemapTargetKeys.add(target.key);
+      sitemapTargets.push(target);
     }
   }
   if (!robots.exists) {
-    pushScanIssue(issues, undefined, {
+    pushScanIssue(issues, {
       url: `${origin}/robots.txt`,
       severity: "low",
       category: "robots",
@@ -1427,7 +2450,7 @@ async function runLocalScan(scanId: string) {
       evidence: { status: robots.status, error: robots.error },
     });
   } else if (robots.blocksAll) {
-    pushScanIssue(issues, undefined, {
+    pushScanIssue(issues, {
       url: robots.url,
       severity: "high",
       category: "robots",
@@ -1438,7 +2461,7 @@ async function runLocalScan(scanId: string) {
     });
   }
   if (robots.exists && !(robots.sitemaps || []).length) {
-    pushScanIssue(issues, undefined, {
+    pushScanIssue(issues, {
       url: robots.url,
       severity: "low",
       category: "robots",
@@ -1449,8 +2472,18 @@ async function runLocalScan(scanId: string) {
     });
   }
   for (const item of sitemap.sitemaps || []) {
-    if (!item.ok) {
-      pushScanIssue(issues, undefined, {
+    if (item.truncated) {
+      pushScanIssue(issues, {
+        url: item.url,
+        severity: "medium",
+        category: "sitemap",
+        type: "sitemap-too-large",
+        message: "Sitemap is larger than 50 MB uncompressed",
+        recommendation: "Split the sitemap into smaller files and list them in a sitemap index.",
+        evidence: { status: item.status, error: item.error },
+      });
+    } else if (!item.ok) {
+      pushScanIssue(issues, {
         url: item.url,
         severity: "medium",
         category: "sitemap",
@@ -1459,10 +2492,20 @@ async function runLocalScan(scanId: string) {
         recommendation: "Fix the sitemap response, XML syntax, or robots.txt sitemap reference.",
         evidence: { status: item.status, error: item.error },
       });
+    } else if (item.urlCount > MAX_URLS_PER_SITEMAP || item.childSitemapCount > MAX_URLS_PER_SITEMAP) {
+      pushScanIssue(issues, {
+        url: item.url,
+        severity: "medium",
+        category: "sitemap",
+        type: "sitemap-too-many-urls",
+        message: `Sitemap lists ${Math.max(item.urlCount, item.childSitemapCount || 0)} ${item.type === "index" ? "sitemaps" : "URLs"}, over the 50,000 limit`,
+        recommendation: "Split the sitemap into files of up to 50,000 URLs and list them in a sitemap index.",
+        evidence: { urlCount: item.urlCount, childSitemapCount: item.childSitemapCount, limit: MAX_URLS_PER_SITEMAP },
+      });
     }
   }
   if (!sitemap.urls.length) {
-    pushScanIssue(issues, undefined, {
+    pushScanIssue(issues, {
       url: `${origin}/sitemap.xml`,
       severity: "medium",
       category: "sitemap",
@@ -1473,7 +2516,7 @@ async function runLocalScan(scanId: string) {
     });
   }
   if ((sitemap.urls || []).length > limits.maxQueuedUrls) {
-    pushScanIssue(issues, undefined, {
+    pushScanIssue(issues, {
       url: `${origin}/sitemap.xml`,
       severity: "low",
       category: "sitemap",
@@ -1483,41 +2526,94 @@ async function runLocalScan(scanId: string) {
       evidence: { sitemapUrls: (sitemap.urls || []).length, crawlLimit: limits.maxQueuedUrls },
     });
   }
-  persistProgress();
+  softNotFound = await probeSoftNotFound(origin, signal);
+  throwIfCancelled();
+  if (softNotFound.soft404) {
+    pushScanIssue(issues, {
+      url: softNotFound.probeUrl,
+      severity: "medium",
+      category: "crawl",
+      type: "soft-404",
+      message: `A URL that does not exist answers HTTP ${softNotFound.status}`,
+      recommendation: "Return HTTP 404 or 410 for URLs that do not exist, instead of a 200 page or a redirect to one.",
+      evidence: {
+        status: softNotFound.status,
+        sourceStatus: softNotFound.sourceStatus,
+        finalUrl: softNotFound.finalUrl,
+        redirectChain: softNotFound.redirectChain,
+      },
+    });
+  }
+  persistProgress(true);
 
   phase = "crawling";
-  while (queue.length > 0 && visited.size < limits.maxPages) {
-    const requestedUrl = queue.shift()!;
+  let fetchedPages = 0;
+  // The page budget counts page rows only: URLs that redirect to a page
+  // already crawled, or off the site, do not use it. Total requests stay
+  // bounded by the queue limit.
+  while (pages.length < limits.maxPages && visited.size < limits.maxQueuedUrls) {
+    throwIfCancelled();
+    if (consecutiveRateLimits >= 5) {
+      persistProgress(true);
+      throw new Error(
+        "The site keeps rate limiting the crawl (HTTP 429/503). Wait a while and scan again, or keep the polite crawl speed.",
+      );
+    }
+    const requestedUrl = nextCrawlUrl();
+    if (!requestedUrl) break;
     const requestedKey = normalizedUrlKey(requestedUrl);
     queued.delete(requestedKey);
     if (visited.has(requestedKey) || processedContent.has(requestedKey)) continue;
     visited.add(requestedKey);
+    if (politeTarget && fetchedPages > 0) {
+      await sleep(pageDelayMs * (0.75 + Math.random() * 0.5), signal);
+      throwIfCancelled();
+    }
+    fetchedPages += 1;
+    progressUrl = requestedUrl;
     let current = requestedUrl;
     let currentKey = requestedKey;
-    const requestedPageIssues = pageBucket(requestedUrl);
-    let pageIssues = requestedPageIssues;
-    let currentDepth = depthByUrl.get(requestedKey) ?? 0;
+    let currentDepth = depthByUrl.get(requestedKey);
 
     try {
+      // loadMs times the request itself: sleeps and queue waits are excluded.
       let startedAt = Date.now();
-      let response = await fetchText(requestedUrl);
+      let response = await fetchText(requestedUrl, 15000, { signal });
       let loadMs = Date.now() - startedAt;
       if (response.finalStatus === 429 || response.finalStatus === 503) {
         // Back off once, honoring Retry-After, before recording the response.
         const retrySeconds = Math.min(Math.max(Number(response.retryAfter) || 5, 1), 30);
-        await sleep(retrySeconds * 1000);
+        await sleep(retrySeconds * 1000, signal);
+        throwIfCancelled();
         startedAt = Date.now();
-        response = await fetchText(requestedUrl);
+        response = await fetchText(requestedUrl, 15000, { signal });
         loadMs = Date.now() - startedAt;
       }
       consecutiveRateLimits =
         response.finalStatus === 429 || response.finalStatus === 503 ? consecutiveRateLimits + 1 : 0;
+      crawledResources.set(requestedUrl, {
+        ok: response.finalStatus < 400 && !response.redirectError,
+        status: response.status,
+        finalStatus: response.finalStatus,
+        finalUrl: response.url,
+        redirected: response.redirected,
+        redirectChain: response.redirectChain,
+        redirectLoop: response.redirectLoop,
+        redirectError: response.redirectError,
+        contentType: response.contentType,
+        contentLength: response.contentLength,
+        contentEncoding: response.contentEncoding,
+        error: response.redirectError,
+        failureKind: response.redirectError ? "redirect" : "",
+        fromCrawl: true,
+      });
       if (response.redirectError) {
-        recordRedirectIssues(requestedUrl, requestedPageIssues, response);
+        recordRedirectIssues(requestedUrl, response);
         const finalUrl = response.url || requestedUrl;
         pages.push({
           url: requestedUrl,
           finalUrl,
+          requestedUrl,
           status: response.status,
           finalStatus: response.finalStatus,
           redirected: response.redirected,
@@ -1529,7 +2625,7 @@ async function runLocalScan(scanId: string) {
           indexable: false,
           finalIndexable: false,
           indexabilityReason: response.redirectLoop ? "redirect-loop" : "redirect-failed",
-          depth: currentDepth,
+          depth: currentDepth ?? null,
           discovery: discoveryByUrl.get(requestedKey) || "internal-link",
           internalInlinks: internalInlinks.get(requestedKey) || 0,
           sitemapListed: sitemapUrlSet.has(requestedKey) || sitemapUrlSet.has(normalizedUrlKey(finalUrl)),
@@ -1537,37 +2633,44 @@ async function runLocalScan(scanId: string) {
           externalLinks: 0,
           images: 0,
           assets: 0,
-          issues: pageIssues,
         });
         persistProgress();
-        if (consecutiveRateLimits >= 5) {
-          throw new Error(
-            "The site keeps rate limiting the crawl (HTTP 429/503). Wait a while and scan again, or keep the polite crawl speed.",
-          );
-        }
-        if (politeTarget && queue.length > 0 && visited.size < limits.maxPages) {
-          await sleep(pageDelayMs * (0.75 + Math.random() * 0.5));
-        }
         continue;
       }
       const finalUrl = response.url || requestedUrl;
       const finalKey = normalizedUrlKey(finalUrl);
-      if (response.redirected) recordRedirectIssues(requestedUrl, requestedPageIssues, response);
+      // An internal URL that lands on another domain is evidence about this
+      // site's redirect, not a page of this site: record the hop, skip the audit.
+      if (!sameSiteUrl(finalUrl, startUrl)) {
+        pushScanIssue(issues, {
+          url: requestedUrl,
+          severity: "low",
+          category: "crawl",
+          type: "redirect-off-site",
+          message: `URL redirects to another domain with HTTP ${response.status}`,
+          recommendation: "Confirm the cross-domain redirect is intentional, or link to the external URL directly.",
+          evidence: {
+            status: response.status,
+            finalStatus: response.finalStatus,
+            finalUrl,
+            redirectChain: response.redirectChain,
+          },
+        });
+        persistProgress();
+        continue;
+      }
+      if (response.redirected) recordRedirectIssues(requestedUrl, response);
       if (processedContent.has(finalKey)) {
         persistProgress();
-        if (politeTarget && queue.length > 0 && visited.size < limits.maxPages) {
-          await sleep(pageDelayMs * (0.75 + Math.random() * 0.5));
-        }
         continue;
       }
       processedContent.add(finalKey);
       if (finalKey !== requestedKey) {
         current = finalUrl;
         currentKey = finalKey;
-        pageIssues = pageBucket(current);
         const finalDepth = depthByUrl.get(finalKey);
-        currentDepth = Math.min(currentDepth, finalDepth ?? currentDepth);
-        depthByUrl.set(finalKey, currentDepth);
+        if (finalDepth !== undefined && (currentDepth === undefined || finalDepth < currentDepth)) currentDepth = finalDepth;
+        if (currentDepth !== undefined) depthByUrl.set(finalKey, currentDepth);
         if (!discoveryByUrl.has(finalKey)) {
           discoveryByUrl.set(finalKey, discoveryByUrl.get(requestedKey) || "internal-link");
         }
@@ -1576,14 +2679,86 @@ async function runLocalScan(scanId: string) {
           Math.max(internalInlinks.get(finalKey) || 0, internalInlinks.get(requestedKey) || 0),
         );
       }
-      const isHtml = /text\/html|application\/xhtml\+xml/i.test(response.contentType) || response.text.includes("<html");
+      const isHtml =
+        /text\/html|application\/xhtml\+xml/i.test(response.contentType) ||
+        (!response.contentType && /<html[\s>]/i.test(response.text.slice(0, 4096)));
+      const robotsHeaderDirectives = robotsDirectives([], cleanText(response.xRobotsTag || ""));
+      if (!isHtml) {
+        // Feeds, JSON, and files keep their status and redirect evidence, but
+        // are not audited as HTML pages.
+        const noindex = robotsHeaderDirectives.some((item) => item === "noindex" || item === "none");
+        if (response.finalStatus >= 400) {
+          pushScanIssue(issues, {
+            url: current,
+            severity: "high",
+            category: "crawl",
+            type: "page-http-error",
+            message: `Page returns HTTP ${response.finalStatus}`,
+            recommendation: "Fix the URL or redirect it to a live equivalent.",
+            evidence: {
+              status: response.status,
+              finalStatus: response.finalStatus,
+              requestedUrl,
+              redirectChain: response.redirectChain,
+            },
+          });
+        } else {
+          pushScanIssue(issues, {
+            url: current,
+            severity: "medium",
+            category: "crawl",
+            type: "non-html-page",
+            message: "Crawled URL is not HTML",
+            recommendation: "Keep non-HTML files out of primary crawl paths unless they are intentionally linked.",
+            evidence: { contentType: response.contentType },
+          });
+        }
+        pages.push({
+          url: current,
+          finalUrl,
+          requestedUrl,
+          sourceStatus: response.status,
+          status: response.finalStatus,
+          finalStatus: response.finalStatus,
+          redirected: response.redirected,
+          redirectChain: response.redirectChain,
+          redirectLoop: response.redirectLoop,
+          contentType: response.contentType,
+          contentEncoding: response.contentEncoding,
+          contentLength: response.contentLength,
+          loadMs,
+          urlLength: current.length,
+          isHtml: false,
+          xRobotsTag: response.xRobotsTag || "",
+          indexable: false,
+          finalIndexable: false,
+          indexabilityReason: response.finalStatus >= 400 ? "http-error" : noindex ? "noindex" : "non-html",
+          depth: currentDepth ?? null,
+          discovery: discoveryByUrl.get(currentKey) || "internal-link",
+          internalInlinks: internalInlinks.get(currentKey) || 0,
+          sitemapListed: sitemapUrlSet.has(currentKey) || sitemapUrlSet.has(finalKey),
+          sitemapSourceListed: requestedKey !== currentKey && sitemapUrlSet.has(requestedKey),
+          internalLinks: 0,
+          externalLinks: 0,
+          images: 0,
+          assets: 0,
+        });
+        persistProgress();
+        continue;
+      }
       const $ = cheerio.load(response.text);
       const baseHref = cleanText($("base[href]").first().attr("href") || "");
       const documentBaseUrl = baseHref ? absoluteHttpUrl(baseHref, finalUrl) || finalUrl : finalUrl;
-      const title = cleanText($("title").first().text());
-      const titleCount = $("title").length;
-      const description = cleanText($('meta[name="description"]').attr("content") || "");
-      const descriptionCount = $('meta[name="description"]').length;
+      // The document title only: <title> inside inline SVG labels the graphic.
+      const titleTags = $("title").filter((_, item) => $(item).closest("svg").length === 0);
+      const title = cleanText(titleTags.first().text());
+      const titleCount = titleTags.length;
+      // Meta names are case-insensitive (NAME="ROBOTS", name="Description").
+      const metaContents = (name: string) =>
+        $(`meta[name="${name}" i]`).map((_, item) => cleanText($(item).attr("content") || "")).get();
+      const descriptions = metaContents("description");
+      const description = descriptions.find(Boolean) || "";
+      const descriptionCount = descriptions.length;
       const h1s = $("h1").map((_, item) => cleanText($(item).text())).get().filter(Boolean);
       const emptyH1Count = $("h1").length - h1s.length;
       const h2Count = $("h2").length;
@@ -1600,58 +2775,64 @@ async function runLocalScan(scanId: string) {
       const canonicalRaw = $('link[rel="canonical"]').attr("href") || "";
       const canonical = canonicalRaw ? absoluteHttpUrl(canonicalRaw, documentBaseUrl) || canonicalRaw : "";
       const canonicalCount = $('link[rel="canonical"]').length;
-      const robotsMeta = cleanText($('meta[name="robots"]').attr("content") || "");
+      // Every robots and googlebot meta tag counts, not just the first one.
+      const robotsMetaContents = [...metaContents("robots"), ...metaContents("googlebot")].filter(Boolean);
+      const robotsMeta = robotsMetaContents.join(", ");
       const xRobotsTag = cleanText(response.xRobotsTag || "");
-      const robotDirectives = `${robotsMeta},${xRobotsTag}`
-        .split(",")
-        .map((item) => item.trim().toLowerCase())
-        .filter(Boolean);
+      const robotDirectives = [...robotsDirectives(robotsMetaContents, ""), ...robotsHeaderDirectives];
       const hasNoindexDirective = robotDirectives.some((item) => item === "noindex" || item === "none");
       const finalIndexable = !hasNoindexDirective && response.finalStatus < 400 && !response.redirectError;
       const indexable = finalIndexable;
       const lang = cleanText($("html").attr("lang") || "");
-      const viewport = cleanText($('meta[name="viewport"]').attr("content") || "");
-      const charset = cleanText($("meta[charset]").attr("charset") || $('meta[http-equiv="content-type"]').attr("content") || "");
+      const viewport = metaContents("viewport")[0] || "";
+      const charset = cleanText($("meta[charset]").attr("charset") || $('meta[http-equiv="content-type" i]').attr("content") || "");
       const metaRefresh = cleanText($("meta").filter((_, item) => /^refresh$/i.test($(item).attr("http-equiv") || "")).first().attr("content") || "");
       const faviconCount = $('link[rel~="icon"], link[rel="shortcut icon"]').length;
-      const schemaCount = $('script[type="application/ld+json"]').length;
-      const schemaParseErrors: string[] = [];
-      $('script[type="application/ld+json"]').each((_, script) => {
-        const text = $(script).contents().text().trim();
-        if (!text) return;
-        try {
-          JSON.parse(text);
-        } catch (error) {
-          schemaParseErrors.push(error instanceof Error ? error.message : "Invalid JSON-LD");
-        }
-      });
-      const ogTitle = cleanText($('meta[property="og:title"]').attr("content") || "");
-      const ogDescription = cleanText($('meta[property="og:description"]').attr("content") || "");
-      const ogImageRaw = cleanText($('meta[property="og:image"]').attr("content") || "");
+      const structuredData = readStructuredData($);
+      const schemaCount = structuredData.jsonLdCount;
+      const schemaParseErrors = structuredData.parseErrors;
+      const ogTitle = cleanText($('meta[property="og:title" i]').attr("content") || "");
+      const ogDescription = cleanText($('meta[property="og:description" i]').attr("content") || "");
+      const ogImageRaw = cleanText($('meta[property="og:image" i]').attr("content") || "");
       const ogImage = ogImageRaw ? absoluteHttpUrl(ogImageRaw, documentBaseUrl) || ogImageRaw : "";
-      if (/^https?:\/\//i.test(ogImage) && imagesToCheck.size < limits.maxImagesToCheck && !imagesToCheck.has(ogImage)) {
-        imagesToCheck.set(ogImage, { url: ogImage, from: current, purpose: "og:image" });
-      }
-      const twitterCard = cleanText($('meta[name="twitter:card"]').attr("content") || "");
+      const twitterCard = metaContents("twitter:card")[0] || "";
       const hreflangs = $('link[rel="alternate"][hreflang]').map((_, item) => ({
         lang: cleanText($(item).attr("hreflang") || ""),
         href: $(item).attr("href") || "",
       })).get();
       const hreflangCount = hreflangs.length;
       const hreflangCodes = hreflangs.map((item) => item.lang.toLowerCase()).filter(Boolean);
+      const hreflangTargets = hreflangs.flatMap((item) => {
+        const href = item.lang ? absoluteHttpUrl(item.href, documentBaseUrl) : null;
+        return href ? [{ lang: item.lang, href }] : [];
+      });
+      hreflangByPage.set(current, hreflangTargets);
       const imageRows: any[] = [];
       const linkRows: any[] = [];
       const assetRows: any[] = [];
 
-      const addAsset = (url: string, type: "css" | "js", meta: Record<string, unknown> = {}) => {
-        if (assetsToCheck.size >= limits.maxAssetsToCheck || assetsToCheck.has(url)) return;
-        assetsToCheck.set(url, { url, from: current, type, ...meta });
+      // Resources remember every page that references them, so a failing
+      // image or asset is reported on each affected page.
+      const addResourceToCheck = (
+        resources: Map<string, any>,
+        max: number,
+        url: string,
+        meta: Record<string, unknown>,
+      ) => {
+        const existing = resources.get(url);
+        if (existing) {
+          if (!existing.sourcePages.includes(current)) existing.sourcePages.push(current);
+          return;
+        }
+        if (resources.size >= max) return;
+        resources.set(url, { url, from: current, sourcePages: [current], ...meta });
       };
+      const addAsset = (url: string, type: "css" | "js", meta: Record<string, unknown> = {}) =>
+        addResourceToCheck(assetsToCheck, limits.maxAssetsToCheck, url, { type, ...meta });
+      const addImageToCheck = (url: string, meta: Record<string, unknown> = {}) =>
+        addResourceToCheck(imagesToCheck, limits.maxImagesToCheck, url, meta);
 
-      const addImageToCheck = (url: string, meta: Record<string, unknown> = {}) => {
-        if (imagesToCheck.size >= limits.maxImagesToCheck || imagesToCheck.has(url)) return;
-        imagesToCheck.set(url, { url, from: current, ...meta });
-      };
+      if (/^https?:\/\//i.test(ogImage)) addImageToCheck(ogImage, { purpose: "og:image" });
 
       $("img").each((imageIndex, img) => {
         const src = $(img).attr("src") || $(img).attr("data-src") || "";
@@ -1782,9 +2963,11 @@ async function runLocalScan(scanId: string) {
         if (target?.parameterized) addParameterUrl(absolute, "internal-link", current, target.url);
         if (target) {
           internalInlinks.set(target.key, (internalInlinks.get(target.key) || 0) + 1);
-          const nextDepth = currentDepth + 1;
-          if (!depthByUrl.has(target.key) || nextDepth < Number(depthByUrl.get(target.key))) {
-            depthByUrl.set(target.key, nextDepth);
+          if (currentDepth !== undefined) {
+            const nextDepth = currentDepth + 1;
+            if (!depthByUrl.has(target.key) || nextDepth < Number(depthByUrl.get(target.key))) {
+              depthByUrl.set(target.key, nextDepth);
+            }
           }
           if (!discoveryByUrl.has(target.key)) discoveryByUrl.set(target.key, "internal-link");
         }
@@ -1792,10 +2975,10 @@ async function runLocalScan(scanId: string) {
           target &&
           !visited.has(target.key) &&
           !queued.has(target.key) &&
-          queue.length + visited.size < limits.maxQueuedUrls
+          linkQueue.length + visited.size < limits.maxQueuedUrls
         ) {
           queued.add(target.key);
-          queue.push(target.url);
+          linkQueue.push(target.url);
         }
       });
 
@@ -1823,9 +3006,13 @@ async function runLocalScan(scanId: string) {
       $("script,style,noscript,svg").remove();
       const bodyText = cleanText($("body").text());
       const wordCount = bodyText ? bodyText.split(/\s+/).filter(Boolean).length : 0;
+      // Near-duplicate checks compare the main text, without site navigation
+      // and footer boilerplate shared by every page.
+      $("nav,footer").remove();
+      const simhash = contentSimhash(cleanText($("body").text()));
 
       if (response.finalStatus >= 400) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "high",
           category: "crawl",
@@ -1840,19 +3027,8 @@ async function runLocalScan(scanId: string) {
           },
         });
       }
-      if (!isHtml) {
-        pushScanIssue(issues, pageIssues, {
-          url: current,
-          severity: "medium",
-          category: "crawl",
-          type: "non-html-page",
-          message: "Crawled URL is not HTML",
-          recommendation: "Keep non-HTML files out of primary crawl paths unless they are intentionally linked.",
-          evidence: { contentType: response.contentType },
-        });
-      }
       if (current.length > 115) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: current.length > 160 ? "medium" : "low",
           category: "crawl",
@@ -1863,7 +3039,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (metaRefresh) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "crawl",
@@ -1874,18 +3050,21 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (new URL(current).protocol !== "https:") {
-        pushScanIssue(issues, pageIssues, {
+        // Plain HTTP is normal on localhost/.test/.local development hosts.
+        pushScanIssue(issues, {
           url: current,
-          severity: "high",
+          severity: localTarget ? "low" : "high",
           category: "security",
           type: "page-not-https",
           message: "Page is served over HTTP",
-          recommendation: "Serve public pages over HTTPS and redirect HTTP URLs to their HTTPS equivalents.",
-          evidence: { url: current },
+          recommendation: localTarget
+            ? "Local development host: make sure the public site serves this page over HTTPS."
+            : "Serve public pages over HTTPS and redirect HTTP URLs to their HTTPS equivalents.",
+          evidence: { url: current, localHost: localTarget },
         });
       }
       if (isLikelyTrackingUrl(current)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "crawl",
@@ -1895,8 +3074,8 @@ async function runLocalScan(scanId: string) {
           evidence: { url: current },
         });
       }
-      if (currentDepth > 3) {
-        pushScanIssue(issues, pageIssues, {
+      if (currentDepth !== undefined && currentDepth > 3) {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "crawl",
@@ -1907,7 +3086,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!title) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "high",
           category: "metadata",
@@ -1916,7 +3095,7 @@ async function runLocalScan(scanId: string) {
           recommendation: "Add a unique title tag that describes the page and primary search intent.",
         });
       } else if (titleCount > 1) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "metadata",
@@ -1926,7 +3105,7 @@ async function runLocalScan(scanId: string) {
           evidence: { titleCount },
         });
       } else if (title.length > 60 || title.length < 30) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: title.length > 70 ? "medium" : "low",
           category: "metadata",
@@ -1937,7 +3116,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!description) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "high",
           category: "metadata",
@@ -1946,7 +3125,7 @@ async function runLocalScan(scanId: string) {
           recommendation: "Add a unique meta description that summarizes the page and includes the main value.",
         });
       } else if (descriptionCount > 1) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "metadata",
@@ -1956,7 +3135,7 @@ async function runLocalScan(scanId: string) {
           evidence: { descriptionCount },
         });
       } else if (description.length > 160 || description.length < 70) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "metadata",
@@ -1967,7 +3146,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (h1s.length === 0 || h1s.length > 1) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "headings",
@@ -1978,7 +3157,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (emptyH1Count > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "headings",
@@ -1989,7 +3168,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (emptyHeadingCount > emptyH1Count) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "headings",
@@ -2000,7 +3179,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (headingJumps.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "headings",
@@ -2011,7 +3190,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (wordCount > 300 && h2Count === 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "headings",
@@ -2022,7 +3201,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!canonical) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "canonicals",
@@ -2031,7 +3210,7 @@ async function runLocalScan(scanId: string) {
           recommendation: "Add a canonical URL so crawlers understand the preferred version.",
         });
       } else if (canonicalRaw && !absoluteHttpUrl(canonicalRaw, documentBaseUrl)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "canonicals",
@@ -2041,7 +3220,7 @@ async function runLocalScan(scanId: string) {
           evidence: { canonical: canonicalRaw },
         });
       } else if (canonicalCount > 1) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "canonicals",
@@ -2051,7 +3230,7 @@ async function runLocalScan(scanId: string) {
           evidence: { canonicalCount },
         });
       } else if (isHttpOnHttpsPage(canonical, current)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "canonicals",
@@ -2061,7 +3240,7 @@ async function runLocalScan(scanId: string) {
           evidence: { canonical },
         });
       } else if (!sameSiteUrl(canonical, startUrl)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "canonicals",
@@ -2073,7 +3252,7 @@ async function runLocalScan(scanId: string) {
       } else if (
         response.redirectChain.some((hop) => normalizedUrl(hop.url) === normalizedUrl(canonical))
       ) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "canonicals",
@@ -2083,7 +3262,7 @@ async function runLocalScan(scanId: string) {
           evidence: { canonical, finalUrl, redirectChain: response.redirectChain },
         });
       } else if (finalIndexable && normalizedUrl(canonical) !== normalizedUrl(finalUrl)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "canonicals",
@@ -2094,7 +3273,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (hasNoindexDirective) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "high",
           category: "indexability",
@@ -2104,8 +3283,8 @@ async function runLocalScan(scanId: string) {
           evidence: { robotsMeta, xRobotsTag },
         });
       }
-      if (robotDirectives.includes("nofollow")) {
-        pushScanIssue(issues, pageIssues, {
+      if (robotDirectives.includes("nofollow") || robotDirectives.includes("none")) {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "indexability",
@@ -2116,7 +3295,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (robotDirectives.includes("noarchive") || robotDirectives.includes("nosnippet")) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "indexability",
@@ -2127,7 +3306,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!lang) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "indexability",
@@ -2136,7 +3315,7 @@ async function runLocalScan(scanId: string) {
           recommendation: "Set the page language on the html element.",
         });
       } else if (!isValidLangCode(lang)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "localization",
@@ -2147,7 +3326,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!charset) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "indexability",
@@ -2157,7 +3336,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!faviconCount) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "metadata",
@@ -2167,7 +3346,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!viewport) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "performance",
@@ -2176,7 +3355,7 @@ async function runLocalScan(scanId: string) {
           recommendation: "Add a responsive viewport meta tag for mobile rendering.",
         });
       } else if (!/width\s*=\s*device-width/i.test(viewport)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2187,7 +3366,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (loadMs > 4000) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "performance",
@@ -2197,7 +3376,7 @@ async function runLocalScan(scanId: string) {
           evidence: { loadMs },
         });
       } else if (loadMs > 2000) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2208,7 +3387,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (response.contentLength && response.contentLength > 1000000) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2219,7 +3398,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (wordCount < 150) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "content",
@@ -2236,7 +3415,7 @@ async function runLocalScan(scanId: string) {
       const emptyAlt = imageRows.filter((image) => image.classification === "content" && image.altState === "empty").length;
       const missingDimensions = imageRows.filter((image) => image.issues.includes("missing size"));
       if (imagesMissingSrc.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "high",
           category: "images",
@@ -2250,7 +3429,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (missingFallbackSrc > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2261,7 +3440,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (invalidSrcset > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "images",
@@ -2272,7 +3451,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (missingAlt > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "images",
@@ -2283,7 +3462,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (emptyAlt > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2295,7 +3474,7 @@ async function runLocalScan(scanId: string) {
       }
       const genericAlt = imageRows.filter((image) => image.classification === "content" && image.issues.includes("generic alt"));
       if (genericAlt.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2307,7 +3486,7 @@ async function runLocalScan(scanId: string) {
       }
       const longAlt = imageRows.filter((image) => image.classification === "content" && image.issues.includes("alt too long"));
       if (longAlt.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2322,7 +3501,7 @@ async function runLocalScan(scanId: string) {
         .map((image) => image.altPreview.toLowerCase())
         .filter((alt, index, alts) => alts.indexOf(alt) !== index))];
       if (duplicateAltTexts.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2333,7 +3512,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (missingDimensions.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2345,7 +3524,7 @@ async function runLocalScan(scanId: string) {
       }
       const missingSrcset = imageRows.filter((image) => image.issues.includes("missing srcset"));
       if (missingSrcset.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "images",
@@ -2357,7 +3536,7 @@ async function runLocalScan(scanId: string) {
       }
       const missingLazyLoading = imageRows.filter((image) => image.issues.includes("not lazy loaded"));
       if (missingLazyLoading.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2369,7 +3548,7 @@ async function runLocalScan(scanId: string) {
       }
       const mixedImages = imageRows.filter((image) => image.src && isHttpOnHttpsPage(image.src, current));
       if (mixedImages.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "images",
@@ -2381,7 +3560,7 @@ async function runLocalScan(scanId: string) {
       }
       const mixedLinks = linkRows.filter((link) => isHttpOnHttpsPage(link.href, current));
       if (mixedLinks.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "links",
@@ -2393,7 +3572,7 @@ async function runLocalScan(scanId: string) {
       }
       const emptyAnchorLinks = linkRows.filter((link) => !link.anchor && !link.accessibleName);
       if (emptyAnchorLinks.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "links",
@@ -2405,7 +3584,7 @@ async function runLocalScan(scanId: string) {
       }
       const internalNofollowLinks = linkRows.filter((link) => link.type === "internal" && /\bnofollow\b/i.test(link.rel));
       if (internalNofollowLinks.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "links",
@@ -2417,7 +3596,7 @@ async function runLocalScan(scanId: string) {
       }
       const unsafeBlankLinks = linkRows.filter((link) => link.type === "external" && link.target.toLowerCase() === "_blank" && !/\b(noopener|noreferrer)\b/i.test(link.rel));
       if (unsafeBlankLinks.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "security",
@@ -2428,7 +3607,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (linkRows.filter((link) => link.type === "internal").length === 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "links",
@@ -2438,7 +3617,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (linkRows.length > 150) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "links",
@@ -2448,9 +3627,26 @@ async function runLocalScan(scanId: string) {
           evidence: { linkCount: linkRows.length },
         });
       }
+      const robotsBlockedLinks = [...new Set(linkRows.filter((link) => link.type === "internal").map((link) => link.href))].flatMap(
+        (href) => {
+          const verdict = robotsCheck(href);
+          return verdict && !verdict.allowed ? [{ url: href, rule: verdict.matchedRule }] : [];
+        },
+      );
+      if (robotsBlockedLinks.length > 0) {
+        pushScanIssue(issues, {
+          url: current,
+          severity: "low",
+          category: "robots",
+          type: "robots-blocked-linked",
+          message: `${robotsBlockedLinks.length} internal links point to URLs robots.txt disallows for Googlebot`,
+          recommendation: "Confirm the blocked destinations are intentional, or link to crawlable URLs instead.",
+          evidence: { count: robotsBlockedLinks.length, blockedUrls: robotsBlockedLinks.slice(0, 20), robotsUrl: robots.url },
+        });
+      }
       const trackingInternalLinks = linkRows.filter((link) => link.type === "internal" && isLikelyTrackingUrl(link.href));
       if (trackingInternalLinks.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "links",
@@ -2460,18 +3656,48 @@ async function runLocalScan(scanId: string) {
           evidence: { samples: trackingInternalLinks.map((link) => link.href) },
         });
       }
-      if (!schemaCount) {
-        pushScanIssue(issues, pageIssues, {
+      if (!schemaCount && !structuredData.microdataCount) {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "structured-data",
           type: "structured-data-missing",
-          message: "No JSON-LD structured data found",
+          message: "No JSON-LD or microdata structured data found",
           recommendation: "Add relevant schema such as Organization, WebSite, BreadcrumbList, Article, Product, or LocalBusiness.",
         });
       }
+      const itemsMissingRequired = structuredData.items.filter((item) => item.missingRequired.length);
+      if (itemsMissingRequired.length > 0) {
+        pushScanIssue(issues, {
+          url: current,
+          severity: "medium",
+          category: "structured-data",
+          type: "structured-data-missing-required",
+          message: `${itemsMissingRequired.length} structured data items are missing required properties`,
+          recommendation: "Add the listed required properties so the items are eligible for rich results.",
+          evidence: {
+            count: itemsMissingRequired.length,
+            items: itemsMissingRequired.map((item) => ({ type: item.type, format: item.format, missing: item.missingRequired })),
+          },
+        });
+      }
+      const itemsMissingRecommended = structuredData.items.filter((item) => item.missingRecommended.length);
+      if (itemsMissingRecommended.length > 0) {
+        pushScanIssue(issues, {
+          url: current,
+          severity: "low",
+          category: "structured-data",
+          type: "structured-data-missing-recommended",
+          message: `${itemsMissingRecommended.length} structured data items are missing recommended properties`,
+          recommendation: "Add the listed recommended properties where the page has that information.",
+          evidence: {
+            count: itemsMissingRecommended.length,
+            items: itemsMissingRecommended.map((item) => ({ type: item.type, format: item.format, missing: item.missingRecommended })),
+          },
+        });
+      }
       if (schemaParseErrors.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "structured-data",
@@ -2482,7 +3708,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!ogTitle || !ogDescription) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "social",
@@ -2493,7 +3719,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!ogImage) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "social",
@@ -2502,7 +3728,7 @@ async function runLocalScan(scanId: string) {
           recommendation: "Add og:image for pages that may be shared or discovered socially.",
         });
       } else if (!/^https?:\/\//i.test(ogImage)) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "social",
@@ -2513,7 +3739,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (!twitterCard) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "social",
@@ -2524,7 +3750,7 @@ async function runLocalScan(scanId: string) {
       }
       const invalidHreflangs = hreflangs.filter((item) => !item.lang || !absoluteHttpUrl(item.href, documentBaseUrl));
       if (invalidHreflangs.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "localization",
@@ -2536,7 +3762,7 @@ async function runLocalScan(scanId: string) {
       }
       const malformedHreflangs = hreflangs.filter((item) => item.lang && item.lang.toLowerCase() !== "x-default" && !isValidLangCode(item.lang));
       if (malformedHreflangs.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "localization",
@@ -2548,7 +3774,7 @@ async function runLocalScan(scanId: string) {
       }
       const duplicateHreflangCodes = [...new Set(hreflangCodes.filter((code, index) => hreflangCodes.indexOf(code) !== index))];
       if (duplicateHreflangCodes.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "localization",
@@ -2558,8 +3784,19 @@ async function runLocalScan(scanId: string) {
           evidence: { duplicateHreflangCodes },
         });
       }
+      if (hreflangTargets.length > 0 && response.finalStatus < 400 && !hreflangTargets.some((item) => normalizedUrl(item.href) === normalizedUrl(finalUrl))) {
+        pushScanIssue(issues, {
+          url: current,
+          severity: "low",
+          category: "localization",
+          type: "hreflang-missing-self",
+          message: "Hreflang set does not include this page",
+          recommendation: "Add an hreflang link for this page's own language pointing at its own URL.",
+          evidence: { hreflangCount, hreflang: hreflangTargets.slice(0, 20) },
+        });
+      }
       if (hreflangCount > 1 && !hreflangCodes.includes("x-default")) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "localization",
@@ -2571,7 +3808,7 @@ async function runLocalScan(scanId: string) {
       }
       const mixedAssets = assetRows.filter((asset) => isHttpOnHttpsPage(asset.url, current));
       if (mixedAssets.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "medium",
           category: "assets",
@@ -2589,7 +3826,7 @@ async function runLocalScan(scanId: string) {
         !asset.module
       );
       if (renderBlockingScripts.length > 0) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2600,7 +3837,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (assetRows.length > 60) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2611,7 +3848,7 @@ async function runLocalScan(scanId: string) {
         });
       }
       if (response.contentLength && response.contentLength > 50000 && !response.contentEncoding) {
-        pushScanIssue(issues, pageIssues, {
+        pushScanIssue(issues, {
           url: current,
           severity: "low",
           category: "performance",
@@ -2637,6 +3874,7 @@ async function runLocalScan(scanId: string) {
         contentLength: response.contentLength,
         loadMs,
         urlLength: current.length,
+        isHtml: true,
         title,
         titleLength: title.length,
         titleCount,
@@ -2664,7 +3902,7 @@ async function runLocalScan(scanId: string) {
         metaRefresh,
         faviconCount,
         wordCount,
-        depth: currentDepth,
+        depth: currentDepth ?? null,
         discovery: discoveryByUrl.get(currentKey) || "internal-link",
         internalInlinks: internalInlinks.get(currentKey) || 0,
         sitemapListed:
@@ -2672,9 +3910,14 @@ async function runLocalScan(scanId: string) {
         sitemapSourceListed:
           requestedKey !== currentKey && sitemapUrlSet.has(requestedKey),
         contentFingerprint: contentFingerprint(bodyText),
+        contentSimhash: simhash,
         schemaCount,
         schemaParseErrors,
+        structuredData: structuredData.items,
         hreflangCount,
+        hreflang: hreflangTargets
+          .slice(0, MAX_STORED_HREFLANG)
+          .map((item) => ({ ...item, targetStatus: null, returnLink: null })),
         openGraph: { title: ogTitle, description: ogDescription },
         ogImage,
         twitterCard,
@@ -2690,65 +3933,93 @@ async function runLocalScan(scanId: string) {
         assets: assetRows.length,
         cssAssets: assetRows.filter((asset) => asset.type === "css").length,
         jsAssets: assetRows.filter((asset) => asset.type === "js").length,
-        issues: pageIssues,
       };
       pages.push(page);
       persistProgress();
     } catch (error) {
-      pushScanIssue(issues, pageIssues, {
+      if (signal.aborted) throwIfCancelled();
+      // A page that never answered (DNS, TLS, timeout, reset) still gets a
+      // page row, so it is visible in reports and counts in the health score.
+      const message = error instanceof Error ? error.message : "Failed to crawl URL";
+      const failureKind = resourceFailureKind(message);
+      crawledResources.set(requestedUrl, { ...failedResourceCheck(requestedUrl, message), fromCrawl: true });
+      pushScanIssue(issues, {
         url: current,
         severity: "high",
         category: "crawl",
         type: "crawl-failed",
-        message: error instanceof Error ? error.message : "Failed to crawl URL",
+        message,
         recommendation: "Check DNS, TLS, firewall, redirects, and server availability.",
+        evidence: { error: message, failureKind },
+      });
+      pages.push({
+        url: current,
+        finalUrl: current,
+        requestedUrl,
+        status: null,
+        finalStatus: null,
+        error: message,
+        failureKind,
+        indexable: false,
+        finalIndexable: false,
+        indexabilityReason: "crawl-failed",
+        depth: currentDepth ?? null,
+        discovery: discoveryByUrl.get(currentKey) || "internal-link",
+        internalInlinks: internalInlinks.get(currentKey) || 0,
+        sitemapListed: sitemapUrlSet.has(currentKey),
+        internalLinks: 0,
+        externalLinks: 0,
+        images: 0,
+        assets: 0,
       });
       persistProgress();
     }
-    if (consecutiveRateLimits >= 5) {
-      throw new Error(
-        "The site keeps rate limiting the crawl (HTTP 429/503). Wait a while and scan again, or keep the polite crawl speed.",
-      );
-    }
-    if (politeTarget && queue.length > 0 && visited.size < limits.maxPages) {
-      await sleep(pageDelayMs * (0.75 + Math.random() * 0.5));
-    }
   }
-  for (const page of pages) {
-    const pageKey = normalizedUrlKey(page.url);
-    const finalKey = normalizedUrlKey(page.finalUrl || page.url);
-    const requestedKey = normalizedUrlKey(page.requestedUrl || page.url);
-    page.internalInlinks = Math.max(
-      Number(page.internalInlinks || 0),
-      internalInlinks.get(pageKey) || 0,
-      internalInlinks.get(finalKey) || 0,
-      internalInlinks.get(requestedKey) || 0,
-    );
-    page.depth = Math.min(
-      Number.isFinite(Number(page.depth)) ? Number(page.depth) : 999,
-      depthByUrl.get(pageKey) ?? 999,
-      depthByUrl.get(finalKey) ?? 999,
-      depthByUrl.get(requestedKey) ?? 999,
-    );
-    if (page.depth === 999) page.depth = 0;
-    page.discovery =
-      discoveryByUrl.get(pageKey) ||
-      discoveryByUrl.get(finalKey) ||
-      discoveryByUrl.get(requestedKey) ||
-      page.discovery ||
-      "internal-link";
-    page.sitemapListed = sitemapUrlSet.has(pageKey) || sitemapUrlSet.has(finalKey);
-    page.sitemapSourceListed = requestedKey !== pageKey && sitemapUrlSet.has(requestedKey);
-  }
+  settlePages();
 
-  const politeResourcePause = async (url: string) => {
-    if (politeTarget && sameSiteUrl(url, startUrl)) await sleep(120 + Math.random() * 180);
+  // Resource checks: URLs the crawl already fetched reuse that response; the
+  // rest run concurrently (6 at once, at most 2 per host, 1 at a time against
+  // the scanned site when crawling politely).
+  const siteKey = siteHostKey(startUrl);
+  const checkResources = async (candidates: any[], afterCheck?: (candidate: any, result: any) => Promise<void>) => {
+    const results: any[] = candidates.map((candidate) => crawledResources.get(candidate.url));
+    const pendingIndexes = results.flatMap((result, index) => (result ? [] : [index]));
+    pendingChecks = pendingIndexes.length;
+    persistProgress(true);
+    await runBounded(
+      pendingIndexes,
+      (index) => siteHostKey(candidates[index].url),
+      (host) => (politeTarget && host === siteKey ? 1 : 2),
+      async (index) => {
+        const candidate = candidates[index];
+        if (politeTarget && siteHostKey(candidate.url) === siteKey) await sleep(120 + Math.random() * 180, signal);
+        if (signal.aborted) return;
+        progressUrl = candidate.url;
+        const result = await checkResource(candidate.url, signal);
+        if (signal.aborted) return;
+        if (afterCheck) await afterCheck(candidate, result);
+        results[index] = result;
+        pendingChecks -= 1;
+        persistProgress();
+      },
+      signal,
+    );
+    return results;
+  };
+
+  // Reported once per affected source page, like the pages themselves.
+  const pushForSources = (sourcePages: string[], issue: Omit<Parameters<typeof pushScanIssue>[1], "url">) => {
+    for (const from of sourcePages) {
+      pushScanIssue(issues, { ...issue, url: from, evidence: { ...issue.evidence, affectedPages: sourcePages.length } });
+    }
   };
 
   phase = "checking links";
-  for (const candidate of [...linksToCheck.values()]) {
-    await politeResourcePause(candidate.url);
-    const result = await checkResource(candidate.url);
+  const linkCandidates = [...linksToCheck.values()];
+  const linkResults = await checkResources(linkCandidates);
+  for (const [index, candidate] of linkCandidates.entries()) {
+    const result = linkResults[index];
+    if (!result) continue;
     const sources = [...candidate.sources.values()];
     const sourcePages = sources.map((source) => source.from);
     const row = {
@@ -2763,51 +4034,53 @@ async function runLocalScan(scanId: string) {
       ...result,
     };
     checkedLinks.push(row);
+    const internal = candidate.type === "internal";
     if (!row.ok) {
-      const firstSource = sources[0];
       const certificateFailure = row.failureKind === "tls-certificate";
       const redirectLoop = row.redirectLoop === true;
-      pushScanIssue(issues, firstSource ? pageBucket(firstSource.from) : undefined, {
-        url: firstSource?.from || candidate.url,
-        severity: certificateFailure ? "medium" : candidate.type === "internal" ? "high" : "medium",
-        category: "links",
-        type: redirectLoop
-          ? "link-redirect-loop"
-          : certificateFailure
-            ? `${candidate.type}-link-certificate-error`
-            : candidate.type === "internal"
-              ? "broken-internal-link"
-              : "broken-external-link",
-        message: redirectLoop
-          ? `${candidate.type === "internal" ? "Internal" : "External"} link has a redirect loop`
-          : certificateFailure
-            ? `${candidate.type === "internal" ? "Internal" : "External"} link certificate could not be verified`
-            : `${candidate.type === "internal" ? "Internal" : "External"} link is failing`,
-        recommendation: certificateFailure
-          ? "Verify the destination certificate in a browser or another trusted client before treating the URL as unavailable."
-          : redirectLoop
-            ? "Fix the redirect cycle or link directly to a working final destination."
-            : "Update the linked URL, remove the link, or redirect that URL to a live page.",
-        evidence: {
-          linkedUrl: candidate.url,
-          status: row.status,
-          finalStatus: row.finalStatus,
-          error: row.error,
-          failureKind: row.failureKind,
-          redirectChain: row.redirectChain,
-          affectedPages: sourcePages.length,
-          totalReferences: row.referenceCount,
-          sourcePages,
-        },
-      });
+      for (const source of sources) {
+        pushScanIssue(issues, {
+          url: source.from,
+          severity: certificateFailure ? "medium" : internal ? "high" : "medium",
+          category: "links",
+          type: redirectLoop
+            ? "link-redirect-loop"
+            : certificateFailure
+              ? `${candidate.type}-link-certificate-error`
+              : internal
+                ? "broken-internal-link"
+                : "broken-external-link",
+          message: redirectLoop
+            ? `${internal ? "Internal" : "External"} link has a redirect loop`
+            : certificateFailure
+              ? `${internal ? "Internal" : "External"} link certificate could not be verified`
+              : `${internal ? "Internal" : "External"} link is failing`,
+          recommendation: certificateFailure
+            ? "Verify the destination certificate in a browser or another trusted client before treating the URL as unavailable."
+            : redirectLoop
+              ? "Fix the redirect cycle or link directly to a working final destination."
+              : "Update the linked URL, remove the link, or redirect that URL to a live page.",
+          evidence: {
+            linkedUrl: candidate.url,
+            status: row.status,
+            finalStatus: row.finalStatus,
+            error: row.error,
+            failureKind: row.failureKind,
+            redirectChain: row.redirectChain,
+            affectedPages: sourcePages.length,
+            totalReferences: row.referenceCount,
+            referencesOnPage: source.references,
+          },
+        });
+      }
     } else if (row.redirected || (row.finalUrl && row.finalUrl !== candidate.url)) {
       for (const source of sources) {
-        pushScanIssue(issues, pageBucket(source.from), {
+        pushScanIssue(issues, {
           url: source.from,
-          severity: candidate.type === "internal" ? "medium" : "low",
+          severity: internal ? "medium" : "low",
           category: "links",
-          type: candidate.type === "internal" ? "internal-link-redirects" : "external-link-redirects",
-          message: `${candidate.type === "internal" ? "Internal" : "External"} link redirects with HTTP ${row.status}`,
+          type: internal ? "internal-link-redirects" : "external-link-redirects",
+          message: `${internal ? "Internal" : "External"} link redirects with HTTP ${row.status}`,
           recommendation: "Link directly to the final destination when the redirect is permanent and intentional.",
           evidence: {
             linkedUrl: candidate.url,
@@ -2822,22 +4095,47 @@ async function runLocalScan(scanId: string) {
         });
       }
     }
-    if (checkedLinks.length % 25 === 0) persistProgress();
   }
+  throwIfCancelled();
+
+  // Canonical and hreflang URLs and sitemap entries reuse every response the
+  // scan already has; the rest are checked like links, within the link budget.
+  phase = "checking canonical, hreflang, and sitemap links";
+  const urlResponses = knownUrlResponses(crawledResources, checkedLinks, pages);
+  const sitemapEntries = sitemapEntriesToAudit(sitemap.urls || [], pages, urlResponses, startUrl);
+  const targetUrls = [
+    ...new Set([
+      ...pages.map(canonicalTargetUrl),
+      ...[...hreflangByPage.values()].flatMap((entries) => entries.map((entry) => entry.href)),
+      ...sitemapEntries,
+    ]),
+  ]
+    .filter((url) => url && !urlResponses.has(url))
+    .slice(0, limits.maxLinksToCheck);
+  const targetResults = await checkResources(targetUrls.map((url) => ({ url })));
+  for (const [index, url] of targetUrls.entries()) {
+    if (targetResults[index]) urlResponses.set(url, targetResults[index]);
+  }
+  throwIfCancelled();
+  const pagesByFinalUrl = htmlPagesByFinalUrl(pages);
+  pushCanonicalTargetIssues(issues, pages, urlResponses, pagesByFinalUrl);
+  pushHreflangIssues(issues, pages, hreflangByPage, urlResponses, pagesByFinalUrl);
+  pushSitemapUrlIssues(issues, sitemapEntries, urlResponses, pagesByFinalUrl);
 
   const checkedImageUrls = new Set<string>();
-  async function checkQueuedImages() {
-    for (const candidate of [...imagesToCheck.values()]) {
-      if (checkedImageUrls.has(candidate.url)) continue;
-      checkedImageUrls.add(candidate.url);
-      await politeResourcePause(candidate.url);
-      const result = await checkResource(candidate.url);
-      const row = { ...candidate, ...result };
+  const checkQueuedImages = async () => {
+    const candidates = [...imagesToCheck.values()].filter((candidate) => !checkedImageUrls.has(candidate.url));
+    for (const candidate of candidates) checkedImageUrls.add(candidate.url);
+    const results = await checkResources(candidates);
+    for (const [index, candidate] of candidates.entries()) {
+      const result = results[index];
+      if (!result) continue;
+      const row = { ...candidate, affectedPages: candidate.sourcePages.length, ...result };
       checkedImages.push(row);
+      const evidence = { image: candidate.url, purpose: candidate.purpose };
       if (!row.ok) {
         const certificateFailure = row.failureKind === "tls-certificate";
-        pushScanIssue(issues, pageBucket(candidate.from), {
-          url: candidate.from,
+        pushForSources(candidate.sourcePages, {
           severity: certificateFailure ? "medium" : "high",
           category: "images",
           type: certificateFailure ? "image-certificate-error" : "broken-image",
@@ -2846,77 +4144,87 @@ async function runLocalScan(scanId: string) {
             ? "Verify the image host certificate in a trusted client before treating the image as unavailable."
             : "Replace the image URL or restore the missing image asset.",
           evidence: {
-            image: candidate.url,
+            ...evidence,
             status: row.status,
             finalStatus: row.finalStatus,
             error: row.error,
             failureKind: row.failureKind,
             redirectChain: row.redirectChain,
-            purpose: candidate.purpose,
           },
         });
       } else if (row.redirected || (row.finalUrl && row.finalUrl !== candidate.url)) {
-        pushScanIssue(issues, pageBucket(candidate.from), {
-          url: candidate.from,
+        pushForSources(candidate.sourcePages, {
           severity: "low",
           category: "images",
           type: "image-redirects",
           message: "Image URL redirects before loading",
           recommendation: "Point image tags directly at the final image URL to reduce request overhead.",
-          evidence: { image: candidate.url, finalUrl: row.finalUrl, status: row.status, purpose: candidate.purpose },
+          evidence: { ...evidence, finalUrl: row.finalUrl, status: row.status },
         });
       } else if (row.contentType && !/^image\//i.test(row.contentType)) {
-        pushScanIssue(issues, pageBucket(candidate.from), {
-          url: candidate.from,
+        pushForSources(candidate.sourcePages, {
           severity: "medium",
           category: "images",
           type: "image-invalid-content-type",
           message: "Image URL does not return an image content type",
           recommendation: "Fix the image source so it serves a valid image file.",
-          evidence: { image: candidate.url, contentType: row.contentType, purpose: candidate.purpose },
+          evidence: { ...evidence, contentType: row.contentType },
         });
       } else {
         const expectedMime = expectedImageMime(candidate.url);
         if (expectedMime && row.contentType && !row.contentType.toLowerCase().includes(expectedMime)) {
-          pushScanIssue(issues, pageBucket(candidate.from), {
-            url: candidate.from,
+          pushForSources(candidate.sourcePages, {
             severity: "low",
             category: "images",
             type: "image-extension-mismatch",
             message: "Image file extension does not match the response content type",
             recommendation: "Serve images with the correct file extension and Content-Type so browsers, caches, and crawlers classify them correctly.",
-            evidence: { image: candidate.url, expectedMime, contentType: row.contentType, purpose: candidate.purpose },
+            evidence: { ...evidence, expectedMime, contentType: row.contentType },
           });
         }
         if (row.contentLength && row.contentLength > 500000) {
-          pushScanIssue(issues, pageBucket(candidate.from), {
-            url: candidate.from,
+          pushForSources(candidate.sourcePages, {
             severity: "low",
             category: "images",
             type: "large-image",
             message: "Image file is larger than 500 KB",
             recommendation: "Compress, resize, or serve a modern responsive image.",
-            evidence: { image: candidate.url, bytes: row.contentLength, purpose: candidate.purpose },
+            evidence: { ...evidence, bytes: row.contentLength },
           });
         }
       }
-      if (checkedImages.length % 25 === 0) persistProgress();
     }
-  }
+    throwIfCancelled();
+  };
 
   phase = "checking images";
   await checkQueuedImages();
 
   phase = "checking assets";
-  for (const candidate of [...assetsToCheck.values()]) {
-    await politeResourcePause(candidate.url);
-    const result = await checkResource(candidate.url);
-    const row = { ...candidate, ...result };
+  const assetCandidates = [...assetsToCheck.values()];
+  // Background images referenced from stylesheets, found while checking CSS.
+  const cssImageUrls = new Map<string, string[]>();
+  const assetResults = await checkResources(assetCandidates, async (candidate, result) => {
+    if (
+      candidate.type !== "css" ||
+      !result.ok ||
+      (result.contentType && !/(text\/css|octet-stream|text\/plain)/i.test(result.contentType)) ||
+      (result.contentLength && result.contentLength > 1000000)
+    ) {
+      return;
+    }
+    const cssResponse = await fetchText(candidate.url, 8000, { signal }).catch(() => null);
+    if (cssResponse?.ok) cssImageUrls.set(candidate.url, cssUrlValues(cssResponse.text, cssResponse.url || candidate.url));
+  });
+  for (const [index, candidate] of assetCandidates.entries()) {
+    const result = assetResults[index];
+    if (!result) continue;
+    const row = { ...candidate, affectedPages: candidate.sourcePages.length, ...result };
     checkedAssets.push(row);
+    const assetLabel = String(candidate.type).toUpperCase();
     if (!row.ok) {
       const certificateFailure = row.failureKind === "tls-certificate";
-      pushScanIssue(issues, pageBucket(candidate.from), {
-        url: candidate.from,
+      pushForSources(candidate.sourcePages, {
         severity: certificateFailure ? "medium" : "high",
         category: "assets",
         type: certificateFailure
@@ -2925,8 +4233,8 @@ async function runLocalScan(scanId: string) {
             ? "broken-css"
             : "broken-javascript",
         message: certificateFailure
-          ? `${candidate.type.toUpperCase()} asset certificate could not be verified`
-          : `${candidate.type.toUpperCase()} asset is failing`,
+          ? `${assetLabel} asset certificate could not be verified`
+          : `${assetLabel} asset is failing`,
         recommendation: certificateFailure
           ? "Verify the asset host certificate in a trusted client before treating the asset as unavailable."
           : "Restore the asset, fix the URL, or remove the reference.",
@@ -2940,8 +4248,7 @@ async function runLocalScan(scanId: string) {
         },
       });
     } else if (candidate.type === "css" && row.contentType && !/(text\/css|octet-stream)/i.test(row.contentType)) {
-      pushScanIssue(issues, pageBucket(candidate.from), {
-        url: candidate.from,
+      pushForSources(candidate.sourcePages, {
         severity: "medium",
         category: "assets",
         type: "css-invalid-content-type",
@@ -2950,8 +4257,7 @@ async function runLocalScan(scanId: string) {
         evidence: { asset: candidate.url, contentType: row.contentType },
       });
     } else if (candidate.type === "js" && row.contentType && !/(javascript|ecmascript|octet-stream|text\/plain)/i.test(row.contentType)) {
-      pushScanIssue(issues, pageBucket(candidate.from), {
-        url: candidate.from,
+      pushForSources(candidate.sourcePages, {
         severity: "medium",
         category: "assets",
         type: "javascript-invalid-content-type",
@@ -2960,94 +4266,97 @@ async function runLocalScan(scanId: string) {
         evidence: { asset: candidate.url, contentType: row.contentType },
       });
     } else if (row.contentLength && row.contentLength > 500000) {
-      pushScanIssue(issues, pageBucket(candidate.from), {
-        url: candidate.from,
+      pushForSources(candidate.sourcePages, {
         severity: "low",
         category: "assets",
         type: candidate.type === "css" ? "large-css" : "large-javascript",
-        message: `${candidate.type.toUpperCase()} asset is larger than 500 KB`,
+        message: `${assetLabel} asset is larger than 500 KB`,
         recommendation: "Split, minify, compress, or defer heavy assets.",
         evidence: { asset: candidate.url, bytes: row.contentLength },
       });
     }
-    if (
-      candidate.type === "css" &&
-      row.ok &&
-      (!row.contentType || /(text\/css|octet-stream|text\/plain)/i.test(row.contentType)) &&
-      (!row.contentLength || row.contentLength <= 1000000)
-    ) {
-      const cssResponse = await fetchText(candidate.url, 8000).catch(() => null);
-      if (cssResponse?.ok) {
-        for (const imageUrl of cssUrlValues(cssResponse.text, cssResponse.url || candidate.url)) {
-          if (imagesToCheck.size >= limits.maxImagesToCheck || imagesToCheck.has(imageUrl)) continue;
-          imagesToCheck.set(imageUrl, { url: imageUrl, from: candidate.from, purpose: "external-css-url", css: candidate.url });
-        }
-      }
+    for (const imageUrl of cssImageUrls.get(candidate.url) || []) {
+      if (imagesToCheck.size >= limits.maxImagesToCheck || imagesToCheck.has(imageUrl)) continue;
+      imagesToCheck.set(imageUrl, {
+        url: imageUrl,
+        from: candidate.from,
+        sourcePages: candidate.sourcePages,
+        purpose: "external-css-url",
+        css: candidate.url,
+      });
     }
-    if (checkedAssets.length % 25 === 0) persistProgress();
   }
+  throwIfCancelled();
 
   phase = "checking CSS images";
   await checkQueuedImages();
 
   phase = "deduplicating";
+  // Each duplicate issue carries the group size and a bounded URL sample;
+  // listing every URL on every issue would grow with the square of the group.
+  const duplicateEvidence = (rows: any[]) => ({
+    duplicateCount: rows.length,
+    duplicates: rows.slice(0, 20).map((row) => row.url),
+  });
   for (const [title, rows] of groupDuplicateValues(pages.filter((page) => page.indexable), "title")) {
     for (const page of rows) {
-      pushScanIssue(issues, pageBucket(page.url), {
+      pushScanIssue(issues, {
         url: page.url,
         severity: "medium",
         category: "metadata",
         type: "duplicate-title",
         message: "Duplicate title tag",
         recommendation: "Write a unique title for each indexable page.",
-        evidence: { title, duplicates: rows.map((row) => row.url) },
+        evidence: { title, ...duplicateEvidence(rows) },
       });
     }
   }
   for (const [description, rows] of groupDuplicateValues(pages.filter((page) => page.indexable), "description")) {
     for (const page of rows) {
-      pushScanIssue(issues, pageBucket(page.url), {
+      pushScanIssue(issues, {
         url: page.url,
         severity: "low",
         category: "metadata",
         type: "duplicate-description",
         message: "Duplicate meta description",
         recommendation: "Write a unique description for each important page.",
-        evidence: { description, duplicates: rows.map((row) => row.url) },
+        evidence: { description, ...duplicateEvidence(rows) },
       });
     }
   }
   for (const [h1, rows] of groupDuplicateValues(pages.filter((page) => page.indexable), "h1")) {
     if (!firstH1Fingerprint(h1)) continue;
     for (const page of rows) {
-      pushScanIssue(issues, pageBucket(page.url), {
+      pushScanIssue(issues, {
         url: page.url,
         severity: "low",
         category: "headings",
         type: "duplicate-h1",
         message: "Duplicate H1 across multiple pages",
         recommendation: "Use a distinct H1 that reflects the unique purpose of each page.",
-        evidence: { h1, duplicates: rows.map((row) => row.url) },
+        evidence: { h1, ...duplicateEvidence(rows) },
       });
     }
   }
   for (const [, rows] of groupDuplicateValues(pages.filter((page) => page.indexable && page.wordCount >= 120), "contentFingerprint")) {
     for (const page of rows) {
-      pushScanIssue(issues, pageBucket(page.url), {
+      pushScanIssue(issues, {
         url: page.url,
         severity: "medium",
         category: "content",
         type: "duplicate-content",
         message: "Page body content is duplicated",
         recommendation: "Canonicalize, consolidate, or rewrite duplicate pages so each important URL has a distinct purpose.",
-        evidence: { duplicates: rows.map((row) => row.url) },
+        evidence: duplicateEvidence(rows),
       });
     }
   }
+  pushNearDuplicateIssues(issues, pages);
+  pushRobotsBlockedIssues(issues, pages, sitemap.urls || [], robotsCheck, robots.url);
   if (sitemapUrlSet.size > 0) {
     for (const page of pages.filter((item) => item.indexable)) {
       if (!sitemapUrlSet.has(normalizedUrlKey(page.finalUrl || page.url)) && !sitemapUrlSet.has(normalizedUrlKey(page.url))) {
-        pushScanIssue(issues, pageBucket(page.url), {
+        pushScanIssue(issues, {
           url: page.url,
           severity: "low",
           category: "sitemap",
@@ -3059,7 +4368,7 @@ async function runLocalScan(scanId: string) {
     }
     for (const page of pages.filter((item) => item.indexabilityReason === "noindex")) {
       if (sitemapUrlSet.has(normalizedUrlKey(page.finalUrl || page.url)) || sitemapUrlSet.has(normalizedUrlKey(page.url))) {
-        pushScanIssue(issues, pageBucket(page.url), {
+        pushScanIssue(issues, {
           url: page.url,
           severity: "medium",
           category: "sitemap",
@@ -3072,7 +4381,7 @@ async function runLocalScan(scanId: string) {
   }
   for (const page of pages.filter((item) => item.indexable && item.discovery === "sitemap" && Number(item.internalInlinks || 0) === 0)) {
     if (normalizedUrlKey(page.url) === normalizedUrlKey(startUrl)) continue;
-    pushScanIssue(issues, pageBucket(page.url), {
+    pushScanIssue(issues, {
       url: page.url,
       severity: "medium",
       category: "crawl",
@@ -3082,8 +4391,9 @@ async function runLocalScan(scanId: string) {
       evidence: { discovery: page.discovery, sitemapListed: page.sitemapListed },
     });
   }
-  if (pages.length === 0) {
-    pushScanIssue(issues, pageBucket(startUrl), {
+  // Failed pages have rows, but a scan where nothing answered has no evidence.
+  if (!pages.some((page) => !page.error)) {
+    pushScanIssue(issues, {
       url: startUrl,
       severity: "high",
       category: "crawl",
@@ -3092,6 +4402,7 @@ async function runLocalScan(scanId: string) {
       recommendation: "Check the scan URL, redirects, DNS, TLS, firewall rules, and whether the URL returns crawlable HTML.",
       evidence: {
         visitedUrls: visited.size,
+        failedPages: pages.length,
         sitemapUrls: (sitemap.urls || []).length,
         checkedLinks: checkedLinks.length,
         checkedImages: checkedImages.length,
@@ -3102,56 +4413,6 @@ async function runLocalScan(scanId: string) {
 
   phase = "completed";
   const score = healthScore(pages, issues);
-  const previousCandidate = all<any>(
-    `
-    SELECT id, created_at, url FROM scans
-    WHERE site_id = ?
-      AND status = 'completed'
-      AND rowid < (SELECT rowid FROM scans WHERE id = ?)
-    ORDER BY rowid DESC
-    LIMIT 50
-    `,
-    [scan.site_id, scanId],
-  ).find((row) => {
-    const candidate = String(row.url || "");
-    const candidateUrl = /^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`;
-    return normalizedUrlKey(candidateUrl) === normalizedUrlKey(startUrl);
-  });
-  const previousResultRow = previousCandidate
-    ? get<any>("SELECT result_json FROM scans WHERE id = ?", [previousCandidate.id])
-    : null;
-  const previousScan = previousCandidate && previousResultRow
-    ? { ...previousCandidate, result_json: previousResultRow.result_json }
-    : null;
-  const comparison = buildScanComparison(previousScan, pages, issues, limits);
-  const result = scanResult({
-    startUrl,
-    origin,
-    phase,
-    pages,
-    issues,
-    checkedLinks,
-    checkedImages,
-    checkedAssets,
-    imageInventory,
-    linkInventory,
-    parameterUrls,
-    robots,
-    sitemap,
-    limits,
-    comparison,
-  });
-  run(
-    `
-    UPDATE scans
-    SET status = 'completed',
-        score = ?,
-        pages_crawled = ?,
-        issue_count = ?,
-        result_json = ?,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-    `,
-    [score, pages.length, issues.length, JSON.stringify(result), scanId],
-  );
+  const comparison = buildScanComparison(previousCompletedScan(scan.site_id, scanId, startUrl), pages, issues, limits);
+  saveScanResult(scanId, scan.site_id, "completed", score, currentResult(comparison));
 }

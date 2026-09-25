@@ -1,12 +1,13 @@
 import * as cheerio from "cheerio";
-import Papa from "papaparse";
 import { randomUUID } from "node:crypto";
 import { parse as parseDomain } from "tldts";
-import { createAiJob } from "./codex";
-import { all, get, jsonParse, nowIso, run } from "./db";
+import { createAiJob, listAiJobs } from "./codex";
+import { type CsvRow, csvHasColumn, csvNumber, csvRow, csvText, normalizeCsvHeader, parseCsvRows } from "./csv";
+import { all, get, jsonParse, nowIso, run, transaction } from "./db";
 import { getConfigValue } from "./config";
 import { DEFAULT_KEYWORD_LANGUAGE_CODE, DEFAULT_KEYWORD_LOCATION_CODE } from "./defaults";
-import { fetchJson, fetchText } from "./http";
+import { badRequest, notFound } from "./errors";
+import { fetchJson } from "./http";
 import { clearIssueIgnores, clearScans, createIssueIgnore, deleteIssueIgnore, deleteScan, getScan, listAllScans, listIssueIgnores, listScans, sameSiteUrl, startScan } from "./scans";
 
 export { clearIssueIgnores, clearScans, createIssueIgnore, deleteIssueIgnore, deleteScan, getScan, listAllScans, listIssueIgnores, listScans, sameSiteUrl, startScan };
@@ -49,20 +50,36 @@ function stableNumber(input: string, min: number, max: number) {
   return min + (hash % (max - min + 1));
 }
 
-function normalizeDomain(value: string) {
-  return value
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .replace(/^www\./i, "")
-    .replace(/\/.*$/, "")
-    .toLowerCase();
+function parseHost(value: string) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return { hostname: url.hostname.toLowerCase().replace(/\.$/, "").replace(/^www\./, ""), port: url.port };
+  } catch {
+    return null;
+  }
 }
 
-// True when a SERP result host belongs to the tracked domain: exact match or a
-// subdomain of it. Dot-boundary check avoids "start.com" matching "art.com".
-function hostMatchesDomain(resultHost: string, target: string) {
-  const host = normalizeDomain(String(resultHost || ""));
-  const domain = normalizeDomain(String(target || ""));
+// A site's domain identity: the URL hostname (lowercased, no path, query, or
+// trailing dot) with a leading "www." removed, so www and the bare domain are
+// the same site everywhere domains are compared. A non-default port is kept
+// ("localhost:4131") because it addresses a different local server; default
+// ports disappear ("example.com:443" → "example.com"). Returns "" when the
+// value is not a hostname.
+export function normalizeDomain(value: string) {
+  const host = parseHost(value);
+  if (!host?.hostname) return "";
+  return host.port ? `${host.hostname}:${host.port}` : host.hostname;
+}
+
+// True when a SERP result host belongs to the tracked domain: the same site
+// (www and bare domain count as one, ports ignored) or a subdomain of it
+// (blog.example.com counts for example.com, not the reverse). The dot-boundary
+// check avoids "start.com" matching "art.com".
+export function hostMatchesDomain(resultHost: string, target: string) {
+  const host = parseHost(String(resultHost || ""))?.hostname || "";
+  const domain = parseHost(String(target || ""))?.hostname || "";
   if (!host || !domain) return false;
   return host === domain || host.endsWith(`.${domain}`);
 }
@@ -133,6 +150,48 @@ type WebSearchResult = {
   source: string;
 };
 
+type SearchOptions = {
+  depth: number;
+  locationCode?: number;
+  languageCode?: string;
+};
+
+// One provider answer. depthChecked is how many organic results were actually
+// inspected — lower than the requested depth when the provider ran out of
+// pages — so "not found" can be reported as "not in the top N checked".
+type SearchOutcome = {
+  rows: WebSearchResult[];
+  source: string;
+  locale: string;
+  depthChecked: number;
+};
+
+// Keyword-tool markets (the Google Ads location codes offered in the app)
+// mapped to ISO country codes for providers that accept a region. Unknown
+// codes search without a region rather than guessing one.
+const marketCountries: Record<number, string> = {
+  2840: "us",
+  2620: "pt",
+  2826: "gb",
+  2724: "es",
+  2250: "fr",
+  2276: "de",
+  2076: "br",
+  2124: "ca",
+};
+
+function searchLanguage(options: SearchOptions) {
+  return String(options.languageCode || "").trim().toLowerCase().slice(0, 2);
+}
+
+function searchCountry(options: SearchOptions) {
+  return marketCountries[Number(options.locationCode)] || "";
+}
+
+function maxSearchPages(depth: number) {
+  return Math.min(10, Math.ceil(depth / 10) + 1);
+}
+
 function normalizeSearchResult(item: any, rank: number, source: string): WebSearchResult | null {
   const url = String(item.url || item.link || item.href || item.target || "").trim();
   if (!url) return null;
@@ -146,78 +205,208 @@ function normalizeSearchResult(item: any, rank: number, source: string): WebSear
   };
 }
 
-async function searchOpenSerp(query: string, limit: number, engine = "duckduckgo") {
+// OpenSERP takes the depth as one limit and a language; it has no region or
+// device parameter.
+async function searchOpenSerp(query: string, options: SearchOptions): Promise<SearchOutcome | null> {
   const base = (getConfigValue("openserp_url") || process.env.OPENSERP_URL || "").replace(/\/$/, "");
   if (!base) return null;
-  const url = `${base}/${encodeURIComponent(engine)}/search?text=${encodeURIComponent(query)}&limit=${limit}`;
-  const response = await fetchJson(url);
-  if (!response.ok) throw new Error(`OpenSERP ${response.status}`);
+  const engine = "duckduckgo";
+  const params = new URLSearchParams({ text: query, limit: String(options.depth) });
+  const language = searchLanguage(options);
+  if (language) params.set("lang", language.toUpperCase());
+  const response = await fetchJson(`${base}/${engine}/search?${params}`);
+  if (response.status !== 200) throw new Error(`OpenSERP returned HTTP ${response.status}.`);
   const data = response.data || {};
-  const items =
-    data.results ||
-    data.items ||
-    data.organic ||
-    data.web ||
-    data.data?.results ||
-    [];
-  return (Array.isArray(items) ? items : [])
+  const items = data.results || data.items || data.organic || data.web || data.data?.results || [];
+  const rows = (Array.isArray(items) ? items : [])
     .map((item, index) => normalizeSearchResult(item, index + 1, `openserp:${engine}`))
-    .filter(Boolean) as WebSearchResult[];
+    .filter((row): row is WebSearchResult => Boolean(row))
+    .slice(0, options.depth);
+  if (!rows.length) throw new Error("OpenSERP returned no results.");
+  return { rows, source: `openserp:${engine}`, locale: language.toUpperCase(), depthChecked: rows.length };
 }
 
-async function searchSearxng(query: string, limit: number) {
+// SearXNG pages through results with pageno and takes a language-region code
+// such as "pt-PT"; it has no device parameter.
+async function searchSearxng(query: string, options: SearchOptions): Promise<SearchOutcome | null> {
   const base = (getConfigValue("searxng_url") || process.env.SEARXNG_URL || "").replace(/\/$/, "");
   if (!base) return null;
-  const url = `${base}/search?q=${encodeURIComponent(query)}&format=json`;
-  const response = await fetchJson(url);
-  if (!response.ok) throw new Error(`SearXNG ${response.status}`);
-  const data = response.data || {};
-  const items = data.results || data.items || data.organic || [];
-  return (Array.isArray(items) ? items : [])
-    .map((item, index) => normalizeSearchResult(
-      {
-        url: item.url || item.link,
-        title: item.title,
-        description: item.content || item.description || item.snippet,
-        domain: item.parsed_url?.[1] || item.domain,
-      },
-      index + 1,
-      "searxng",
-    ))
-    .filter(Boolean)
-    .slice(0, limit) as WebSearchResult[];
+  const language = searchLanguage(options);
+  const country = searchCountry(options);
+  const locale = language && country ? `${language}-${country.toUpperCase()}` : language;
+  const rows: WebSearchResult[] = [];
+  const seen = new Set<string>();
+  for (let page = 1; page <= maxSearchPages(options.depth) && rows.length < options.depth; page += 1) {
+    const params = new URLSearchParams({ q: query, format: "json", pageno: String(page) });
+    if (locale) params.set("language", locale);
+    let data: any;
+    try {
+      const response = await fetchJson(`${base}/search?${params}`);
+      if (response.status !== 200) throw new Error(`SearXNG returned HTTP ${response.status}.`);
+      data = response.data || {};
+    } catch (error) {
+      // A later page that fails leaves the depth checked at what was read.
+      if (page === 1) throw error;
+      break;
+    }
+    const items = Array.isArray(data.results) ? data.results : [];
+    let added = 0;
+    for (const item of items) {
+      const row = normalizeSearchResult(
+        {
+          url: item.url || item.link,
+          title: item.title,
+          description: item.content || item.description || item.snippet,
+          domain: item.parsed_url?.[1] || item.domain,
+        },
+        rows.length + 1,
+        "searxng",
+      );
+      if (!row || seen.has(row.url)) continue;
+      seen.add(row.url);
+      rows.push(row);
+      added += 1;
+    }
+    if (page === 1 && !added) {
+      const unresponsive = Array.isArray(data.unresponsive_engines)
+        ? data.unresponsive_engines.map((engine: unknown) => (Array.isArray(engine) ? engine.join(": ") : String(engine))).join(", ")
+        : "";
+      throw new Error(`SearXNG returned no results${unresponsive ? ` (unresponsive engines: ${unresponsive})` : ""}.`);
+    }
+    if (!added) break;
+  }
+  const checked = rows.slice(0, options.depth);
+  return { rows: checked, source: "searxng", locale, depthChecked: checked.length };
 }
 
-async function searchDuckDuckGo(query: string, limit: number) {
-  const response = await fetchText(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`);
-  if (!response.ok) throw new Error(`DuckDuckGo ${response.status}`);
-  const $ = cheerio.load(response.text);
+// DuckDuckGo's region codes pair a country with that market's language.
+function duckDuckGoRegion(options: SearchOptions) {
+  const country = searchCountry(options);
+  if (country === "ca") return searchLanguage(options) === "fr" ? "ca-fr" : "ca-en";
+  const regions: Record<string, string> = {
+    us: "us-en",
+    gb: "uk-en",
+    pt: "pt-pt",
+    br: "br-pt",
+    es: "es-es",
+    fr: "fr-fr",
+    de: "de-de",
+  };
+  return regions[country] || "wt-wt";
+}
+
+function duckDuckGoHtmlUrl() {
+  return process.env.DUCKDUCKGO_HTML_URL?.trim() || "https://html.duckduckgo.com/html/";
+}
+
+// Pause between DuckDuckGo requests. Bursts get rate limited, and a rate-limited
+// answer is a provider error, never a "not ranking" result.
+const DUCKDUCKGO_PAUSE_MS = 1000;
+
+async function fetchDuckDuckGoPage(url: string, form?: URLSearchParams) {
+  const response = await fetch(url, {
+    method: form ? "POST" : "GET",
+    body: form,
+    redirect: "follow",
+    signal: AbortSignal.timeout(15000),
+    headers: {
+      "User-Agent": "LocalSEO/0.1 (+https://localhost)",
+      Accept: "text/html,application/xhtml+xml",
+      ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+    },
+  });
+  return { status: response.status, url: response.url || url, text: await response.text() };
+}
+
+// Reads one DuckDuckGo HTML results page. Anything but HTTP 200 is an error:
+// DuckDuckGo answers rate-limited requests with 202 and an empty page, which
+// must not be read as "no results". Ads are skipped so positions count organic
+// results only.
+export function readDuckDuckGoPage(page: { status: number; url?: string; text: string }, firstRank = 1) {
+  if (page.status !== 200) {
+    throw new Error(
+      page.status === 202
+        ? "DuckDuckGo returned HTTP 202 (rate limited) instead of results."
+        : `DuckDuckGo returned HTTP ${page.status}.`,
+    );
+  }
+  const $ = cheerio.load(page.text);
   const rows: WebSearchResult[] = [];
   $(".result").each((_, element) => {
-    if (rows.length >= limit) return false;
+    if ($(element).is(".result--ad")) return;
     const link = $(element).find("a.result__a").first();
-    const rawHref = link.attr("href") || "";
-    const url = decodeDuckDuckGoHref(rawHref);
+    const url = decodeDuckDuckGoHref(link.attr("href") || "");
     const domain = normalizeDomain(url);
     if (!url || !domain) return;
     rows.push({
-      rank: rows.length + 1,
+      rank: firstRank + rows.length,
       domain,
       url,
-      title: link.text().replace(/\s+/g, " ").trim(),
-      description: $(element).find(".result__snippet").text().replace(/\s+/g, " ").trim(),
+      title: cleanText(link.text()),
+      description: cleanText($(element).find(".result__snippet").text()),
       source: "duckduckgo",
     });
   });
-  return rows;
+  const nextForm = $("form")
+    .filter((_, form) => $(form).find('input[type="submit"]').toArray().some((input) => /next/i.test($(input).attr("value") || "")))
+    .first();
+  const next = nextForm.length
+    ? {
+        action: new URL(nextForm.attr("action") || "", page.url || duckDuckGoHtmlUrl()).toString(),
+        fields: new URLSearchParams(
+          nextForm
+            .find('input[type="hidden"]')
+            .toArray()
+            .map((input) => [$(input).attr("name") || "", $(input).attr("value") || ""] as [string, string])
+            .filter(([name]) => name),
+        ),
+      }
+    : null;
+  return { rows, next };
 }
 
-async function searchWeb(query: string, limit: number) {
-  const openSerpRows = await searchOpenSerp(query, limit).catch(() => null);
-  if (openSerpRows?.length) return openSerpRows.slice(0, limit);
-  const searxngRows = await searchSearxng(query, limit).catch(() => null);
-  if (searxngRows?.length) return searxngRows.slice(0, limit);
-  return searchDuckDuckGo(query, limit);
+// DuckDuckGo HTML has no device parameter; region comes from kl. Deeper pages
+// are fetched through the page's own "Next" form until the depth is reached.
+async function searchDuckDuckGo(query: string, options: SearchOptions): Promise<SearchOutcome> {
+  const region = duckDuckGoRegion(options);
+  const url = new URL(duckDuckGoHtmlUrl());
+  url.searchParams.set("q", query);
+  url.searchParams.set("kl", region);
+  let page = readDuckDuckGoPage(await fetchDuckDuckGoPage(url.toString()));
+  if (!page.rows.length) {
+    throw new Error("DuckDuckGo returned a page without results (likely rate limited or blocked).");
+  }
+  const rows = [...page.rows];
+  for (let pageNumber = 2; pageNumber <= maxSearchPages(options.depth) && rows.length < options.depth && page.next; pageNumber += 1) {
+    await Bun.sleep(DUCKDUCKGO_PAUSE_MS);
+    try {
+      page = readDuckDuckGoPage(await fetchDuckDuckGoPage(page.next.action, page.next.fields), rows.length + 1);
+    } catch {
+      // A later page that fails leaves the depth checked at what was read.
+      break;
+    }
+    if (!page.rows.length) break;
+    rows.push(...page.rows);
+  }
+  const checked = rows.slice(0, options.depth);
+  return { rows: checked, source: "duckduckgo", locale: region, depthChecked: checked.length };
+}
+
+// Configured self-hosted providers first, then the built-in DuckDuckGo
+// fallback. A provider that errors or returns nothing hands over to the next;
+// when all fail the combined error is thrown so callers never mistake a
+// provider failure for "no results".
+async function searchWeb(query: string, options: SearchOptions): Promise<SearchOutcome> {
+  const errors: string[] = [];
+  for (const provider of [searchOpenSerp, searchSearxng, searchDuckDuckGo]) {
+    try {
+      const outcome = await provider(query, options);
+      if (outcome) return outcome;
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new Error(`Search failed: ${errors.join(" ")}`);
 }
 
 export function listSites() {
@@ -228,12 +417,36 @@ export function getSite(siteId: string) {
   return get<Site>("SELECT * FROM sites WHERE id = ?", [siteId]);
 }
 
+// Optional text field from a request body: undefined when absent, 400 when
+// present with the wrong type.
+function optionalText(value: unknown, field: string) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw badRequest(`${field} must be text.`);
+  return value.trim();
+}
+
+// A domain field from a request: "" when blank, 400 when it is not a hostname.
+function domainInput(value: unknown) {
+  const text = optionalText(value, "Domain");
+  if (!text) return "";
+  const domain = normalizeDomain(text);
+  if (!domain) throw badRequest(`"${text}" is not a valid domain.`);
+  return domain;
+}
+
+function optionalLocationCode(value: unknown) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const code = Number(value);
+  if (!Number.isInteger(code) || code <= 0) throw badRequest("Location code must be a positive number.");
+  return code;
+}
+
 export function createSite(input: {
-  name: string;
-  domain?: string;
-  notes?: string;
-  locationCode?: number;
-  languageCode?: string;
+  name?: unknown;
+  domain?: unknown;
+  notes?: unknown;
+  locationCode?: unknown;
+  languageCode?: unknown;
   crawlProtocol?: CrawlProtocol | string;
   crawlHost?: CrawlHost | string;
   crawlSpeed?: CrawlSpeed | string;
@@ -244,10 +457,11 @@ export function createSite(input: {
   crawl_max_pages?: number;
 }) {
   const id = randomUUID();
-  const domain = normalizeDomain(input.domain || "");
-  const name = input.name.trim() || domain || "Untitled site";
-  const locationCode = Number(input.locationCode || defaultLocationCode());
-  const languageCode = input.languageCode || defaultLanguageCode();
+  const domain = domainInput(input.domain);
+  const name = optionalText(input.name, "Site name") || domain;
+  if (!name) throw badRequest("A site name or domain is required.");
+  const locationCode = optionalLocationCode(input.locationCode) || defaultLocationCode();
+  const languageCode = optionalText(input.languageCode, "Language code") || defaultLanguageCode();
   const crawlProtocol = normalizeCrawlProtocol(
     input.crawlProtocol ?? input.crawl_protocol ?? getConfigValue("default_crawl_protocol"),
   );
@@ -263,7 +477,7 @@ export function createSite(input: {
       id,
       name,
       domain,
-      input.notes?.trim() || "",
+      optionalText(input.notes, "Notes") || "",
       locationCode,
       languageCode,
       crawlProtocol,
@@ -275,15 +489,11 @@ export function createSite(input: {
   return getSite(id)!;
 }
 
-export function updateSite(siteId: string, input: Partial<Site>) {
+export function updateSite(siteId: string, input: Record<string, unknown>) {
   const existing = getSite(siteId);
-  if (!existing) throw new Error("Site not found.");
-  const body = input as Partial<Site> & {
-    crawlProtocol?: CrawlProtocol | string;
-    crawlHost?: CrawlHost | string;
-    crawlSpeed?: CrawlSpeed | string;
-    crawlMaxPages?: number;
-  };
+  if (!existing) throw notFound("Site not found.");
+  const name = optionalText(input.name, "Site name");
+  if (name === "") throw badRequest("Site name cannot be empty.");
   run(
     `
     UPDATE sites
@@ -291,15 +501,15 @@ export function updateSite(siteId: string, input: Partial<Site>) {
     WHERE id = ?
     `,
     [
-      input.name ?? existing.name,
-      normalizeDomain(input.domain ?? existing.domain),
-      input.notes ?? existing.notes,
-      input.location_code ?? existing.location_code,
-      input.language_code ?? existing.language_code,
-      normalizeCrawlProtocol(body.crawl_protocol ?? body.crawlProtocol ?? existing.crawl_protocol),
-      normalizeCrawlHost(body.crawl_host ?? body.crawlHost ?? existing.crawl_host),
-      normalizeCrawlSpeed(body.crawl_speed ?? body.crawlSpeed ?? existing.crawl_speed),
-      normalizeCrawlMaxPages(body.crawl_max_pages ?? body.crawlMaxPages ?? existing.crawl_max_pages),
+      name ?? existing.name,
+      input.domain === undefined ? existing.domain : domainInput(input.domain),
+      optionalText(input.notes, "Notes") ?? existing.notes,
+      optionalLocationCode(input.location_code) ?? existing.location_code,
+      optionalText(input.language_code, "Language code") || existing.language_code,
+      normalizeCrawlProtocol(input.crawl_protocol ?? input.crawlProtocol ?? existing.crawl_protocol),
+      normalizeCrawlHost(input.crawl_host ?? input.crawlHost ?? existing.crawl_host),
+      normalizeCrawlSpeed(input.crawl_speed ?? input.crawlSpeed ?? existing.crawl_speed),
+      normalizeCrawlMaxPages(input.crawl_max_pages ?? input.crawlMaxPages ?? existing.crawl_max_pages),
       siteId,
     ],
   );
@@ -352,12 +562,28 @@ function publicSerpResult(result: any) {
   };
 }
 
+// Older lookups stored the per-name result counts as "shareOfVoice" and a
+// "visibility" count shown as a percentage. Both were only counts of returned
+// search results, so history is served under the honest names.
 function publicBrandLookupResult(result: any) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const { shareOfVoice, ...rest } = result;
   return {
-    ...result,
+    ...rest,
     resolvedEntity: result.resolvedEntity || "",
-    shareOfVoice: result.shareOfVoice,
+    resultCounts:
+      result.resultCounts ??
+      (Array.isArray(shareOfVoice) ? shareOfVoice : []).map((row: any) => ({
+        label: row.label,
+        isPrimary: Boolean(row.isPrimary),
+        resultCount: row.value ?? null,
+        maxResults: BRAND_LOOKUP_RESULTS,
+      })),
+    platforms: (Array.isArray(result.platforms) ? result.platforms : []).map((platform: any) => ({
+      platform: platform.platform,
+      resultCount: platform.resultCount ?? platform.mentions ?? null,
+      citations: platform.citations || [],
+    })),
   };
 }
 
@@ -392,9 +618,9 @@ export async function researchKeywords(input: {
   limit?: number;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
-  const query = input.query.trim();
-  if (!query) throw new Error("Keyword query is required.");
+  if (!site) throw notFound("Site not found.");
+  const query = optionalText(input.query, "Keyword query") || "";
+  if (!query) throw badRequest("Keyword query is required.");
   const locationCode = input.locationCode || site.location_code;
   const languageCode = input.languageCode || site.language_code;
   const limit = Math.max(5, Math.min(100, input.limit || 25));
@@ -429,7 +655,7 @@ export function saveKeywords(input: {
   source?: string;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const tagNames = parseList(input.tags).map(normalizeTagName).filter(Boolean);
   for (const tag of tagNames) ensureSavedKeywordTag(site.id, tag);
   const saved = [];
@@ -499,28 +725,34 @@ type ImportedKeywordMetricRow = {
   intent: string;
 };
 
+const keywordColumnAliases = ["keyword", "query", "search term", "search_term", "term"];
+
+// Search Console "impressions" are deliberately not a volume alias: impressions
+// count how often this site was shown, not how often the keyword was searched.
 function parseKeywordMetricsCsv(csv: string) {
-  const parsed = Papa.parse<Record<string, unknown>>(csv, {
-    header: true,
-    skipEmptyLines: true,
-  });
-  if (parsed.errors.length) {
-    const firstError = parsed.errors[0];
-    throw new Error(`Keyword metrics CSV could not be parsed: ${firstError.message}`);
+  const { fields, rows } = parseCsvRows(csv, "Keyword metrics CSV");
+  const [onlyField] = fields;
+  const headerIsKeywordColumn = keywordColumnAliases.some(
+    (alias) => normalizeCsvHeader(alias) === normalizeCsvHeader(onlyField || ""),
+  );
+  // A plain one-column keyword list may have no header: its first line is a
+  // keyword too, not a column name.
+  if (fields.length === 1 && !headerIsKeywordColumn) {
+    return [onlyField, ...rows.map((row) => String(row[onlyField] ?? ""))].map((keyword) => ({ keyword }));
   }
-  return parsed.data.filter((row) => Object.values(row).some((value) => String(value ?? "").trim()));
+  return rows;
 }
 
 function normalizeImportedKeywordMetricRow(raw: Record<string, unknown>): ImportedKeywordMetricRow | null {
-  const row = normalizedCsvRow(raw);
-  const keyword = csvField(row, ["keyword", "query", "search term", "search_term", "term"]);
+  const row = csvRow(raw);
+  const keyword = csvText(row, keywordColumnAliases);
   if (!keyword) return null;
   return {
     keyword,
-    searchVolume: csvNumber(row, ["search volume", "search_volume", "volume", "avg monthly searches", "monthly searches", "impressions"]),
+    searchVolume: csvNumber(row, ["search volume", "search_volume", "volume", "avg monthly searches", "monthly searches"]),
     difficulty: csvNumber(row, ["difficulty", "keyword difficulty", "keyword_difficulty", "kd", "seo difficulty"]),
     cpc: csvNumber(row, ["cpc", "cost per click", "cost_per_click", "avg cpc", "average cpc"]),
-    intent: csvField(row, ["intent", "search intent", "main intent"]) || "unknown",
+    intent: csvText(row, ["intent", "search intent", "main intent"]) || "unknown",
   };
 }
 
@@ -550,104 +782,128 @@ export function listKeywordMetricImports(siteId: string) {
   ).map(mapKeywordMetricImport);
 }
 
+function importRows(input: { csv?: unknown; rows?: unknown }, parse: (csv: string) => Record<string, unknown>[]) {
+  if (typeof input.csv === "string" && input.csv.trim()) return parse(input.csv);
+  if (input.csv !== undefined && typeof input.csv !== "string") throw badRequest("csv must be text.");
+  if (input.rows === undefined) return [];
+  if (!Array.isArray(input.rows)) throw badRequest("rows must be an array.");
+  return input.rows.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object");
+}
+
 export function importKeywordMetricsCsv(input: {
   siteId?: string;
   sourceName?: string;
-  csv?: string;
-  rows?: Record<string, unknown>[];
+  csv?: unknown;
+  rows?: unknown;
 }) {
   const site = getSite(String(input.siteId || ""));
-  if (!site) throw new Error("Site not found.");
-  const rawRows = input.csv ? parseKeywordMetricsCsv(input.csv) : input.rows || [];
-  const rows = rawRows
+  if (!site) throw notFound("Site not found.");
+  const rows = importRows(input, parseKeywordMetricsCsv)
     .map(normalizeImportedKeywordMetricRow)
     .filter((row): row is ImportedKeywordMetricRow => Boolean(row));
-  if (!rows.length) throw new Error("Import file has no keyword metric rows.");
+  if (!rows.length) throw badRequest("Import file has no keyword metric rows.");
 
-  let insertedCount = 0;
-  let updatedCount = 0;
-  for (const row of rows) {
-    const existing = get<any>(
-      "SELECT * FROM saved_keywords WHERE site_id = ? AND lower(keyword) = lower(?) AND location_code = ? AND language_code = ?",
-      [site.id, row.keyword, site.location_code, site.language_code],
-    );
-    const nextIntent = row.intent && row.intent !== "unknown" ? row.intent : existing?.intent || "unknown";
-    if (existing) {
-      run(
-        `
-        UPDATE saved_keywords
-        SET search_volume = ?, difficulty = ?, cpc = ?, intent = ?, source = ?
-        WHERE id = ?
-        `,
-        [
-          row.searchVolume ?? existing.search_volume,
-          row.difficulty ?? existing.difficulty,
-          row.cpc ?? existing.cpc,
-          nextIntent,
-          "keyword-metrics-import",
-          existing.id,
-        ],
-      );
-      updatedCount += 1;
-    } else {
-      run(
-        `
-        INSERT INTO saved_keywords
-          (id, site_id, keyword, location_code, language_code, search_volume, difficulty, cpc, intent, tags, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)
-        `,
-        [
-          randomUUID(),
-          site.id,
-          row.keyword,
-          site.location_code,
-          site.language_code,
-          row.searchVolume,
-          row.difficulty,
-          row.cpc,
-          nextIntent,
-          "keyword-metrics-import",
-        ],
-      );
-      insertedCount += 1;
+  return transaction(() => {
+    // Keywords match case-insensitively; both maps are built once instead of
+    // scanning saved_keywords / rank_keywords for every imported row.
+    const savedByKeyword = new Map<string, any>();
+    for (const saved of all<any>(
+      "SELECT * FROM saved_keywords WHERE site_id = ? AND location_code = ? AND language_code = ?",
+      [site.id, site.location_code, site.language_code],
+    )) {
+      savedByKeyword.set(saved.keyword.toLowerCase(), saved);
     }
+    const rankKeywordIds = new Map<string, string[]>();
+    for (const rankKeyword of all<{ id: string; keyword: string }>(
+      `
+      SELECT rk.id, rk.keyword
+      FROM rank_keywords rk
+      JOIN rank_trackers rt ON rt.id = rk.tracker_id
+      WHERE rt.site_id = ? AND rt.location_code = ? AND rt.language_code = ?
+      `,
+      [site.id, site.location_code, site.language_code],
+    )) {
+      const key = rankKeyword.keyword.toLowerCase();
+      rankKeywordIds.set(key, [...(rankKeywordIds.get(key) || []), rankKeyword.id]);
+    }
+
+    let insertedCount = 0;
+    let updatedCount = 0;
+    for (const row of rows) {
+      const key = row.keyword.toLowerCase();
+      const existing = savedByKeyword.get(key);
+      const next = {
+        search_volume: row.searchVolume ?? existing?.search_volume ?? null,
+        difficulty: row.difficulty ?? existing?.difficulty ?? null,
+        cpc: row.cpc ?? existing?.cpc ?? null,
+        intent: row.intent && row.intent !== "unknown" ? row.intent : existing?.intent || "unknown",
+      };
+      if (existing) {
+        run(
+          "UPDATE saved_keywords SET search_volume = ?, difficulty = ?, cpc = ?, intent = ?, source = ? WHERE id = ?",
+          [next.search_volume, next.difficulty, next.cpc, next.intent, "keyword-metrics-import", existing.id],
+        );
+        savedByKeyword.set(key, { ...existing, ...next });
+        updatedCount += 1;
+      } else {
+        const id = randomUUID();
+        run(
+          `
+          INSERT INTO saved_keywords
+            (id, site_id, keyword, location_code, language_code, search_volume, difficulty, cpc, intent, tags, source)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)
+          `,
+          [
+            id,
+            site.id,
+            row.keyword,
+            site.location_code,
+            site.language_code,
+            next.search_volume,
+            next.difficulty,
+            next.cpc,
+            next.intent,
+            "keyword-metrics-import",
+          ],
+        );
+        savedByKeyword.set(key, { id, keyword: row.keyword, ...next });
+        insertedCount += 1;
+      }
+      if (row.searchVolume === null && row.difficulty === null && row.cpc === null) continue;
+      for (const rankKeywordId of rankKeywordIds.get(key) || []) {
+        run(
+          `
+          UPDATE rank_keywords
+          SET search_volume = COALESCE(?, search_volume),
+              keyword_difficulty = COALESCE(?, keyword_difficulty),
+              cpc = COALESCE(?, cpc),
+              metrics_fetched_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+          `,
+          [row.searchVolume, row.difficulty, row.cpc, rankKeywordId],
+        );
+      }
+    }
+
+    const id = randomUUID();
     run(
       `
-      UPDATE rank_keywords
-      SET search_volume = COALESCE(?, search_volume),
-          keyword_difficulty = COALESCE(?, keyword_difficulty),
-          cpc = COALESCE(?, cpc),
-          metrics_fetched_at = CURRENT_TIMESTAMP
-      WHERE lower(keyword) = lower(?)
-        AND tracker_id IN (
-          SELECT id FROM rank_trackers
-          WHERE site_id = ?
-            AND location_code = ?
-            AND language_code = ?
-        )
+      INSERT INTO keyword_metric_imports
+        (id, site_id, source_name, row_count, inserted_count, updated_count, rows_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
-      [row.searchVolume, row.difficulty, row.cpc, row.keyword, site.id, site.location_code, site.language_code],
+      [
+        id,
+        site.id,
+        String(input.sourceName || "Keyword metrics CSV").slice(0, 160),
+        rows.length,
+        insertedCount,
+        updatedCount,
+        JSON.stringify(rows),
+      ],
     );
-  }
-
-  const id = randomUUID();
-  run(
-    `
-    INSERT INTO keyword_metric_imports
-      (id, site_id, source_name, row_count, inserted_count, updated_count, rows_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    `,
-    [
-      id,
-      site.id,
-      String(input.sourceName || "Keyword metrics CSV").slice(0, 160),
-      rows.length,
-      insertedCount,
-      updatedCount,
-      JSON.stringify(rows),
-    ],
-  );
-  return mapKeywordMetricImport(get<any>("SELECT * FROM keyword_metric_imports WHERE id = ?", [id]));
+    return mapKeywordMetricImport(get<any>("SELECT * FROM keyword_metric_imports WHERE id = ?", [id]));
+  });
 }
 
 export function listSavedKeywords(siteId: string) {
@@ -659,7 +915,7 @@ export function listSavedKeywords(siteId: string) {
 
 export function ensureSavedKeywordTag(siteId: string, name: string, color?: string) {
   const cleanName = normalizeTagName(name);
-  if (!cleanName) throw new Error("Tag name is required.");
+  if (!cleanName) throw badRequest("Tag name is required.");
   const existing = get<any>(
     "SELECT * FROM saved_keyword_tags WHERE site_id = ? AND lower(name) = lower(?)",
     [siteId, cleanName],
@@ -706,7 +962,7 @@ export function querySavedKeywords(input: {
   order?: string;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const search = String(input.search || "").trim().toLowerCase();
   const includeTerms = parseList(input.includeTerms).map((item) => item.toLowerCase());
   const excludeTerms = parseList(input.excludeTerms).map((item) => item.toLowerCase());
@@ -774,7 +1030,7 @@ export function updateSavedKeywordTags(input: {
   removeTagIds?: string[];
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const addTags = parseList(input.addTags).map(normalizeTagName).filter(Boolean);
   const removeTagNames = new Set(parseList(input.removeTagNames).map(normalizeTagName));
   for (const tagId of input.removeTagIds || []) {
@@ -802,12 +1058,12 @@ export function updateSavedKeywordTag(input: {
   color?: string | null;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const tag = get<any>("SELECT * FROM saved_keyword_tags WHERE id = ? AND site_id = ?", [
     input.tagId,
     site.id,
   ]);
-  if (!tag) throw new Error("Tag not found.");
+  if (!tag) throw notFound("Tag not found.");
   const nextName = input.name ? normalizeTagName(input.name) : tag.name;
   const nextColor = input.color || tag.color || pickTagColor(nextName);
   run(
@@ -826,12 +1082,12 @@ export function updateSavedKeywordTag(input: {
 
 export function deleteSavedKeywordTag(input: { siteId: string; tagId: string }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const tag = get<any>("SELECT * FROM saved_keyword_tags WHERE id = ? AND site_id = ?", [
     input.tagId,
     site.id,
   ]);
-  if (!tag) throw new Error("Tag not found.");
+  if (!tag) throw notFound("Tag not found.");
   for (const keyword of listSavedKeywords(site.id)) {
     if (!keyword.tags.includes(tag.name)) continue;
     const tags = keyword.tags.filter((item: string) => item !== tag.name);
@@ -843,7 +1099,7 @@ export function deleteSavedKeywordTag(input: { siteId: string; tagId: string }) 
 
 export function removeSavedKeywords(siteId: string, savedKeywordIds: string[]) {
   const site = getSite(siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   let removed = 0;
   for (const id of savedKeywordIds || []) {
     const info = run("DELETE FROM saved_keywords WHERE id = ? AND site_id = ?", [id, site.id]);
@@ -852,49 +1108,126 @@ export function removeSavedKeywords(siteId: string, savedKeywordIds: string[]) {
   return { removed };
 }
 
+// Runs listed with each tracker. Older runs stay in SQLite and are paged
+// through listRankRuns; runCount always reports the full total.
+const RANK_RUN_HISTORY_LIMIT = 100;
+
+type RankRunError = { keywordId: string; keyword: string; error: string };
+
+function requireTracker(trackerId: string) {
+  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [trackerId]);
+  if (!tracker) throw notFound("Tracker not found.");
+  return tracker;
+}
+
+function publicRankRun(row: any) {
+  const { errors_json, history_rank: _historyRank, run_total: _runTotal, ...rest } = row;
+  return { ...rest, errors: jsonParse<RankRunError[]>(errors_json, []) };
+}
+
+function groupByTracker<T extends { tracker_id: string }>(rows: T[]) {
+  const groups = new Map<string, T[]>();
+  for (const row of rows) {
+    const group = groups.get(row.tracker_id);
+    if (group) group.push(row);
+    else groups.set(row.tracker_id, [row]);
+  }
+  return groups;
+}
+
+// The latest check of each keyword still on its tracker, from completed runs
+// only. Partial and failed runs stay visible in run and keyword history but
+// never replace a keyword's latest position or feed the trend. Removed
+// keywords drop out because their snapshots lose keyword_id.
+function latestRankSnapshots(siteId: string) {
+  return all<any>(
+    `
+    SELECT * FROM (
+      SELECT rs.*, ROW_NUMBER() OVER (
+        PARTITION BY rs.keyword_id
+        ORDER BY rs.checked_at DESC, rr.started_at DESC, rs.rowid DESC
+      ) AS latest_rank
+      FROM rank_snapshots rs
+      JOIN rank_runs rr ON rr.id = rs.run_id AND rr.status = 'completed'
+      JOIN rank_keywords rk ON rk.id = rs.keyword_id AND rk.tracker_id = rs.tracker_id
+      JOIN rank_trackers rt ON rt.id = rs.tracker_id
+      WHERE rt.site_id = ?
+    )
+    WHERE latest_rank = 1
+    ORDER BY position IS NULL, position ASC, keyword ASC
+    `,
+    [siteId],
+  ).map(({ latest_rank: _latestRank, ...row }) => row);
+}
+
 export function listRankTrackers(siteId: string) {
   const trackers = all<any>(
     "SELECT * FROM rank_trackers WHERE site_id = ? ORDER BY created_at DESC",
     [siteId],
   );
-  return trackers.map((tracker) => ({
-    ...tracker,
-    keywords: all<any>("SELECT * FROM rank_keywords WHERE tracker_id = ? ORDER BY keyword", [
-      tracker.id,
-    ]),
-    runs: all<any>(
-      "SELECT * FROM rank_runs WHERE tracker_id = ? ORDER BY started_at DESC",
-      [tracker.id],
-    ),
-    latest: all<any>(
+  if (!trackers.length) return [];
+  const keywords = groupByTracker(
+    all<any>(
       `
-      SELECT rs.*
-      FROM rank_snapshots rs
-      JOIN (
-        SELECT keyword, max(checked_at) AS checked_at
-        FROM rank_snapshots
-        WHERE tracker_id = ?
-        GROUP BY keyword
-      ) latest ON latest.keyword = rs.keyword AND latest.checked_at = rs.checked_at
-      WHERE rs.tracker_id = ?
-      ORDER BY rs.position IS NULL, rs.position ASC
+      SELECT rk.* FROM rank_keywords rk
+      JOIN rank_trackers rt ON rt.id = rk.tracker_id
+      WHERE rt.site_id = ?
+      ORDER BY rk.keyword
       `,
-      [tracker.id, tracker.id],
+      [siteId],
     ),
-  }));
+  );
+  const runs = groupByTracker(
+    all<any>(
+      `
+      SELECT * FROM (
+        SELECT rr.*,
+          ROW_NUMBER() OVER (PARTITION BY rr.tracker_id ORDER BY rr.started_at DESC, rr.rowid DESC) AS history_rank,
+          COUNT(*) OVER (PARTITION BY rr.tracker_id) AS run_total
+        FROM rank_runs rr
+        JOIN rank_trackers rt ON rt.id = rr.tracker_id
+        WHERE rt.site_id = ?
+      )
+      WHERE history_rank <= ?
+      ORDER BY started_at DESC, history_rank ASC
+      `,
+      [siteId, RANK_RUN_HISTORY_LIMIT],
+    ),
+  );
+  const latest = groupByTracker(latestRankSnapshots(siteId));
+  return trackers.map((tracker) => {
+    const trackerRuns = runs.get(tracker.id) || [];
+    return {
+      ...tracker,
+      keywords: keywords.get(tracker.id) || [],
+      runs: trackerRuns.map(publicRankRun),
+      runCount: Number(trackerRuns[0]?.run_total || 0),
+      latest: latest.get(tracker.id) || [],
+    };
+  });
+}
+
+function rankTrackerView(tracker: any) {
+  return listRankTrackers(tracker.site_id).find((item) => item.id === tracker.id);
+}
+
+function serpDepth(value: unknown) {
+  return Math.max(10, Math.min(100, Math.round(Number(value)) || 50));
 }
 
 export function createRankTracker(input: {
   siteId: string;
-  domain: string;
-  keywords: string[];
-  locationCode?: number;
-  languageCode?: string;
-  device?: string;
-  depth?: number;
+  domain?: unknown;
+  keywords?: unknown;
+  locationCode?: unknown;
+  languageCode?: unknown;
+  device?: unknown;
+  depth?: unknown;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
+  const domain = domainInput(input.domain) || site.domain;
+  if (!domain) throw badRequest("Domain is required.");
   const id = randomUUID();
   run(
     `
@@ -905,15 +1238,15 @@ export function createRankTracker(input: {
     [
       id,
       site.id,
-      normalizeDomain(input.domain || site.domain),
-      input.locationCode || site.location_code,
-      input.languageCode || site.language_code,
-      input.device || "desktop",
-      input.depth || 50,
+      domain,
+      optionalLocationCode(input.locationCode) || site.location_code,
+      optionalText(input.languageCode, "Language code") || site.language_code,
+      input.device === "mobile" ? "mobile" : "desktop",
+      serpDepth(input.depth),
     ],
   );
   addRankKeywords(id, input.keywords);
-  return listRankTrackers(site.id).find((tracker) => tracker.id === id);
+  return rankTrackerView({ id, site_id: site.id });
 }
 
 function savedKeywordMetricsForTracker(tracker: any, keyword: string) {
@@ -936,12 +1269,9 @@ function hasImportedKeywordMetrics(metrics: any) {
   return metrics && (metrics.search_volume != null || metrics.difficulty != null || metrics.cpc != null);
 }
 
-export function addRankKeywords(trackerId: string, keywords: string[]) {
-  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [trackerId]);
-  if (!tracker) throw new Error("Tracker not found.");
-  for (const raw of keywords) {
-    const keyword = raw.trim();
-    if (!keyword) continue;
+export function addRankKeywords(trackerId: string, keywords: unknown) {
+  const tracker = requireTracker(trackerId);
+  for (const keyword of parseList(keywords)) {
     const metrics = savedKeywordMetricsForTracker(tracker, keyword);
     const hasMetrics = hasImportedKeywordMetrics(metrics);
     run(
@@ -964,62 +1294,65 @@ export function addRankKeywords(trackerId: string, keywords: string[]) {
   }
 }
 
-export function removeRankKeywords(trackerId: string, keywordIds: string[]) {
-  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [trackerId]);
-  if (!tracker) throw new Error("Tracker not found.");
+export function removeRankKeywords(trackerId: string, keywordIds: unknown) {
+  const tracker = requireTracker(trackerId);
+  if (!Array.isArray(keywordIds)) throw badRequest("keywordIds must be an array.");
   let removed = 0;
-  for (const id of keywordIds || []) {
-    const info = run("DELETE FROM rank_keywords WHERE id = ? AND tracker_id = ?", [id, trackerId]);
+  for (const id of keywordIds) {
+    const info = run("DELETE FROM rank_keywords WHERE id = ? AND tracker_id = ?", [String(id), trackerId]);
     removed += Number(info.changes || 0);
   }
-  return { removed, tracker: listRankTrackers(tracker.site_id).find((item) => item.id === trackerId) };
+  return { removed, tracker: rankTrackerView(tracker) };
+}
+
+function historyDays(sinceDays: number | undefined) {
+  return Math.max(1, Math.min(730, Math.round(Number(sinceDays)) || 365));
 }
 
 export function getRankKeywordHistory(input: { trackerId: string; keywordId: string; sinceDays?: number }) {
-  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [input.trackerId]);
-  if (!tracker) throw new Error("Tracker not found.");
-  const sinceDays = Math.max(1, Math.min(730, input.sinceDays || 365));
+  requireTracker(input.trackerId);
   return all<any>(
     `
-    SELECT position, url, title, checked_at
-    FROM rank_snapshots
-    WHERE tracker_id = ?
-      AND keyword_id = ?
-      AND checked_at >= datetime('now', ?)
-    ORDER BY checked_at ASC
+    SELECT rs.run_id, rs.position, rs.url, rs.title, rs.checked_at, rs.depth_checked, rs.source, rr.status AS run_status
+    FROM rank_snapshots rs
+    JOIN rank_runs rr ON rr.id = rs.run_id
+    WHERE rs.tracker_id = ?
+      AND rs.keyword_id = ?
+      AND rs.checked_at >= datetime('now', ?)
+    ORDER BY rs.checked_at ASC
     `,
-    [input.trackerId, input.keywordId, `-${sinceDays} days`],
+    [input.trackerId, input.keywordId, `-${historyDays(input.sinceDays)} days`],
   );
 }
 
+// One point per completed run. notRanking counts keywords not found within the
+// depth that run actually checked.
 export function getRankTrackerTrend(trackerId: string, sinceDays = 365) {
-  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [trackerId]);
-  if (!tracker) throw new Error("Tracker not found.");
-  const runs = all<any>(
+  requireTracker(trackerId);
+  return all<any>(
     `
-    SELECT * FROM rank_runs
-    WHERE tracker_id = ?
-      AND started_at >= datetime('now', ?)
-    ORDER BY started_at ASC
+    SELECT
+      rr.id AS runId,
+      COALESCE(rr.finished_at, rr.started_at) AS checkedAt,
+      COUNT(rs.id) AS checked,
+      COALESCE(SUM(rs.position <= 3), 0) AS top3,
+      COALESCE(SUM(rs.position <= 10), 0) AS top10,
+      COALESCE(SUM(rs.position <= 20), 0) AS top20,
+      COALESCE(SUM(rs.id IS NOT NULL AND rs.position IS NULL), 0) AS notRanking
+    FROM rank_runs rr
+    LEFT JOIN rank_snapshots rs ON rs.run_id = rr.id
+    WHERE rr.tracker_id = ?
+      AND rr.status = 'completed'
+      AND rr.started_at >= datetime('now', ?)
+    GROUP BY rr.id
+    ORDER BY rr.started_at ASC
     `,
-    [trackerId, `-${Math.max(1, Math.min(730, sinceDays))} days`],
+    [trackerId, `-${historyDays(sinceDays)} days`],
   );
-  return runs.map((rankRun) => {
-    const rows = all<any>("SELECT * FROM rank_snapshots WHERE run_id = ?", [rankRun.id]);
-    return {
-      runId: rankRun.id,
-      checkedAt: rankRun.finished_at || rankRun.started_at,
-      top3: rows.filter((row) => row.position != null && row.position <= 3).length,
-      top10: rows.filter((row) => row.position != null && row.position <= 10).length,
-      top20: rows.filter((row) => row.position != null && row.position <= 20).length,
-      notRanking: rows.filter((row) => row.position == null).length,
-    };
-  });
 }
 
 export function syncRankKeywordMetrics(trackerId: string) {
-  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [trackerId]);
-  if (!tracker) throw new Error("Tracker not found.");
+  const tracker = requireTracker(trackerId);
   const keywords = all<any>("SELECT * FROM rank_keywords WHERE tracker_id = ?", [trackerId]);
   let updated = 0;
   const missingKeywords: string[] = [];
@@ -1050,71 +1383,142 @@ export function syncRankKeywordMetrics(trackerId: string) {
       ? "Some tracked keywords do not have imported metrics yet. Import a keyword metrics CSV from Saved keywords."
       : "",
     missingKeywords,
-    tracker: listRankTrackers(tracker.site_id).find((item) => item.id === trackerId),
+    tracker: rankTrackerView(tracker),
   };
 }
 
+// Search providers have no device emulation, so tracker.device is recorded but
+// cannot change results. Location and language are passed where supported.
 async function serpPosition(keyword: string, tracker: any) {
-  const target = normalizeDomain(tracker.domain);
-  // Do not swallow provider failures into a false "not ranking" result — let the
-  // error propagate so the run is marked failed instead of fabricating a drop.
-  const rows = await searchWeb(keyword, Math.max(10, tracker.serp_depth));
-  const match = rows.find((row) => hostMatchesDomain(row.domain, target));
-  if (match) return { position: match.rank, url: match.url, title: match.title };
-  return { position: null, url: "", title: "" };
+  const outcome = await searchWeb(keyword, {
+    depth: serpDepth(tracker.serp_depth),
+    locationCode: tracker.location_code,
+    languageCode: tracker.language_code,
+  });
+  const match = outcome.rows.find((row) => hostMatchesDomain(row.domain, tracker.domain));
+  return {
+    position: match?.rank ?? null,
+    url: match?.url || "",
+    title: match?.title || "",
+    depthChecked: outcome.depthChecked,
+    source: outcome.locale ? `${outcome.source}:${outcome.locale}` : outcome.source,
+  };
 }
 
-export async function runRankCheck(trackerId: string) {
-  const tracker = get<any>("SELECT * FROM rank_trackers WHERE id = ?", [trackerId]);
-  if (!tracker) throw new Error("Tracker not found.");
-  const keywords = all<any>("SELECT * FROM rank_keywords WHERE tracker_id = ?", [trackerId]);
-  const runId = randomUUID();
-  run("INSERT INTO rank_runs (id, tracker_id, status, message) VALUES (?, ?, ?, ?)", [
-    runId,
-    trackerId,
-    "running",
-    "Checking SERPs",
-  ]);
-  try {
-    for (const keyword of keywords) {
+function saveRankRunProgress(runId: string, checked: number, errors: RankRunError[], message: string) {
+  run(
+    "UPDATE rank_runs SET checked_count = ?, error_count = ?, errors_json = ?, message = ? WHERE id = ?",
+    [checked, errors.length, JSON.stringify(errors), message, runId],
+  );
+}
+
+// A keyword whose search fails gets no snapshot: the error is recorded on the
+// run instead of a fabricated "not ranking" row. The run ends 'completed' only
+// when every keyword was checked, 'partial' when some were, else 'failed'.
+async function executeRankRun(runId: string, tracker: any, keywords: any[]) {
+  const errors: RankRunError[] = [];
+  let checked = 0;
+  for (const [index, keyword] of keywords.entries()) {
+    let pause = true;
+    try {
       const result = await serpPosition(keyword.keyword, tracker);
-      run(
-        `
-        INSERT INTO rank_snapshots
-          (id, run_id, tracker_id, keyword_id, keyword, position, url, title)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          randomUUID(),
-          runId,
-          trackerId,
-          keyword.id,
-          keyword.keyword,
-          result.position,
-          result.url,
-          result.title,
-        ],
-      );
+      pause = result.source.startsWith("duckduckgo");
+      // Skip keywords removed from the tracker while the run was going.
+      if (get("SELECT id FROM rank_keywords WHERE id = ?", [keyword.id])) {
+        run(
+          `
+          INSERT INTO rank_snapshots
+            (id, run_id, tracker_id, keyword_id, keyword, position, url, title, depth_checked, source)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+          [
+            randomUUID(),
+            runId,
+            tracker.id,
+            keyword.id,
+            keyword.keyword,
+            result.position,
+            result.url,
+            result.title,
+            result.depthChecked,
+            result.source,
+          ],
+        );
+        checked += 1;
+      }
+    } catch (error) {
+      errors.push({
+        keywordId: keyword.id,
+        keyword: keyword.keyword,
+        error: error instanceof Error ? error.message : "Search failed",
+      });
     }
-    run(
-      "UPDATE rank_runs SET status = 'completed', message = 'Completed', finished_at = CURRENT_TIMESTAMP WHERE id = ?",
-      [runId],
-    );
-  } catch (error) {
-    run(
-      "UPDATE rank_runs SET status = 'failed', message = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
-      [error instanceof Error ? error.message : "Rank check failed", runId],
-    );
-    throw error;
+    saveRankRunProgress(runId, checked, errors, `Checked ${index + 1} of ${keywords.length} keywords`);
+    if (pause && index < keywords.length - 1) await Bun.sleep(DUCKDUCKGO_PAUSE_MS);
   }
-  return { runId, tracker: listRankTrackers(tracker.site_id).find((item) => item.id === trackerId) };
+  const status = !errors.length ? "completed" : checked ? "partial" : "failed";
+  const message =
+    status === "completed"
+      ? `Checked ${checked} ${checked === 1 ? "keyword" : "keywords"}.`
+      : status === "partial"
+        ? `${errors.length} of ${keywords.length} keywords could not be checked: ${errors[0].error}`
+        : `No keyword could be checked: ${errors[0].error}`;
+  run(
+    "UPDATE rank_runs SET status = ?, message = ?, checked_count = ?, error_count = ?, errors_json = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [status, message, checked, errors.length, JSON.stringify(errors), runId],
+  );
+}
+
+// Starts a rank check in the background and returns the running run at once.
+// Poll getRankRun (or reload the trackers) until its status leaves 'running'.
+export function startRankCheck(trackerId: string) {
+  const tracker = requireTracker(trackerId);
+  const active = get<any>(
+    "SELECT * FROM rank_runs WHERE tracker_id = ? AND status IN ('queued', 'running') ORDER BY started_at DESC LIMIT 1",
+    [trackerId],
+  );
+  if (active) {
+    return { runId: active.id, alreadyRunning: true, run: publicRankRun(active), tracker: rankTrackerView(tracker) };
+  }
+  const keywords = all<any>("SELECT * FROM rank_keywords WHERE tracker_id = ? ORDER BY keyword", [trackerId]);
+  if (!keywords.length) throw badRequest("Add keywords to this tracker before running a rank check.");
+  const runId = randomUUID();
+  run(
+    "INSERT INTO rank_runs (id, tracker_id, status, message, keyword_count) VALUES (?, ?, 'running', ?, ?)",
+    [runId, trackerId, `Checking ${keywords.length} ${keywords.length === 1 ? "keyword" : "keywords"}`, keywords.length],
+  );
+  queueMicrotask(() => {
+    executeRankRun(runId, tracker, keywords).catch((error) => {
+      run(
+        "UPDATE rank_runs SET status = 'failed', message = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [error instanceof Error ? error.message : "Rank check failed", runId],
+      );
+    });
+  });
+  return { runId, alreadyRunning: false, run: getRankRun(trackerId, runId), tracker: rankTrackerView(tracker) };
+}
+
+export function getRankRun(trackerId: string, runId: string) {
+  const row = get<any>("SELECT * FROM rank_runs WHERE id = ? AND tracker_id = ?", [runId, trackerId]);
+  if (!row) throw notFound("Rank run not found.");
+  return publicRankRun(row);
+}
+
+export function listRankRuns(trackerId: string, limit = 50, offset = 0) {
+  requireTracker(trackerId);
+  const total = get<{ count: number }>("SELECT count(*) AS count FROM rank_runs WHERE tracker_id = ?", [trackerId])?.count || 0;
+  const runs = all<any>(
+    "SELECT * FROM rank_runs WHERE tracker_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ? OFFSET ?",
+    [trackerId, limit, offset],
+  ).map(publicRankRun);
+  return { runs, total, limit, offset, hasMore: offset + runs.length < total };
 }
 
 export async function domainOverview(input: { siteId: string; domain?: string }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const domain = normalizeDomain(input.domain || site.domain);
-  if (!domain) throw new Error("Domain is required.");
+  if (!domain) throw badRequest("Domain is required.");
   const imported = latestOrganicImport(site.id, domain);
   if (imported) {
     return {
@@ -1164,17 +1568,24 @@ function localScanPagesForDomain(siteId: string, domain: string, page: number, p
   for (const scan of scans) {
     const result = jsonParse<any>(scan.result_json, null);
     const pages = Array.isArray(result?.pages) ? result.pages : [];
+    // Page issues live once in result.issues, recorded on the page URL or on
+    // the URL it was requested as (redirect findings).
+    const issueCounts = new Map<string, number>();
+    for (const issue of Array.isArray(result?.issues) ? result.issues : []) {
+      issueCounts.set(issue.url, (issueCounts.get(issue.url) || 0) + 1);
+    }
     const rows = pages
       .filter((row: any) => sameSiteUrl(String(row.finalUrl || row.url || ""), scope))
       .map((row: any) => {
         const pageUrl = String(row.finalUrl || row.url || "");
+        const issueUrls = new Set([row.url, row.requestedUrl].filter(Boolean));
         return {
           page: pageUrl,
           relativePath: relativePath(pageUrl),
           organicTraffic: null,
           keywords: null,
           title: String(row.title || ""),
-          issues: Array.isArray(row.issues) ? row.issues.length : 0,
+          issues: [...issueUrls].reduce((total, url) => total + (issueCounts.get(url) || 0), 0),
           source: "local-scan",
           scanId: scan.id,
           scannedAt: scan.updated_at || scan.created_at,
@@ -1226,15 +1637,7 @@ type ImportedOrganicPageRow = {
 };
 
 function parseOrganicCsv(csv: string) {
-  const parsed = Papa.parse<Record<string, unknown>>(csv, {
-    header: true,
-    skipEmptyLines: true,
-  });
-  if (parsed.errors.length) {
-    const firstError = parsed.errors[0];
-    throw new Error(`Organic research CSV could not be parsed: ${firstError.message}`);
-  }
-  return parsed.data.filter((row) => Object.values(row).some((value) => String(value ?? "").trim()));
+  return parseCsvRows(csv, "Organic research CSV").rows;
 }
 
 function organicUrl(value: string, domain: string) {
@@ -1247,9 +1650,9 @@ function organicUrl(value: string, domain: string) {
 }
 
 function normalizeImportedOrganicRow(raw: Record<string, unknown>, domain: string) {
-  const row = normalizedCsvRow(raw);
-  const keyword = csvField(row, ["keyword", "query", "search term", "search_term", "term"]);
-  const rawUrl = csvField(row, [
+  const row = csvRow(raw);
+  const keyword = csvText(row, keywordColumnAliases);
+  const rawUrl = csvText(row, [
     "url",
     "page",
     "ranking url",
@@ -1268,7 +1671,7 @@ function normalizeImportedOrganicRow(raw: Record<string, unknown>, domain: strin
     ? {
         page: url,
         relativePath: relativePath(url),
-        title: csvField(row, ["title", "page title", "meta title"]),
+        title: csvText(row, ["title", "page title", "meta title"]),
         organicTraffic: traffic,
         keywords: keywordCount || (keyword ? 1 : null),
         value: csvNumber(row, ["value", "traffic value", "estimated value", "cost"]),
@@ -1279,13 +1682,13 @@ function normalizeImportedOrganicRow(raw: Record<string, unknown>, domain: strin
     ? {
         keyword,
         position: csvNumber(row, ["position", "rank", "ranking position", "current position"]),
-        searchVolume: csvNumber(row, ["search volume", "search_volume", "volume", "avg monthly searches", "monthly searches", "impressions"]),
+        searchVolume: csvNumber(row, ["search volume", "search_volume", "volume", "avg monthly searches", "monthly searches"]),
         traffic,
         keywordDifficulty: csvNumber(row, ["keyword difficulty", "keyword_difficulty", "difficulty", "kd", "seo difficulty"]),
         cpc: csvNumber(row, ["cpc", "cost per click", "cost_per_click"]),
         url,
         relativeUrl: url ? relativePath(url) : null,
-        intent: csvField(row, ["intent", "search intent"]) || "unknown",
+        intent: csvText(row, ["intent", "search intent"]) || "unknown",
       }
     : null;
   return { keyword: keywordRow, page };
@@ -1367,15 +1770,15 @@ export function importOrganicResearchCsv(input: {
   rows?: Record<string, unknown>[];
 }) {
   const site = getSite(String(input.siteId || ""));
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const domain = normalizeDomain(input.domain || site.domain);
-  if (!domain) throw new Error("Domain is required.");
-  const rawRows = input.csv ? parseOrganicCsv(input.csv) : input.rows || [];
+  if (!domain) throw badRequest("Domain is required.");
+  const rawRows = importRows(input, parseOrganicCsv);
   const normalized = rawRows.map((row) => normalizeImportedOrganicRow(row, domain));
   const keywords = normalized.map((row) => row.keyword).filter((row): row is ImportedOrganicKeywordRow => Boolean(row));
   const pages = mergeOrganicPages(normalized.map((row) => row.page).filter((row): row is ImportedOrganicPageRow => Boolean(row)));
   if (!keywords.length && !pages.length) {
-    throw new Error("Import file has no organic keyword or page rows for this domain.");
+    throw badRequest("Import file has no organic keyword or page rows for this domain.");
   }
   const summary = organicSummary(keywords, pages);
   const id = randomUUID();
@@ -1406,7 +1809,7 @@ export async function getDomainKeywordSuggestions(input: {
   limit?: number;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const target = normalizeDomain(input.domain || site.domain);
   const limit = Math.max(5, Math.min(100, input.limit || 25));
   const page = await getDomainKeywordsPage({
@@ -1431,9 +1834,9 @@ export async function getDomainKeywordsPage(input: {
   search?: string;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const target = normalizeDomain(input.domain || site.domain);
-  if (!target) throw new Error("Domain is required.");
+  if (!target) throw badRequest("Domain is required.");
   const page = Math.max(1, Number(input.page || 1));
   const pageSize = Math.max(10, Math.min(200, Number(input.pageSize || 50)));
   const search = String(input.search || "").trim().toLowerCase();
@@ -1481,9 +1884,9 @@ export async function getDomainPagesPage(input: {
   search?: string;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const target = normalizeDomain(input.domain || site.domain);
-  if (!target) throw new Error("Domain is required.");
+  if (!target) throw badRequest("Domain is required.");
   const page = Math.max(1, Number(input.page || 1));
   const pageSize = Math.max(10, Math.min(200, Number(input.pageSize || 50)));
   const search = String(input.search || "").trim().toLowerCase();
@@ -1537,9 +1940,9 @@ export function listDomainSnapshots(siteId: string) {
 
 export async function backlinksOverview(input: { siteId: string; domain?: string }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const domain = normalizeDomain(input.domain || site.domain);
-  if (!domain) throw new Error("Domain is required.");
+  if (!domain) throw badRequest("Domain is required.");
   const imported = latestBacklinkImport(site.id, domain);
   if (imported) {
     return {
@@ -1573,9 +1976,9 @@ export async function getBacklinksProfile(input: {
   mode?: string;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const domain = normalizeDomain(input.domain || site.domain);
-  if (!domain) throw new Error("Domain is required.");
+  if (!domain) throw badRequest("Domain is required.");
   const tab = input.tab || "backlinks";
   const page = Math.max(1, Number(input.page || 1));
   const pageSize = Math.max(10, Math.min(200, Number(input.pageSize || 50)));
@@ -1643,46 +2046,45 @@ type ImportedBacklinkRow = {
   linksCount: number | null;
 };
 
-function normalizeCsvHeader(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-function normalizedCsvRow(row: Record<string, unknown>) {
-  const normalized = new Map<string, unknown>();
-  for (const [key, value] of Object.entries(row)) {
-    normalized.set(normalizeCsvHeader(key), value);
-  }
-  return normalized;
-}
-
-function csvField(row: Map<string, unknown>, aliases: string[]) {
-  for (const alias of aliases) {
-    const value = row.get(normalizeCsvHeader(alias));
-    const text = cleanText(String(value ?? ""));
-    if (text) return text;
-  }
-  return "";
-}
-
-function csvNumber(row: Map<string, unknown>, aliases: string[]) {
-  const value = csvField(row, aliases);
-  if (!value) return null;
-  const match = value.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
-  if (!match) return null;
-  const number = Number(match[0]);
-  return Number.isFinite(number) ? number : null;
-}
-
-function csvBoolean(row: Map<string, unknown>, aliases: string[]) {
-  const value = csvField(row, aliases).toLowerCase();
-  if (!value) return null;
-  if (/(nofollow|false|no|lost|removed|0)\b/.test(value)) return false;
-  if (/(dofollow|follow|true|yes|live|active|1)\b/.test(value)) return true;
+// true / false for explicit yes/no cells, null when the cell is empty or says
+// something else.
+function csvFlag(row: CsvRow, aliases: string[]) {
+  const value = csvText(row, aliases).toLowerCase();
+  if (["true", "yes", "y", "1"].includes(value)) return true;
+  if (["false", "no", "n", "0"].includes(value)) return false;
   return null;
 }
 
-function backlinkDomainFromRow(row: Map<string, unknown>, urlFrom: string) {
-  const domain = csvField(row, [
+// Whether the link passes authority: false for nofollow/ugc/sponsored, true
+// when the export shows a followed link, null when the export does not say.
+// Semrush and Ahrefs exports carry Nofollow / UGC / Sponsored flag columns;
+// other tools use a rel column or a follow/dofollow column.
+function backlinkFollowState(row: CsvRow, relAttributes: string[]) {
+  if (csvHasColumn(row, ["rel", "rel attributes", "attributes", "link rel"]) && relAttributes.length) {
+    return !/\b(nofollow|ugc|sponsored)\b/i.test(relAttributes.join(" "));
+  }
+  const flags = [
+    csvFlag(row, ["nofollow", "no follow", "is nofollow"]),
+    csvFlag(row, ["ugc", "is ugc"]),
+    csvFlag(row, ["sponsored", "is sponsored"]),
+  ];
+  if (flags.includes(true)) return false;
+  if (flags[0] === false) return true;
+  const follow = csvText(row, ["dofollow", "follow", "is dofollow", "link type", "type"]).toLowerCase();
+  if (/\b(nofollow|no follow|ugc|sponsored)\b/.test(follow) || ["false", "no", "0"].includes(follow)) return false;
+  if (/\b(dofollow|do follow|follow|followed)\b/.test(follow) || ["true", "yes", "1"].includes(follow)) return true;
+  return null;
+}
+
+// Only a three-digit HTTP code counts as a status code: "404" or
+// "404 Not Found", never the year in "Lost 2024-03-01".
+function backlinkHttpStatus(row: CsvRow) {
+  const match = /^([1-5]\d\d)\b/.exec(csvText(row, ["http status", "http code", "status code", "status", "link status"]));
+  return match ? Number(match[1]) : null;
+}
+
+function backlinkDomainFromRow(row: CsvRow, urlFrom: string) {
+  const domain = csvText(row, [
     "domain_from",
     "domain from",
     "source_domain",
@@ -1696,15 +2098,16 @@ function backlinkDomainFromRow(row: Map<string, unknown>, urlFrom: string) {
 }
 
 function normalizeImportedBacklinkRow(raw: Record<string, unknown>, fallbackDomain: string): ImportedBacklinkRow | null {
-  const row = normalizedCsvRow(raw);
+  const row = csvRow(raw);
   const urlFrom =
-    csvField(row, [
+    csvText(row, [
       "url_from",
       "url from",
       "source_url",
       "source url",
       "source page",
       "referring page",
+      "referring page url",
       "referring url",
       "backlink url",
       "from",
@@ -1712,7 +2115,7 @@ function normalizeImportedBacklinkRow(raw: Record<string, unknown>, fallbackDoma
   const domainFrom = backlinkDomainFromRow(row, urlFrom);
   if (!urlFrom && !domainFrom) return null;
   const urlTo =
-    csvField(row, [
+    csvText(row, [
       "url_to",
       "url to",
       "target_url",
@@ -1725,46 +2128,37 @@ function normalizeImportedBacklinkRow(raw: Record<string, unknown>, fallbackDoma
       "landing page",
       "to",
     ]) || `https://${fallbackDomain}`;
-  const relAttributes = parseList(csvField(row, ["rel", "rel attributes", "attributes", "link rel"]));
-  const relText = relAttributes.join(" ").toLowerCase();
-  const isDofollow = relText.includes("nofollow") ? false : csvBoolean(row, ["dofollow", "follow", "type", "link type"]);
-  const status = csvField(row, ["status", "link status", "http status"]).toLowerCase();
-  const statusCode = csvNumber(row, ["status", "link status", "http status"]);
+  const relAttributes = parseList(csvText(row, ["rel", "rel attributes", "attributes", "link rel"]));
+  const status = csvText(row, ["status", "link status"]).toLowerCase();
+  const httpStatus = backlinkHttpStatus(row);
   return {
     domainFrom,
     urlFrom: urlFrom || `https://${domainFrom}`,
     urlTo,
-    anchor: csvField(row, ["anchor", "anchor text", "text", "link text"]),
-    itemType: csvField(row, ["item type", "item_type", "type", "link type"]) || "link",
-    isDofollow,
+    anchor: csvText(row, ["anchor", "anchor text", "text", "link text"]),
+    itemType: csvText(row, ["item type", "item_type", "type", "link type"]) || "link",
+    isDofollow: backlinkFollowState(row, relAttributes),
     relAttributes,
     rank: csvNumber(row, ["rank", "domain rank", "domain rating", "dr", "authority", "page rank"]),
     domainFromRank: csvNumber(row, ["domain_from_rank", "domain from rank", "domain rank", "domain rating", "dr"]),
     pageFromRank: csvNumber(row, ["page_from_rank", "page from rank", "url rating", "ur", "page rank"]),
     spamScore: csvNumber(row, ["spam score", "spam_score", "toxicity", "toxic score"]),
-    firstSeen: csvField(row, ["first seen", "first_seen", "first found", "date first seen"]) || null,
-    lastSeen: csvField(row, ["last seen", "last_seen", "last found", "date last seen"]) || null,
-    isLost: /(lost|removed|deleted|missing)/.test(status),
-    isBroken: Boolean((statusCode && statusCode >= 400) || /(broken|error|404|5\d\d)/.test(status)),
-    linksCount: csvNumber(row, ["links count", "links_count", "count"]) || 1,
+    firstSeen: csvText(row, ["first seen", "first_seen", "first found", "date first seen"]) || null,
+    lastSeen: csvText(row, ["last seen", "last_seen", "last found", "date last seen"]) || null,
+    isLost: /\b(lost|removed|deleted|missing)\b/.test(status) || csvFlag(row, ["lost link", "lost", "is lost"]) === true,
+    isBroken: (httpStatus !== null && httpStatus >= 400) || /\b(broken|error)\b/.test(status),
+    linksCount: csvNumber(row, ["links count", "links_count", "count"]) ?? 1,
   };
 }
 
 function parseBacklinkCsv(csv: string) {
-  const parsed = Papa.parse<Record<string, unknown>>(csv, {
-    header: true,
-    skipEmptyLines: true,
-  });
-  if (parsed.errors.length) {
-    const firstError = parsed.errors[0];
-    throw new Error(`Backlink CSV could not be parsed: ${firstError.message}`);
-  }
-  return parsed.data.filter((row) => Object.values(row).some((value) => String(value ?? "").trim()));
+  return parseCsvRows(csv, "Backlink CSV").rows;
 }
 
 function backlinkSummary(rows: ImportedBacklinkRow[]) {
   const referringDomains = new Set(rows.map((row) => row.domainFrom).filter(Boolean));
-  const dofollowRows = rows.filter((row) => row.isDofollow === true).length;
+  const followKnown = rows.filter((row) => row.isDofollow !== null);
+  const dofollowRows = followKnown.filter((row) => row.isDofollow === true).length;
   const anchorCounts = new Map<string, number>();
   for (const row of rows) {
     const anchor = row.anchor || "(empty anchor)";
@@ -1773,7 +2167,12 @@ function backlinkSummary(rows: ImportedBacklinkRow[]) {
   return {
     backlinks: rows.length,
     referringDomains: referringDomains.size,
-    dofollowRatio: rows.length ? Math.round((dofollowRows / rows.length) * 100) : null,
+    // Share of followed links among rows whose export states follow/nofollow;
+    // rows without that evidence are counted separately, never as nofollow.
+    dofollowRatio: followKnown.length ? Math.round((dofollowRows / followKnown.length) * 100) : null,
+    dofollowBacklinks: dofollowRows,
+    nofollowBacklinks: followKnown.length - dofollowRows,
+    followUnknownBacklinks: rows.length - followKnown.length,
     topAnchors: [...anchorCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10)
@@ -1826,16 +2225,16 @@ export function importBacklinksCsv(input: {
   rows?: Record<string, unknown>[];
 }) {
   const site = getSite(String(input.siteId || ""));
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   const domain = normalizeDomain(input.domain || site.domain);
-  if (!domain) throw new Error("Domain is required.");
-  const rawRows = input.csv ? parseBacklinkCsv(input.csv) : input.rows || [];
+  if (!domain) throw badRequest("Domain is required.");
+  const rawRows = importRows(input, parseBacklinkCsv);
   const rows = rawRows
     .map((row) => normalizeImportedBacklinkRow(row, domain))
     .filter((row): row is ImportedBacklinkRow => Boolean(row))
     .filter((row) => !row.urlTo || sameSiteUrl(row.urlTo, `https://${domain}`));
   if (!rows.length) {
-    throw new Error("Import file has no backlink rows for this domain.");
+    throw badRequest("Import file has no backlink rows for this domain.");
   }
   const summary = backlinkSummary(rows);
   const id = randomUUID();
@@ -1959,27 +2358,32 @@ export async function getSerpAnalysis(input: {
   depth?: number;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
-  const keyword = input.keyword.trim();
-  if (!keyword) throw new Error("Keyword is required.");
+  if (!site) throw notFound("Site not found.");
+  const keyword = optionalText(input.keyword, "Keyword") || "";
+  if (!keyword) throw badRequest("Keyword is required.");
   const domain = normalizeDomain(input.domain || site.domain);
-  const depth = Math.max(10, Math.min(100, input.depth || 20));
-  let source = "duckduckgo";
+  const depth = Math.max(10, Math.min(100, Math.round(Number(input.depth)) || 20));
+  let source = "search-error";
   let result: any = emptySerpResult(keyword, domain);
 
   try {
-    const rows = await searchWeb(keyword, depth);
+    const outcome = await searchWeb(keyword, {
+      depth,
+      locationCode: site.location_code,
+      languageCode: site.language_code,
+    });
     result = {
       ...result,
-      rows: rows.map((row) => ({
+      rows: outcome.rows.map((row) => ({
         ...row,
         isDomain: domain ? hostMatchesDomain(row.domain, domain) : false,
       })),
+      depthChecked: outcome.depthChecked,
+      locale: outcome.locale,
     };
     result.domainPosition = result.rows.find((row: any) => row.isDomain)?.rank ?? null;
-    source = rows[0]?.source || "duckduckgo";
+    source = outcome.source;
   } catch (error) {
-    source = "search-error";
     result.warning = error instanceof Error ? error.message : "Search failed";
   }
 
@@ -2011,30 +2415,36 @@ export function listSerpRuns(siteId: string) {
   ).map((row) => ({ ...row, result: publicSerpResult(jsonParse(row.result_json, {})) }));
 }
 
-function splitCompetitors(value: string | string[] | undefined) {
-  if (Array.isArray(value)) return value.map(normalizeDomain).filter(Boolean);
-  return String(value || "")
-    .split(/\n|,/)
-    .map(normalizeDomain)
+// Competitors may be domains or plain brand names; names that are not
+// hostnames are kept as typed.
+function splitCompetitors(value: unknown) {
+  return parseList(value)
+    .map((item) => normalizeDomain(item) || item)
     .filter(Boolean);
 }
 
+// Results checked per name in a brand lookup (one page of web results).
+const BRAND_LOOKUP_RESULTS = 10;
+
 export async function brandLookup(input: {
   siteId: string;
-  query: string;
-  competitors?: string[] | string;
+  query?: unknown;
+  competitors?: unknown;
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
-  const query = (input.query || site.domain || site.name).trim();
-  if (!query) throw new Error("Brand or domain is required.");
+  if (!site) throw notFound("Site not found.");
+  const query = optionalText(input.query, "Brand or domain") || site.domain || site.name;
+  if (!query) throw badRequest("Brand or domain is required.");
   const competitors = splitCompetitors(input.competitors);
   let source = "web-search";
   const result: any = {
     query,
     resolvedEntity: normalizeDomain(query) || query,
     platforms: [],
-    shareOfVoice: [],
+    // How many web results an exact-phrase search returned for each name, out
+    // of the first BRAND_LOOKUP_RESULTS checked. A raw result count, not a share
+    // of voice or visibility score.
+    resultCounts: [],
     citations: [],
     recommendations: [
       "Use Search Console and crawl evidence before asking Codex for recommendations.",
@@ -2043,30 +2453,36 @@ export async function brandLookup(input: {
     ],
   };
 
-  try {
-    const labels = [query, ...competitors];
-    const rowsByLabel = await Promise.all(
-      labels.map(async (label) => ({
+  // One name at a time: parallel bursts get rate limited by DuckDuckGo.
+  for (const label of [query, ...competitors]) {
+    const isPrimary = label === query;
+    try {
+      const outcome = await searchWeb(`"${label}"`, {
+        depth: BRAND_LOOKUP_RESULTS,
+        locationCode: site.location_code,
+        languageCode: site.language_code,
+      });
+      if (isPrimary) {
+        result.citations = outcome.rows;
+        source = outcome.source;
+      }
+      result.resultCounts.push({
         label,
-        isPrimary: label === query,
-        rows: await searchWeb(`"${label}"`, 10),
-      })),
-    );
-    result.citations = rowsByLabel[0]?.rows || [];
-    result.shareOfVoice = rowsByLabel
-      .map((item) => ({ label: item.label, value: item.rows.length, isPrimary: item.isPrimary }))
-      .sort((a, b) => b.value - a.value);
-    result.platforms = [
-      {
-        platform: "web_search",
-        visibility: result.citations.length,
-        mentions: result.citations.length,
-        citations: result.citations,
-      },
-    ];
-  } catch (error) {
-    source = "search-error";
-    result.warning = error instanceof Error ? error.message : "Brand lookup search failed";
+        isPrimary,
+        resultCount: outcome.rows.length,
+        maxResults: BRAND_LOOKUP_RESULTS,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Brand lookup search failed";
+      if (isPrimary) {
+        source = "search-error";
+        result.warning = message;
+      }
+      result.resultCounts.push({ label, isPrimary, resultCount: null, maxResults: BRAND_LOOKUP_RESULTS, error: message });
+    }
+  }
+  if (result.citations.length) {
+    result.platforms = [{ platform: "web_search", resultCount: result.citations.length, citations: result.citations }];
   }
 
   const id = randomUUID();
@@ -2099,10 +2515,10 @@ export async function promptExplorer(input: {
   models?: string[];
 }) {
   const site = getSite(input.siteId);
-  if (!site) throw new Error("Site not found.");
-  const prompt = input.prompt.trim();
-  if (!prompt) throw new Error("Prompt is required.");
-  const highlightBrand = input.highlightBrand?.trim() || site.domain || site.name;
+  if (!site) throw notFound("Site not found.");
+  const prompt = optionalText(input.prompt, "Prompt") || "";
+  if (!prompt) throw badRequest("Prompt is required.");
+  const highlightBrand = optionalText(input.highlightBrand, "Highlight brand") || site.domain || site.name;
   const models = ["local_codex"];
   const source = "codex";
   const result: any = {
@@ -2114,6 +2530,7 @@ export async function promptExplorer(input: {
 
   const job = createAiJob({
     type: "prompt.explorer",
+    siteId: site.id,
     prompt: [
       "Analyze this prompt for SEO and AI-answer visibility using only real evidence supplied in the prompt.",
       "Do not invent rankings, citations, traffic, or model mentions.",
@@ -2130,11 +2547,6 @@ export async function promptExplorer(input: {
       brandMentioned: null,
       text: "Queued a local Codex analysis job. Open AI lab to read the result when it completes.",
       citations: [],
-      fanOutQueries: [
-        `${prompt} ${highlightBrand}`,
-        `best sources for ${prompt}`,
-        `${highlightBrand} reviews`,
-      ],
     },
   ];
 
@@ -2150,6 +2562,16 @@ export async function promptExplorer(input: {
   return { id, source, ...result };
 }
 
+// Older runs stored fixed template strings as "fanOutQueries", which read like
+// AI output. They were never model results, so history no longer serves them.
+function publicPromptExplorerResult(result: any) {
+  if (!Array.isArray(result?.results)) return result;
+  return {
+    ...result,
+    results: result.results.map(({ fanOutQueries: _templates, ...row }: any) => row),
+  };
+}
+
 export function listPromptExplorerRuns(siteId: string) {
   return all<any>(
     "SELECT * FROM prompt_explorer_runs WHERE site_id = ? ORDER BY created_at DESC",
@@ -2157,7 +2579,7 @@ export function listPromptExplorerRuns(siteId: string) {
   ).map((row) => ({
     ...row,
     models: jsonParse<string[]>(row.models, []),
-    result: jsonParse(row.result_json, {}),
+    result: publicPromptExplorerResult(jsonParse(row.result_json, {})),
   }));
 }
 
@@ -2204,8 +2626,7 @@ export function dashboardSummary(siteId?: string) {
       gscImportCount: 0,
       latestGscImport: null,
       latestScans: [],
-      allScans: [],
-      latestAiJobs: all<any>("SELECT * FROM ai_jobs ORDER BY created_at DESC"),
+      latestAiJobs: listAiJobs(),
     };
   }
   const latestGscImport = get<any>(
@@ -2255,27 +2676,75 @@ export function dashboardSummary(siteId?: string) {
           createdAt: latestGscImport.created_at,
         }
       : null,
+    // Lite rows (no pages/issues); open GET /api/scans/:id for a full report.
     latestScans: listScans(site.id),
-    allScans: listAllScans(),
-    latestAiJobs: all<any>("SELECT * FROM ai_jobs ORDER BY created_at DESC"),
+    latestAiJobs: listAiJobs(site.id),
   };
 }
 
+// Everything saved for a site as metadata and counts. Import rows, scan
+// results, and stored SERP/lookup payloads are not parsed here; each has its
+// own endpoint that loads the full data on demand.
 export function siteSummary(siteId: string) {
   const site = getSite(siteId);
-  if (!site) throw new Error("Site not found.");
+  if (!site) throw notFound("Site not found.");
   return {
-    site: site,
+    site,
     savedKeywords: listSavedKeywords(siteId),
-    keywordMetricImports: listKeywordMetricImports(siteId),
+    keywordMetricImports: all<any>(
+      `
+      SELECT id, source_name AS sourceName, row_count AS rowCount, inserted_count AS insertedCount,
+        updated_count AS updatedCount, created_at AS createdAt
+      FROM keyword_metric_imports WHERE site_id = ? ORDER BY created_at DESC
+      `,
+      [siteId],
+    ),
     rankTrackers: listRankTrackers(siteId),
-    scans: listScans(siteId),
-    domainSnapshots: listDomainSnapshots(siteId),
-    backlinkSnapshots: listBacklinkSnapshots(siteId),
-    serpRuns: listSerpRuns(siteId),
-    brandLookupRuns: listBrandLookupRuns(siteId),
-    promptExplorerRuns: listPromptExplorerRuns(siteId),
+    scans: all<any>(
+      `
+      SELECT id, url, status, score, pages_crawled, issue_count, error, created_at, updated_at
+      FROM scans WHERE site_id = ? ORDER BY created_at DESC
+      `,
+      [siteId],
+    ),
+    domainSnapshots: [
+      ...all<any>(
+        `
+        SELECT id, domain, 'organic-import' AS source, source_name AS sourceName, keyword_count AS keywordCount,
+          page_count AS pageCount, created_at
+        FROM organic_imports WHERE site_id = ?
+        `,
+        [siteId],
+      ),
+      ...all<any>("SELECT id, domain, source, created_at FROM domain_snapshots WHERE site_id = ?", [siteId]),
+    ].sort(newestFirst),
+    backlinkSnapshots: [
+      ...all<any>(
+        `
+        SELECT id, domain, 'backlink-import' AS source, source_name AS sourceName, row_count AS rowCount, created_at
+        FROM backlink_imports WHERE site_id = ?
+        `,
+        [siteId],
+      ),
+      ...all<any>("SELECT id, domain, source, created_at FROM backlink_snapshots WHERE site_id = ?", [siteId]),
+    ].sort(newestFirst),
+    serpRuns: all<any>(
+      "SELECT id, keyword, domain, source, location_code, language_code, created_at FROM serp_runs WHERE site_id = ? ORDER BY created_at DESC",
+      [siteId],
+    ),
+    brandLookupRuns: all<any>(
+      "SELECT id, query, competitors, source, created_at FROM brand_lookup_runs WHERE site_id = ? ORDER BY created_at DESC",
+      [siteId],
+    ).map((row) => ({ ...row, competitors: jsonParse<string[]>(row.competitors, []) })),
+    promptExplorerRuns: all<any>(
+      "SELECT id, prompt, highlight_brand, source, created_at FROM prompt_explorer_runs WHERE site_id = ? ORDER BY created_at DESC",
+      [siteId],
+    ),
   };
+}
+
+function newestFirst(a: { created_at: string }, b: { created_at: string }) {
+  return String(b.created_at).localeCompare(String(a.created_at));
 }
 
 export function domainFromUrl(value: string) {

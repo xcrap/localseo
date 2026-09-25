@@ -1,4 +1,7 @@
 import {
+	lazy,
+	Suspense,
+	useCallback,
 	useEffect,
 	useMemo,
 	useRef,
@@ -25,6 +28,7 @@ import {
 	LayoutGrid,
 	LogOut,
 	RefreshCw,
+	Search,
 	Settings,
 	ShieldCheck,
 } from "lucide-react";
@@ -54,6 +58,7 @@ import {
 	SelectItem,
 	SelectTrigger,
 	SelectValue,
+	Skeleton,
 	Toaster,
 	toast,
 	Tooltip,
@@ -62,21 +67,73 @@ import {
 } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import {
-	KeywordsPage,
-	RankPage,
-	SavedPage,
-	SerpPage,
-} from "./app/pages/keywords";
-import { DomainPage, LinksPage } from "./app/pages/research";
-import { BrandLookupPage, PromptExplorerPage } from "./app/pages/discovery";
-import {
-	AiPage,
-	GscPage,
-	McpPage,
-	SettingsPage,
-} from "./app/pages/integrations";
-import { ScansPage } from "./app/pages/scans";
-import { Overview, SitesManager } from "./app/pages/sites";
+	CommandPalette,
+	shortcutLabel,
+	useAppShortcuts,
+} from "./app/command-palette";
+import { NotificationBell } from "./app/notifications";
+
+// Page modules load on demand so the shell paints before the heavy report UI.
+const KeywordsPage = lazy(() =>
+	import("./app/pages/keywords").then((m) => ({ default: m.KeywordsPage })),
+);
+const RankPage = lazy(() =>
+	import("./app/pages/rank").then((m) => ({ default: m.RankPage })),
+);
+const SavedPage = lazy(() =>
+	import("./app/pages/keywords").then((m) => ({ default: m.SavedPage })),
+);
+const SerpPage = lazy(() =>
+	import("./app/pages/keywords").then((m) => ({ default: m.SerpPage })),
+);
+const DomainPage = lazy(() =>
+	import("./app/pages/research").then((m) => ({ default: m.DomainPage })),
+);
+const LinksPage = lazy(() =>
+	import("./app/pages/research").then((m) => ({ default: m.LinksPage })),
+);
+const BrandLookupPage = lazy(() =>
+	import("./app/pages/discovery").then((m) => ({ default: m.BrandLookupPage })),
+);
+const PromptExplorerPage = lazy(() =>
+	import("./app/pages/discovery").then((m) => ({
+		default: m.PromptExplorerPage,
+	})),
+);
+const AiPage = lazy(() =>
+	import("./app/pages/integrations").then((m) => ({ default: m.AiPage })),
+);
+const GscPage = lazy(() =>
+	import("./app/pages/gsc").then((m) => ({ default: m.GscPage })),
+);
+const McpPage = lazy(() =>
+	import("./app/pages/integrations").then((m) => ({ default: m.McpPage })),
+);
+const SettingsPage = lazy(() =>
+	import("./app/pages/integrations").then((m) => ({ default: m.SettingsPage })),
+);
+const ScansPage = lazy(() =>
+	import("./app/pages/scans").then((m) => ({ default: m.ScansPage })),
+);
+const InsightsPage = lazy(() =>
+	import("./app/pages/insights").then((m) => ({ default: m.InsightsPage })),
+);
+const Overview = lazy(() =>
+	import("./app/pages/sites").then((m) => ({ default: m.Overview })),
+);
+const SitesManager = lazy(() =>
+	import("./app/pages/sites").then((m) => ({ default: m.SitesManager })),
+);
+
+function PageFallback() {
+	return (
+		<div className="space-y-5" role="status" aria-busy="true" aria-label="Loading page">
+			<Skeleton className="h-9 w-64" />
+			<Skeleton className="h-32 rounded-2xl" />
+			<Skeleton className="h-64 rounded-2xl" />
+		</div>
+	);
+}
 
 function LoginScreen({
 	setupRequired,
@@ -244,13 +301,33 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 		loadSites().catch(console.error);
 	}, []);
 
-	function selectSite(id: string) {
+	const [paletteOpen, setPaletteOpen] = useState(false);
+	useAppShortcuts(() => setPaletteOpen((open) => !open));
+
+	function selectSite(id: string, options: { keepPath?: boolean } = {}) {
 		const changed = id !== activeSiteIdRef.current;
 		storeActiveSiteId(id);
-		if (changed && /^\/scans\/[^/]+/.test(location.pathname)) {
+		if (
+			changed &&
+			!options.keepPath &&
+			/^\/scans\/[^/]+/.test(location.pathname)
+		) {
 			navigate("/scans", { replace: true });
 		}
 	}
+
+	// A deep link to a scan saved for another site switches the workspace to
+	// that site and keeps the link, instead of silently showing another scan.
+	const switchToScanSite = useCallback(
+		(siteId: string) => {
+			const target = sites.find((site) => site.id === siteId);
+			if (!target) return false;
+			selectSite(siteId, { keepPath: true });
+			toast.info(`Switched to ${siteDisplayName(target)} to open this scan.`);
+			return true;
+		},
+		[sites],
+	);
 
 	async function scanActiveSite() {
 		if (!activeSite?.domain) {
@@ -325,43 +402,62 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 
 	const requireSite = (element: ReactNode) =>
 		activeSite ? element : <NoSiteSelected />;
+	// The entrance animation replays per section (/scans, /keywords, …) but not
+	// when only a sub-path or query changes, so /scans → /scans/:id keeps the
+	// mounted page and its state.
+	const sectionKey = location.pathname.split("/")[1] || "home";
+	const palette = (
+		<CommandPalette
+			open={paletteOpen}
+			onOpenChange={setPaletteOpen}
+			sites={sites}
+			activeSite={activeSite}
+			onSelectSite={selectSite}
+			onScanActiveSite={scanActiveSite}
+		/>
+	);
 
 	if (isHome) {
 		return (
 			<div className="grain min-h-screen">
-				<TopBar onLogout={logout} />
+				<TopBar
+					onLogout={logout}
+					onOpenPalette={() => setPaletteOpen(true)}
+					onOpenNotificationSite={selectSite}
+				/>
 				<main
-					key={location.pathname}
+					key={sectionKey}
 					className="rise relative z-10 mx-auto w-full max-w-[1560px] px-5 pb-16 pt-7 lg:px-10 lg:pt-8"
 				>
-					<Routes>
-						<Route
-							path="/"
-							element={
-								<SitesManager
-									variant="home"
-									sites={sites}
-									reloadSites={loadSites}
-									activeSiteId={activeSite?.id || ""}
-									selectSite={selectSite}
-								/>
-							}
-						/>
-						<Route
-							path="/sites"
-							element={
-								<SitesManager
-									variant="home"
-									sites={sites}
-									reloadSites={loadSites}
-									activeSiteId={activeSite?.id || ""}
-									selectSite={selectSite}
-								/>
-							}
-						/>
-						<Route path="/settings" element={<SettingsPage />} />
-					</Routes>
+					<Suspense fallback={<PageFallback />}>
+						<Routes>
+							<Route
+								path="/"
+								element={
+									<SitesManager
+										sites={sites}
+										reloadSites={loadSites}
+										activeSiteId={activeSite?.id || ""}
+										selectSite={selectSite}
+									/>
+								}
+							/>
+							<Route
+								path="/sites"
+								element={
+									<SitesManager
+										sites={sites}
+										reloadSites={loadSites}
+										activeSiteId={activeSite?.id || ""}
+										selectSite={selectSite}
+									/>
+								}
+							/>
+							<Route path="/settings" element={<SettingsPage />} />
+						</Routes>
+					</Suspense>
 				</main>
+				{palette}
 			</div>
 		);
 	}
@@ -370,9 +466,11 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 		<div className="grain min-h-screen">
 			<TopBar
 				onLogout={logout}
+				onOpenPalette={() => setPaletteOpen(true)}
 				sites={sites}
 				activeSiteId={activeSite?.id || ""}
 				onSelectSite={selectSite}
+				onOpenNotificationSite={selectSite}
 			/>
 			<WorkspaceSidebar />
 			<WorkspaceMobileHeader
@@ -383,11 +481,10 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 				scanning={shellScanning}
 				onNavigate={(path) => navigate(path)}
 			/>
+			{palette}
 			<main className="relative z-10 px-4 py-6 lg:ml-66 lg:px-9 lg:py-8">
-				<div
-					key={location.pathname}
-					className="rise mx-auto w-full max-w-[1640px]"
-				>
+				<div key={sectionKey} className="rise mx-auto w-full max-w-[1640px]">
+					<Suspense fallback={<PageFallback />}>
 					<Routes key={activeSite?.id || "no-site"}>
 						<Route
 							path="/overview"
@@ -450,15 +547,17 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 							)}
 						/>
 						<Route
-							path="/scans"
+							path="/scans/:scanId?"
 							element={requireSite(
-								activeSite ? <ScansPage site={activeSite} /> : null,
+								activeSite ? (
+									<ScansPage site={activeSite} switchSite={switchToScanSite} />
+								) : null,
 							)}
 						/>
 						<Route
-							path="/scans/:scanId"
+							path="/insights"
 							element={requireSite(
-								activeSite ? <ScansPage site={activeSite} /> : null,
+								activeSite ? <InsightsPage site={activeSite} /> : null,
 							)}
 						/>
 						<Route
@@ -481,6 +580,7 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 						/>
 						<Route path="*" element={<NotFoundPage />} />
 					</Routes>
+					</Suspense>
 				</div>
 			</main>
 		</div>
@@ -504,14 +604,21 @@ function BrandMark({ compact = false }: { compact?: boolean }) {
 
 function TopBar({
 	onLogout,
+	onOpenPalette,
 	sites,
 	activeSiteId,
 	onSelectSite,
+	onOpenNotificationSite,
 }: {
 	onLogout: () => void;
+	onOpenPalette: () => void;
 	sites?: Site[];
 	activeSiteId?: string;
 	onSelectSite?: (id: string) => void;
+	onOpenNotificationSite?: (
+		id: string,
+		options?: { keepPath?: boolean },
+	) => void;
 }) {
 	const location = useLocation();
 	const onSettings = location.pathname === "/settings";
@@ -524,6 +631,21 @@ function TopBar({
 					</Link>
 				</div>
 				<div className="flex items-center gap-2">
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						className="h-8 gap-2 text-muted-foreground"
+						onClick={onOpenPalette}
+						aria-keyshortcuts="Meta+K Control+K"
+					>
+						<Search />
+						<span className="hidden md:inline">Jump to…</span>
+						<kbd className="hidden rounded border border-border/80 px-1.5 font-sans text-[10px] text-muted-foreground md:inline">
+							{shortcutLabel()}
+						</kbd>
+						<span className="sr-only md:hidden">Open command palette</span>
+					</Button>
 					{onSelectSite && sites && sites.length > 1 ? (
 						<div className="hidden w-56 lg:block">
 							<ActiveSiteSelect
@@ -533,6 +655,7 @@ function TopBar({
 							/>
 						</div>
 					) : null}
+					<NotificationBell onSelectSite={onOpenNotificationSite} />
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
