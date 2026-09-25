@@ -240,6 +240,48 @@ if (!robotsDirectives(["INDEX", "NOINDEX"], "").includes("noindex")) {
     throw new Error(`Codex args should pass the prompt after -- and run in a work directory: ${JSON.stringify(args)}`);
   }
 
+  // --- Codex job hardening (src/codex.ts) ---
+  // App jobs get no shell/exec, connector, browser, or other tool features;
+  // ignore the user's Codex config and rules; write no session files; set web
+  // search explicitly; and never inherit app secrets from the environment.
+  {
+    const { codexEnv, disabledCodexFeatures } = await import("../src/codex");
+    const offArgs = codexArgs("p", "/tmp/w", "/tmp/w/o");
+    const onArgs = codexArgs("p", "/tmp/w", "/tmp/w/o", true);
+    const beforePrompt = offArgs.slice(0, offArgs.indexOf("--"));
+    const disabled = beforePrompt.filter((_, index) => beforePrompt[index - 1] === "--disable");
+    const requiredOff = ["shell_tool", "unified_exec", "apps", "plugins", "browser_use", "computer_use", "in_app_browser", "image_generation", "hooks"];
+    if (
+      !["--ephemeral", "--ignore-user-config", "--ignore-rules"].every((flag) => beforePrompt.includes(flag)) ||
+      beforePrompt[beforePrompt.indexOf("-s") + 1] !== "read-only" ||
+      !requiredOff.every((feature) => disabled.includes(feature)) ||
+      JSON.stringify(disabled) !== JSON.stringify(disabledCodexFeatures) ||
+      !beforePrompt.includes('web_search="disabled"') ||
+      beforePrompt.includes('web_search="live"') ||
+      !onArgs.slice(0, onArgs.indexOf("--")).includes('web_search="live"') ||
+      offArgs.includes("--search") ||
+      onArgs.includes("--search")
+    ) {
+      throw new Error(`Codex jobs should run without shell, connectors, user config, or session files: ${JSON.stringify(offArgs)}`);
+    }
+    const childEnv = codexEnv({
+      PATH: "/usr/bin",
+      HOME: "/Users/someone",
+      CODEX_HOME: "/Users/someone/.codex",
+      HTTPS_PROXY: "http://proxy.local:8080",
+      GOOGLE_CLIENT_ID: "id",
+      GOOGLE_CLIENT_SECRET: "secret",
+      MCP_TOKEN: "token",
+      PAGESPEED_API_KEY: "key",
+      AUTH_SESSION_SECRET: "session",
+      DB_PATH: "/data",
+      API_URL: "http://localhost:3031",
+    });
+    if (JSON.stringify(Object.keys(childEnv).sort()) !== JSON.stringify(["CODEX_HOME", "HOME", "HTTPS_PROXY", "PATH"])) {
+      throw new Error(`Codex jobs should get an allowlisted environment only: ${JSON.stringify(Object.keys(childEnv))}`);
+    }
+  }
+
   // Sessions: logout and password changes revoke existing session tokens.
   const auth = await import("../src/auth");
   const user = await auth.createOrReplaceAdmin("unit@example.com", "unit-password-123");
@@ -664,10 +706,13 @@ const emptyEvidenceUrl = `http://localhost:${emptyEvidenceServer.port}`;
 emptyEvidenceServer.stop(true);
 // Answers the pre-flight probe once, then dies — the crawl that follows gets
 // no pages, exercising the empty-evidence (0 pages, score 0) report path.
+// robots.txt answers 404 (no rules) while the server is up, so it is the
+// page request that fails, not robots.txt.
 let brokenFixtureRequests = 0;
 const brokenFixtureServer = Bun.serve({
   port: 0,
-  fetch() {
+  fetch(request) {
+    if (new URL(request.url).pathname === "/robots.txt") return new Response("missing", { status: 404 });
     brokenFixtureRequests += 1;
     if (brokenFixtureRequests === 1) {
       return new Response("<html><body>probe ok</body></html>", { headers: { "content-type": "text/html" } });
@@ -838,7 +883,9 @@ if (headNotFoundProbe?.status !== 200) {
   throw new Error(`The scan URL probe must retry with GET when HEAD returns 404: ${JSON.stringify(headNotFoundProbe)}`);
 }
 
-// A stand-in Codex CLI: it reports how it was invoked instead of calling a model.
+// A stand-in Codex CLI: it reports how it was invoked instead of calling a model
+// (including which features it was told to disable and which app secrets, if
+// any, reached its environment).
 const fakeCodexDir = path.join(tempDir, "bin");
 await Bun.write(
   path.join(fakeCodexDir, "codex"),
@@ -848,15 +895,22 @@ prev=""
 prompt=""
 dashdash=no
 search=no
+noconfig=no
+disabled=""
 for arg in "$@"; do
   if [ "$dashdash" = yes ] && [ -z "$prompt" ]; then prompt="$arg"; fi
-  if [ "$dashdash" = no ] && [ "$arg" = "--search" ]; then search=yes; fi
+  if [ "$dashdash" = no ] && [ "$arg" = 'web_search="live"' ]; then search=yes; fi
+  if [ "$dashdash" = no ] && [ "$arg" = "--ignore-user-config" ]; then noconfig=yes; fi
+  if [ "$dashdash" = no ] && [ "$prev" = "--disable" ]; then disabled="$disabled $arg"; fi
   if [ "$arg" = "--" ]; then dashdash=yes; fi
   if [ "$prev" = "-o" ]; then out="$arg"; fi
   prev="$arg"
 done
+leaked=$(env | cut -d= -f1 | grep -E '^(GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|MCP_TOKEN|PAGESPEED_API_KEY|PAGESPEED_API_URL|DB_PATH|API_URL|APP_URL)$' | tr '\\n' ' ')
+home=no
+if [ -n "$HOME" ]; then home=yes; fi
 sleep 0.5
-printf 'dashdash=%s\ncwd=%s\nsearch=%s\nprompt=%s\n' "$dashdash" "$(pwd)" "$search" "$prompt" > "$out"
+printf 'dashdash=%s\ncwd=%s\nsearch=%s\nnoconfig=%s\ndisabled=%s \nleaked=%s\nhome=%s\nprompt=%s\n' "$dashdash" "$(pwd)" "$search" "$noconfig" "$disabled" "$leaked" "$home" "$prompt" > "$out"
 `,
 );
 const { chmod } = await import("node:fs/promises");
@@ -1514,7 +1568,7 @@ try {
   ) {
     throw new Error("Fixture scan indexability summary does not match page-level evidence.");
   }
-  if (fixtureScan.result?.scanVersion !== 5) {
+  if (fixtureScan.result?.scanVersion !== 6 || fixtureScan.result?.limits?.robots !== "respect") {
     throw new Error("Fresh scans must identify the crawl semantics used for safe scan-to-scan comparisons.");
   }
   const redirectPage = fixturePages.find((page: any) => page.url === `${fixtureUrl}/redirect-final`);
@@ -2054,15 +2108,24 @@ try {
   if (edgePage("/xrobots-otherbot")?.indexable !== true || edgePage("/xrobots-googlebot")?.indexable !== false) {
     throw new Error("X-Robots-Tag rules must apply generic and googlebot directives and ignore other bots.");
   }
+  // The site's https origin does not answer TLS, so its robots.txt cannot be
+  // read: like Google, the crawler treats that host as disallowed, skips its
+  // URLs, and reports why. (Failed page rows: see the empty-evidence scan.)
   const tlsFailUrl = `${edgeUrl.replace("http:", "https:")}/tls-fail`;
-  const failedEdgePage = edgePages.find((page) => page.url === tlsFailUrl);
+  const tlsSkip = (edgeScan.result?.robotsSkipped?.urls || []).find((row: any) => row.url === tlsFailUrl);
+  const tlsRobotsIssue = edgeIssues.find(
+    (issue) => issue.type === "robots-unavailable" && issue.url === `${edgeUrl.replace("http:", "https:")}/robots.txt`,
+  );
   if (
-    !failedEdgePage?.error ||
-    failedEdgePage.status !== null ||
-    !edgeIssues.some((issue) => issue.url === tlsFailUrl && issue.type === "crawl-failed") ||
-    !(edgeScan.result?.summary?.failedPages >= 1)
+    edgePages.some((page) => page.url === tlsFailUrl) ||
+    tlsSkip?.rule !== null ||
+    tlsSkip.robotsStatus !== null ||
+    !tlsSkip.robotsError ||
+    tlsSkip.source !== "link" ||
+    tlsRobotsIssue?.severity !== "high" ||
+    !tlsRobotsIssue.evidence?.error
   ) {
-    throw new Error(`Pages that fail to load must get a page row: ${JSON.stringify(failedEdgePage)}`);
+    throw new Error(`A same-site host whose robots.txt cannot be read must be skipped with evidence: ${JSON.stringify({ tlsSkip, tlsRobotsIssue })}`);
   }
   const highIssueUrls = new Set(edgeIssues.filter((issue) => issue.severity === "high").map((issue) => issue.url));
   const expectedEdgeScore = Math.round((100 * edgePages.filter((page) => !highIssueUrls.has(page.url)).length) / edgePages.length);
@@ -2389,10 +2452,21 @@ try {
       if (
         checksPage("/blocked/page")?.robotsBlocked !== true ||
         checksPage("/blocked/ok/page")?.robotsBlocked !== false ||
-        checksPage("/private/page")?.robotsBlocked !== false ||
         checksPage("/")?.robotsBlocked !== false
       ) {
         throw new Error(`Pages must record whether robots.txt blocks them for Googlebot: ${JSON.stringify(checksPages.map((row) => [row.url, row.robotsBlocked]))}`);
+      }
+      // The crawler follows the `*` group (no LocalSEO group here), so
+      // /private/page is skipped, not crawled; Googlebot's group allows it.
+      const privateSkip = (checksScan.result?.robotsSkipped?.urls || []).find((row: any) => row.url === `${checksUrl}/private/page`);
+      if (
+        checksPage("/private/page") ||
+        privateSkip?.rule?.path !== "/private" ||
+        privateSkip.userAgentGroup !== "*" ||
+        privateSkip.source !== "link" ||
+        privateSkip.from !== `${checksUrl}/`
+      ) {
+        throw new Error(`URLs robots.txt disallows for LocalSEO must be skipped with their rule: ${JSON.stringify(checksScan.result?.robotsSkipped)}`);
       }
       const blockedPageIssue = checksIssuesFor("/blocked/page", "robots-blocked-page")[0];
       if (
@@ -2633,6 +2707,337 @@ try {
       }
     } finally {
       checksServer.stop(true);
+    }
+  }
+
+  // ── robots.txt-respecting crawl: URLs robots.txt disallows for LocalSEO are
+  // skipped (never requested) with evidence; Googlebot-based issues still
+  // fire; "ignore" fetches them; a blocked start URL or an unreadable
+  // robots.txt ends the scan with a site-level issue. Local fixtures only.
+  {
+    const { testRobots } = await import("../src/robots");
+
+    // Migration: databases from before sites.crawl_robots get it, defaulting
+    // existing sites to "respect".
+    const robotsMigrationDir = path.join(tempDir, "crawl-robots-migration");
+    const robotsMigrationEnv = { ...process.env, DB_PATH: robotsMigrationDir };
+    const initRobotsDb = () =>
+      Bun.spawnSync([process.execPath, "src/db.ts"], { cwd: rootDir, env: robotsMigrationEnv, stdout: "pipe", stderr: "pipe" }).exitCode;
+    initRobotsDb();
+    const beforeRobotsColumn = new Database(path.join(robotsMigrationDir, dbFileName));
+    beforeRobotsColumn.exec("ALTER TABLE sites DROP COLUMN crawl_robots");
+    beforeRobotsColumn.exec("INSERT INTO sites (id, name, domain) VALUES ('robots-migration', 'Robots migration', 'example.com')");
+    beforeRobotsColumn.close();
+    const robotsMigrationExit = initRobotsDb();
+    const afterRobotsColumn = new Database(path.join(robotsMigrationDir, dbFileName), { readonly: true });
+    const crawlRobotsColumn = afterRobotsColumn
+      .query<{ dflt_value: string; notnull: number }, []>("SELECT dflt_value, [notnull] FROM pragma_table_info('sites') WHERE name = 'crawl_robots'")
+      .get();
+    const migratedSite = afterRobotsColumn.query<{ crawl_robots: string }, []>("SELECT crawl_robots FROM sites WHERE id = 'robots-migration'").get();
+    afterRobotsColumn.close();
+    if (robotsMigrationExit !== 0 || crawlRobotsColumn?.dflt_value !== "'respect'" || crawlRobotsColumn.notnull !== 1 || migratedSite?.crawl_robots !== "respect") {
+      throw new Error(`sites.crawl_robots must be added with a 'respect' default: ${JSON.stringify({ robotsMigrationExit, crawlRobotsColumn, migratedSite })}`);
+    }
+
+    // Site setting: validated on create and update, "respect" by default.
+    if ((await requestFailure("/api/sites", { method: "POST", body: JSON.stringify({ name: "Bad robots", domain: "robots.example", crawlRobots: "sometimes" }) })).status !== 400) {
+      throw new Error("Creating a site with an unknown robots.txt setting must be refused.");
+    }
+
+    // Fixture: robots.txt has a LocalSEO group that differs from `*`, and a
+    // Googlebot group. Every request is logged by host and path.
+    let robotsFixtureUrl = "";
+    const robotsFixtureRequests: { host: string; path: string }[] = [];
+    const robotsFixtureTxt = [
+      "User-agent: *",
+      "Disallow: /star-only",
+      "Disallow: /private",
+      "",
+      "User-agent: LocalSEO",
+      "Disallow: /private",
+      "Allow: /private/open",
+      "Disallow: /localseo-only",
+      "Disallow: /assets/private",
+      "Disallow: /localseo-404-check",
+      "",
+      "User-agent: Googlebot",
+      "Disallow: /private",
+      "Allow: /private/open",
+      "Disallow: /googlebot-only",
+      "Disallow: /assets/private",
+      "",
+    ].join("\n");
+    const blockedLinkCount = 12;
+    const robotsFixtureServer = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { host, pathname } = new URL(request.url);
+        robotsFixtureRequests.push({ host, path: pathname });
+        const link = (href: string) => `<a href="${href}">${href}</a>`;
+        switch (pathname) {
+          case "/robots.txt":
+            return new Response(`${robotsFixtureTxt}Sitemap: ${robotsFixtureUrl}/sitemap.xml\n`);
+          case "/sitemap.xml":
+            return new Response(
+              `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${["/", "/sitemap-page", "/private/in-sitemap"].map((loc) => `<url><loc>${robotsFixtureUrl}${loc}</loc></url>`).join("")}</urlset>`,
+              { headers: { "content-type": "application/xml" } },
+            );
+          case "/":
+            // Disallowed links come first: if they used the 10-page budget,
+            // the allowed pages after them would never be crawled.
+            return htmlResponse(fixturePage(
+              "Robots home",
+              [
+                "/private/page",
+                "/localseo-only",
+                ...Array.from({ length: blockedLinkCount }, (_, index) => `/private/b${index}`),
+                "/private/open/page",
+                "/star-only",
+                "/googlebot-only",
+                "/moved",
+                "/allowed-a",
+                "/allowed-b",
+              ].map(link).join(" ") +
+                `<a href="${robotsFixtureUrl.replace("localhost", "127.0.0.1")}/private/external">Other host</a>` +
+                '<img src="/assets/private/logo.png" alt="Blocked logo" width="10" height="10"><img src="/assets/public/ok.png" alt="Allowed logo" width="10" height="10">' +
+                '<img src="/assets/public/moved.png" alt="Moved logo" width="10" height="10">',
+              '<link rel="stylesheet" href="/assets/private/site.css">',
+            ));
+          case "/moved":
+            return new Response(null, { status: 301, headers: { location: "/private/moved-target" } });
+          case "/assets/public/moved.png":
+            return new Response(null, { status: 301, headers: { location: "/assets/private/real.png" } });
+          case "/private/open/page":
+            return htmlResponse(fixturePage(
+              "Allowed back in",
+              link("/"),
+              `<link rel="canonical" href="${robotsFixtureUrl}/private/canonical-target"><link rel="alternate" hreflang="en" href="${robotsFixtureUrl}/private/open/page"><link rel="alternate" hreflang="es" href="${robotsFixtureUrl}/private/es">`,
+            ));
+          default:
+            if (pathname.endsWith(".png")) return new Response("png", { headers: { "content-type": "image/png" } });
+            if (pathname.endsWith(".css")) return new Response("body{}", { headers: { "content-type": "text/css" } });
+            return htmlResponse(fixturePage(`Robots ${pathname}`, link("/")));
+        }
+      },
+    });
+    robotsFixtureUrl = `http://localhost:${robotsFixtureServer.port}`;
+    const robotsFixtureHost = `localhost:${robotsFixtureServer.port}`;
+    // Servers for the start-URL-disallowed and unreadable-robots.txt cases.
+    const stoppedRequests: Record<string, string[]> = { blocked: [], unavailable: [] };
+    const blockedStartServer = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { pathname } = new URL(request.url);
+        stoppedRequests.blocked.push(pathname);
+        if (pathname === "/robots.txt") return new Response("User-agent: *\nDisallow: /\n");
+        return htmlResponse(fixturePage("Staging", "<p>Staging site.</p>"));
+      },
+    });
+    const unavailableRobotsServer = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { pathname } = new URL(request.url);
+        stoppedRequests.unavailable.push(pathname);
+        if (pathname === "/robots.txt") return new Response("unavailable", { status: 503 });
+        return htmlResponse(fixturePage("Live page", "<p>Robots is down.</p>"));
+      },
+    });
+    const robotsSiteBody = (name: string, port: number) =>
+      JSON.stringify({ name, domain: `localhost:${port}`, crawlProtocol: "http", crawlHost: "root", crawlMaxPages: 10 });
+    try {
+      const robotsSite = await request("/api/sites", { method: "POST", body: robotsSiteBody("Robots fixture", robotsFixtureServer.port as number) });
+      if (robotsSite.crawl_robots !== "respect") {
+        throw new Error(`Sites must respect robots.txt by default: ${JSON.stringify(robotsSite)}`);
+      }
+      const respectScan = await waitForScan((await request(`/api/sites/${robotsSite.id}/scan`, { method: "POST" })).scan.id);
+      const respectResult = respectScan.result || {};
+      const respectPages: any[] = respectResult.pages || [];
+      const respectIssues: any[] = respectResult.issues || [];
+      const skipped: any[] = respectResult.robotsSkipped?.urls || [];
+      const skipFor = (pathOrUrl: string) => skipped.find((row) => row.url === (pathOrUrl.startsWith("http") ? pathOrUrl : `${robotsFixtureUrl}${pathOrUrl}`));
+      const respectPage = (pagePath: string) => respectPages.find((row) => row.url === `${robotsFixtureUrl}${pagePath}`);
+      const respectIssuesFor = (pagePath: string, type: string) =>
+        respectIssues.filter((issue) => issue.url === `${robotsFixtureUrl}${pagePath}` && issue.type === type);
+      if (respectScan.status !== "completed" || respectResult.scanVersion !== 6 || respectResult.limits?.robots !== "respect") {
+        throw new Error(`A robots-respecting scan must complete and record its mode: ${JSON.stringify({ status: respectScan.status, error: respectScan.error, limits: respectResult.limits })}`);
+      }
+
+      // Never requested: every request to the site's host is one robots.txt
+      // allows for LocalSEO. Other hosts are not governed by it.
+      const disallowedRequests = robotsFixtureRequests.filter(
+        (row) => row.host === robotsFixtureHost && !testRobots(robotsFixtureTxt, `${robotsFixtureUrl}${row.path}`, "LocalSEO").allowed,
+      );
+      if (disallowedRequests.length) {
+        throw new Error(`The crawler must never request URLs robots.txt disallows for LocalSEO: ${JSON.stringify(disallowedRequests)}`);
+      }
+      if (!robotsFixtureRequests.some((row) => row.host !== robotsFixtureHost && row.path === "/private/external")) {
+        throw new Error("Links to other hosts are not governed by this site's robots.txt and must still be checked.");
+      }
+
+      // Skipped with evidence, by where each URL was found. The LocalSEO group
+      // applies, not `*` (/star-only is crawled, /localseo-only is not).
+      const home = `${robotsFixtureUrl}/`;
+      const openPage = `${robotsFixtureUrl}/private/open/page`;
+      const expectedSkips: [string, string, string, string | undefined][] = [
+        ["/private/page", "link", "/private", home],
+        ["/private/b0", "link", "/private", home],
+        ["/localseo-only", "link", "/localseo-only", home],
+        ["/private/in-sitemap", "sitemap", "/private", undefined],
+        ["/private/moved-target", "redirect", "/private", `${robotsFixtureUrl}/moved`],
+        ["/private/canonical-target", "canonical", "/private", openPage],
+        ["/private/es", "hreflang", "/private", openPage],
+        ["/assets/private/logo.png", "resource", "/assets/private", home],
+        ["/assets/private/site.css", "resource", "/assets/private", home],
+        ["/assets/private/real.png", "redirect", "/assets/private", `${robotsFixtureUrl}/assets/public/moved.png`],
+      ];
+      for (const [skipPath, source, rulePath, from] of expectedSkips) {
+        const row = skipFor(skipPath);
+        if (row?.source !== source || row.rule?.type !== "disallow" || row.rule?.path !== rulePath || row.userAgentGroup !== "LocalSEO" || row.from !== from) {
+          throw new Error(`${skipPath} must be skipped as ${source} with its LocalSEO rule: ${JSON.stringify(row)}`);
+        }
+      }
+      // A checked image redirecting to a disallowed URL stops at the redirect:
+      // it is reported as redirecting, with no type or size claimed for it.
+      const movedImage = (respectResult.images || []).find((row: any) => row.url === `${robotsFixtureUrl}/assets/public/moved.png`);
+      const movedImageIssues = respectIssues.filter((issue) => issue.evidence?.image === movedImage?.url).map((issue) => issue.type);
+      if (
+        movedImage?.skippedRedirect !== `${robotsFixtureUrl}/assets/private/real.png` ||
+        movedImage.contentType !== "" ||
+        JSON.stringify(movedImageIssues) !== JSON.stringify(["image-redirects"])
+      ) {
+        throw new Error(`Resource redirects into disallowed URLs must stop there: ${JSON.stringify({ movedImage, movedImageIssues })}`);
+      }
+      const probeSkip = skipped.find((row) => row.source === "soft-404");
+      if (
+        !probeSkip?.url?.startsWith(`${robotsFixtureUrl}/localseo-404-check-`) ||
+        probeSkip.rule?.path !== "/localseo-404-check" ||
+        respectResult.softNotFound?.robotsSkipped !== true ||
+        respectResult.softNotFound?.soft404 !== false ||
+        respectIssues.some((issue) => issue.type === "soft-404")
+      ) {
+        throw new Error(`A disallowed soft-404 probe must be skipped with a reason: ${JSON.stringify({ probeSkip, softNotFound: respectResult.softNotFound })}`);
+      }
+      const skippedCount = respectResult.robotsSkipped?.count;
+      // Every /private/bN link, the other expected URLs, and the probe, once each.
+      const expectedSkipCount =
+        new Set([...Array.from({ length: blockedLinkCount }, (_, index) => `/private/b${index}`), ...expectedSkips.map(([skipPath]) => skipPath)]).size + 1;
+      if (
+        skippedCount !== skipped.length ||
+        skippedCount !== expectedSkipCount ||
+        respectResult.summary?.robotsSkipped !== skippedCount ||
+        respectResult.progress?.robotsSkipped !== skippedCount ||
+        new Set(skipped.map((row) => row.url)).size !== skipped.length
+      ) {
+        throw new Error(`Skipped URLs must be counted once in the result, summary, and progress: ${JSON.stringify({ skippedCount, stored: skipped.length, summary: respectResult.summary?.robotsSkipped, progress: respectResult.progress?.robotsSkipped })}`);
+      }
+
+      // Skipped URLs have no page rows and do not use the page budget.
+      const expectedPages = ["/", "/private/open/page", "/star-only", "/googlebot-only", "/allowed-a", "/allowed-b", "/sitemap-page"];
+      if (
+        expectedPages.some((pagePath) => !respectPage(pagePath)) ||
+        respectPages.length !== expectedPages.length ||
+        respectPages.some((page) => skipped.some((row) => row.url === page.url))
+      ) {
+        throw new Error(`Allowed pages must all be crawled within the budget, and skipped URLs never: ${JSON.stringify(respectPages.map((page) => page.url))}`);
+      }
+
+      // Googlebot's view still comes from its own group, fetched or not.
+      const googlebotBlocked = respectIssuesFor("/googlebot-only", "robots-blocked-page")[0];
+      const skippedBlocked = respectIssuesFor("/private/page", "robots-blocked-page")[0];
+      const blockedResources = respectIssuesFor("/", "robots-blocked-resource")[0];
+      const blockedLinked = respectIssuesFor("/", "robots-blocked-linked")[0];
+      if (
+        googlebotBlocked?.evidence?.userAgentGroup !== "Googlebot" ||
+        googlebotBlocked.evidence.rule?.path !== "/googlebot-only" ||
+        skippedBlocked?.evidence?.crawled !== false ||
+        respectIssuesFor("/localseo-only", "robots-blocked-page").length ||
+        respectIssuesFor("/star-only", "robots-blocked-page").length ||
+        !respectIssuesFor("/private/in-sitemap", "robots-blocked-in-sitemap").length ||
+        !blockedLinked?.evidence?.blockedUrls?.some((row: any) => row.url === `${robotsFixtureUrl}/private/page`) ||
+        blockedResources?.severity !== "medium" ||
+        blockedResources.evidence?.count !== 2 ||
+        !blockedResources.evidence.blockedResources.some((row: any) => row.url === `${robotsFixtureUrl}/assets/private/site.css` && row.kind === "css")
+      ) {
+        throw new Error(`Googlebot-based robots issues must still fire: ${JSON.stringify({ googlebotBlocked, skippedBlocked, blockedResources, blockedLinked })}`);
+      }
+      const robotsCatalog = new Set((await request("/api/scan-issue-types")).map((row: any) => row.type));
+      for (const type of ["robots-blocked-resource", "robots-blocks-start-url", "robots-unavailable"]) {
+        if (!robotsCatalog.has(type)) throw new Error(`${type} must be in the issue catalog.`);
+      }
+
+      // "ignore" fetches disallowed URLs again and still flags them.
+      if ((await requestFailure(`/api/sites/${robotsSite.id}`, { method: "PUT", body: JSON.stringify({ crawl_robots: "never" }) })).status !== 400) {
+        throw new Error("Updating a site with an unknown robots.txt setting must be refused.");
+      }
+      const ignoringSite = await request(`/api/sites/${robotsSite.id}`, { method: "PUT", body: JSON.stringify({ crawl_robots: "ignore" }) });
+      const keptSetting = await request(`/api/sites/${robotsSite.id}`, { method: "PUT", body: JSON.stringify({ notes: "Keeps the robots setting" }) });
+      if (ignoringSite.crawl_robots !== "ignore" || keptSetting.crawl_robots !== "ignore") {
+        throw new Error(`The robots.txt setting must update and persist: ${JSON.stringify([ignoringSite.crawl_robots, keptSetting.crawl_robots])}`);
+      }
+      robotsFixtureRequests.length = 0;
+      const ignoreScan = await waitForScan((await request(`/api/sites/${robotsSite.id}/scan`, { method: "POST" })).scan.id);
+      const ignoreResult = ignoreScan.result || {};
+      const ignoredPage = (ignoreResult.pages || []).find((row: any) => row.url === `${robotsFixtureUrl}/private/page`);
+      const requestedPaths = new Set(robotsFixtureRequests.filter((row) => row.host === robotsFixtureHost).map((row) => row.path));
+      if (
+        ignoreScan.status !== "completed" ||
+        ignoreResult.limits?.robots !== "ignore" ||
+        ignoreResult.robotsSkipped?.count !== 0 ||
+        ignoredPage?.robotsBlocked !== true ||
+        !(ignoreResult.issues || []).some((issue: any) => issue.url === ignoredPage.url && issue.type === "robots-blocked-page") ||
+        !["/private/page", "/localseo-only", "/assets/private/logo.png", "/private/moved-target"].every((requested) => requestedPaths.has(requested)) ||
+        ![...requestedPaths].some((requested) => requested.startsWith("/localseo-404-check-")) ||
+        ignoreResult.comparison?.reason !== "scope-changed"
+      ) {
+        throw new Error(`"ignore" must fetch and flag disallowed URLs as before: ${JSON.stringify({ status: ignoreScan.status, limits: ignoreResult.limits, skipped: ignoreResult.robotsSkipped, ignoredPage, requested: [...requestedPaths], comparison: ignoreResult.comparison?.reason })}`);
+      }
+
+      // A start URL robots.txt disallows (staging sites): completed, nothing
+      // crawled or probed, one site-level issue.
+      const blockedStartSite = await request("/api/sites", { method: "POST", body: robotsSiteBody("Staging fixture", blockedStartServer.port as number) });
+      const blockedStartScan = await waitForScan((await request(`/api/sites/${blockedStartSite.id}/scan`, { method: "POST" })).scan.id);
+      const blockedStartIssues: any[] = blockedStartScan.result?.issues || [];
+      const startIssue = blockedStartIssues.find((issue) => issue.type === "robots-blocks-start-url");
+      const startSkip = blockedStartScan.result?.robotsSkipped?.urls?.[0];
+      if (
+        blockedStartScan.status !== "completed" ||
+        blockedStartScan.pages_crawled !== 0 ||
+        startIssue?.severity !== "high" ||
+        startIssue.evidence?.rule?.path !== "/" ||
+        startIssue.evidence.userAgentGroup !== "*" ||
+        startSkip?.source !== "start-url" ||
+        blockedStartIssues.some((issue) => issue.type === "no-pages-crawled") ||
+        stoppedRequests.blocked.some((requested) => requested !== "/robots.txt" && requested !== "/sitemap.xml")
+      ) {
+        throw new Error(`A disallowed start URL must end the scan with a site-level issue and no page request: ${JSON.stringify({ status: blockedStartScan.status, pages: blockedStartScan.pages_crawled, startIssue, startSkip, requested: stoppedRequests.blocked, issues: blockedStartIssues.map((issue) => issue.type) })}`);
+      }
+
+      // robots.txt answering 503: Google treats the site as disallowed, so
+      // nothing is crawled and the scan says why.
+      const unavailableSite = await request("/api/sites", { method: "POST", body: robotsSiteBody("Robots down fixture", unavailableRobotsServer.port as number) });
+      const unavailableScan = await waitForScan((await request(`/api/sites/${unavailableSite.id}/scan`, { method: "POST" })).scan.id);
+      const unavailableIssues: any[] = unavailableScan.result?.issues || [];
+      const unavailableIssue = unavailableIssues.find((issue) => issue.type === "robots-unavailable");
+      const unavailableSkip = unavailableScan.result?.robotsSkipped?.urls?.[0];
+      if (
+        unavailableScan.status !== "completed" ||
+        unavailableScan.pages_crawled !== 0 ||
+        unavailableIssue?.severity !== "high" ||
+        unavailableIssue.evidence?.status !== 503 ||
+        !/no page was crawled/.test(unavailableIssue.message) ||
+        unavailableIssues.some((issue) => issue.type === "robots-missing" || issue.type === "no-pages-crawled") ||
+        unavailableSkip?.source !== "start-url" ||
+        unavailableSkip.rule !== null ||
+        unavailableSkip.robotsStatus !== 503 ||
+        stoppedRequests.unavailable.some((requested) => requested !== "/robots.txt" && requested !== "/sitemap.xml")
+      ) {
+        throw new Error(`An unreadable robots.txt must stop the crawl with a site-level issue: ${JSON.stringify({ status: unavailableScan.status, pages: unavailableScan.pages_crawled, unavailableIssue, unavailableSkip, requested: stoppedRequests.unavailable })}`);
+      }
+      for (const site of [robotsSite, blockedStartSite, unavailableSite]) await request(`/api/sites/${site.id}`, { method: "DELETE" });
+    } finally {
+      robotsFixtureServer.stop(true);
+      blockedStartServer.stop(true);
+      unavailableRobotsServer.stop(true);
     }
   }
 
@@ -4163,6 +4568,19 @@ try {
   if (maxRunningJobs < 1 || maxRunningJobs > 2) {
     throw new Error(`Codex jobs should run at most two at a time, saw ${maxRunningJobs}.`);
   }
+  // --- Codex job hardening: the spawned CLI gets the hardened flags, its HOME
+  // (for its login), and none of the app's secrets or settings from .env.
+  for (const job of finishedJobs) {
+    if (
+      !job.result_text.includes("noconfig=yes") ||
+      !/^disabled=.* shell_tool .*$/m.test(job.result_text) ||
+      !/^disabled=.* unified_exec .*$/m.test(job.result_text) ||
+      !/^leaked=$/m.test(job.result_text) ||
+      !job.result_text.includes("home=yes")
+    ) {
+      throw new Error(`Codex jobs should run hardened with an allowlisted environment: ${JSON.stringify(job.result_text)}`);
+    }
+  }
   const siteJobs = await request(`/api/ai/jobs?siteId=${site.id}`);
   const dashboardJobs = (await request(`/api/dashboard?siteId=${site.id}`)).latestAiJobs || [];
   for (const rows of [siteJobs, dashboardJobs]) {
@@ -5034,7 +5452,9 @@ try {
     const overlapScanId = randomUUID();
     const overlapServer = Bun.serve({
       port: 0,
-      async fetch() {
+      async fetch(request) {
+        // The probe reads robots.txt first; only page requests are counted.
+        if (new URL(request.url).pathname === "/robots.txt") return new Response("missing", { status: 404 });
         overlapProbes += 1;
         if (overlapProbes === 1) {
           // A manual scan of the same site starts while the scheduler probes.
@@ -5097,8 +5517,8 @@ try {
 
     // Codex web search is off for jobs whose prompt carries crawled content.
     const { codexArgs } = await import("../src/codex");
-    if (codexArgs("p", "/tmp/w", "/tmp/w/o").includes("--search") || !codexArgs("p", "/tmp/w", "/tmp/w/o", true).includes("--search")) {
-      throw new Error("codexArgs should add --search only when web search is on.");
+    if (!codexArgs("p", "/tmp/w", "/tmp/w/o").includes('web_search="disabled"') || !codexArgs("p", "/tmp/w", "/tmp/w/o", true).includes('web_search="live"')) {
+      throw new Error("codexArgs should set web search live only when it is on, and disabled otherwise.");
     }
     await waitForIdleAiJobs();
     const newJob = (body: Record<string, unknown>) => request("/api/ai/jobs", { method: "POST", body: JSON.stringify(body) });

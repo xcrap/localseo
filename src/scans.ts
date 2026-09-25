@@ -3,9 +3,22 @@ import { XMLParser } from "fast-xml-parser";
 import { createHash, randomUUID } from "node:crypto";
 import { getConfigValue } from "./config";
 import { all, get, jsonParse, run, transaction } from "./db";
-import { fetchText, fetchWithRedirectTrace, type KnownResponse } from "./http";
-import { parseRobots, type RobotsVerdict, robotsMatcher, testRobots } from "./robots";
-import { localHostFirst, probeScanUrl, unreachableScanUrlError } from "./site-scan-url";
+import { fetchText, fetchWithRedirectTrace, type KnownResponse, localHostFirst } from "./http";
+import {
+  CRAWLER_ROBOTS_AGENT,
+  type CrawlRobotsMode,
+  crawlRobotsGate,
+  crawlRobotsMode,
+  MAX_ROBOTS_BYTES,
+  parseRobots,
+  type RobotsBlock,
+  type RobotsVerdict,
+  readRobots,
+  robotsMatcher,
+  robotsResponseAllowsAll,
+  testRobots,
+} from "./robots";
+import { probeScanUrl, unreachableScanUrlError } from "./site-scan-url";
 import { readStructuredData } from "./structured-data";
 
 export { parseRobots, testRobots };
@@ -18,8 +31,11 @@ export { parseRobots, testRobots };
 // crawl graph, near-duplicates within 8 simhash bits, percent-escape
 // insensitive URL keys, per-page outlinks (pageLinks), and page-limit based
 // sitemap coverage.
+// Version 6: robots.txt is respected by default — URLs it disallows for
+// LocalSEO are skipped (result.robotsSkipped) instead of fetched, so the
+// crawled page set differs from earlier scans (limits.robots records the mode).
 // Scans are only compared with scans that share the same crawl semantics.
-const SCAN_RESULT_VERSION = 5;
+const SCAN_RESULT_VERSION = 6;
 
 // Thrown for request problems the API should answer with a 4xx status.
 export class ScanRequestError extends Error {
@@ -375,7 +391,9 @@ export async function startScan(siteId: string, url: string, options: { reachabl
   const site = getSite(siteId);
   if (!site) throw new Error("Site not found.");
   const startUrl = /^https?:\/\//i.test(url.trim()) ? url.trim() : `https://${url.trim()}`;
-  if (!options.reachable && !(await probeScanUrl(startUrl))) throw unreachableScanUrlError(startUrl);
+  if (!options.reachable && !(await probeScanUrl(startUrl, crawlRobotsMode(site.crawl_robots)))) {
+    throw unreachableScanUrlError(startUrl);
+  }
   const scanId = randomUUID();
   run(
     "INSERT INTO scans (id, site_id, url, status, updated_at) VALUES (?, ?, ?, 'queued', CURRENT_TIMESTAMP)",
@@ -439,6 +457,9 @@ export const scanIssueTypes: Record<string, ScanIssueTypeInfo> = {
   "robots-blocked-page": { title: "Blocked by robots.txt", category: "robots", severity: "medium", why: "robots.txt disallows this URL for Googlebot, so Google cannot crawl its content.", fix: "Narrow or remove the Disallow rule if the page should be crawled; use noindex, not robots.txt, to keep a page out of search." },
   "robots-blocked-in-sitemap": { title: "Sitemap URL blocked by robots.txt", category: "robots", severity: "medium", why: "The sitemap asks Google to crawl a URL that robots.txt forbids, which sends conflicting signals.", fix: "Remove blocked URLs from the sitemap, or allow them in robots.txt." },
   "robots-blocked-linked": { title: "Links to URLs blocked by robots.txt", category: "robots", severity: "low", why: "Internal links to disallowed URLs lead crawlers to pages they may not fetch.", fix: "Confirm the blocked destinations are intentional, or link to crawlable URLs instead." },
+  "robots-blocked-resource": { title: "Page resources blocked by robots.txt", category: "robots", severity: "medium", why: "robots.txt disallows CSS, JavaScript, or images this page loads, so Googlebot cannot render the page the way visitors see it.", fix: "Allow Googlebot to fetch the stylesheets, scripts, and images pages need to render; only block resources that do not affect the page." },
+  "robots-blocks-start-url": { title: "Start URL blocked by robots.txt", category: "robots", severity: "high", why: "robots.txt disallows the scan's start URL for LocalSEO (its own user-agent group, or * when there is none), so the scan stopped without crawling any page. Staging and preview sites often ship Disallow: /.", fix: "Allow the start URL for LocalSEO in robots.txt (for example a User-agent: LocalSEO group with Allow: /), or set this site's robots.txt setting to Ignore to crawl disallowed URLs anyway." },
+  "robots-unavailable": { title: "robots.txt could not be read", category: "robots", severity: "high", why: "robots.txt answered with a server error or HTTP 429, or not at all. Google treats that as disallowing the whole site until it answers again, and LocalSEO does the same: nothing is crawled unless the site's robots.txt setting is Ignore.", fix: "Make /robots.txt answer 200 with your rules, or 404 if there are none; check server errors, firewalls, and rate limits, then rescan." },
   "sitemap-fetch-failed": { title: "Sitemap fetch failed", category: "sitemap", severity: "medium", why: "A sitemap that errors or does not parse cannot help crawlers discover URLs.", fix: "Fix the sitemap response status, XML syntax, or the reference to it." },
   "sitemap-too-large": { title: "Sitemap too large", category: "sitemap", severity: "medium", why: "Sitemaps over the 50 MB protocol limit are rejected by search engines and were not parsed here.", fix: "Split the sitemap into smaller files listed in a sitemap index." },
   "sitemap-missing-or-empty": { title: "No sitemap URLs", category: "sitemap", severity: "medium", why: "Without an XML sitemap, crawlers rely only on links to find pages.", fix: "Publish an XML sitemap of indexable URLs and reference it from robots.txt." },
@@ -590,7 +611,10 @@ const MAX_OUTLINKS_PER_PAGE = 200;
 const SUMMARY_SAVE_INTERVAL_MS = 1000;
 const RESULT_SAVE_INTERVAL_MS = 10_000;
 
-function scanLimitsFor(maxPages: number): typeof scanLimits {
+// A scan's crawl scope: its caps plus the robots.txt mode it crawled with.
+type ScanLimits = typeof scanLimits & { robots: CrawlRobotsMode };
+
+function scanLimitsFor(maxPages: number, robots: CrawlRobotsMode): ScanLimits {
   const factor = Math.max(1, maxPages / scanLimits.maxPages);
   return {
     maxPages,
@@ -600,6 +624,7 @@ function scanLimitsFor(maxPages: number): typeof scanLimits {
     maxAssetsToCheck: Math.round(scanLimits.maxAssetsToCheck * factor),
     maxLinkInventory: Math.round(scanLimits.maxLinkInventory * factor),
     maxImageInventory: Math.round(scanLimits.maxImageInventory * factor),
+    robots,
   };
 }
 
@@ -1222,7 +1247,7 @@ function buildScanComparison(
   previousScan: any,
   pages: any[],
   issues: any[],
-  limits: typeof scanLimits,
+  limits: ScanLimits,
   scanVersion = SCAN_RESULT_VERSION,
 ) {
   const previousResult = previousScan?.result;
@@ -1232,7 +1257,11 @@ function buildScanComparison(
   if (Number(previousResult.scanVersion || 0) !== Number(scanVersion || 0)) {
     return emptyScanComparison("incompatible-version", previousScan);
   }
-  if (Number(previousResult.limits?.maxPages || 0) !== Number(limits?.maxPages || 0)) {
+  // Scans saved before limits.robots fetched every URL, as "ignore" does.
+  if (
+    Number(previousResult.limits?.maxPages || 0) !== Number(limits?.maxPages || 0) ||
+    (previousResult.limits?.robots || "ignore") !== (limits?.robots || "ignore")
+  ) {
     return emptyScanComparison("scope-changed", previousScan);
   }
 
@@ -1479,34 +1508,47 @@ export function resourceFailureKind(error: unknown) {
 
 const resourceCheckTimeoutMs = 12000;
 
-async function checkResource(url: string, signal?: AbortSignal) {
+// skipRedirect: a redirect target the check must not request (robots.txt);
+// the check then ends at that redirect and names the target in
+// skippedRedirect.
+async function checkResource(url: string, signal?: AbortSignal, skipRedirect?: (url: string) => Promise<boolean>) {
   // Each request gets its own timeout so a slow HEAD cannot eat the GET retry.
   const requestSignal = () => {
     const timeout = AbortSignal.timeout(resourceCheckTimeoutMs);
     return signal ? AbortSignal.any([timeout, signal]) : timeout;
   };
   try {
-    let trace = await fetchWithRedirectTrace(url, {
-      method: "HEAD",
-      signal: requestSignal(),
-      headers: {
-        "User-Agent": "LocalSEO/0.1 (+https://localhost)",
-        Accept: "*/*",
-      },
-    });
-    // Some sites serve the page on GET but return 404 for HEAD.
-    // Confirm with a real content request before reporting a broken resource.
-    if ([403, 404, 405, 501].includes(trace.finalStatus)) {
-      await trace.response.body?.cancel().catch(() => undefined);
-      trace = await fetchWithRedirectTrace(url, {
-        method: "GET",
+    let trace = await fetchWithRedirectTrace(
+      url,
+      {
+        method: "HEAD",
         signal: requestSignal(),
         headers: {
           "User-Agent": "LocalSEO/0.1 (+https://localhost)",
           Accept: "*/*",
-          Range: "bytes=0-2048",
         },
-      });
+      },
+      undefined,
+      skipRedirect,
+    );
+    // Some sites serve the page on GET but return 404 for HEAD.
+    // Confirm with a real content request before reporting a broken resource.
+    if ([403, 404, 405, 501].includes(trace.finalStatus)) {
+      await trace.response.body?.cancel().catch(() => undefined);
+      trace = await fetchWithRedirectTrace(
+        url,
+        {
+          method: "GET",
+          signal: requestSignal(),
+          headers: {
+            "User-Agent": "LocalSEO/0.1 (+https://localhost)",
+            Accept: "*/*",
+            Range: "bytes=0-2048",
+          },
+        },
+        undefined,
+        skipRedirect,
+      );
     }
     const { response } = trace;
     await response.body?.cancel().catch(() => undefined);
@@ -1514,6 +1556,9 @@ async function checkResource(url: string, signal?: AbortSignal) {
     // is in Content-Range ("bytes 0-2048/524288"). Prefer that so size checks work.
     const rangeTotal = Number((response.headers.get("content-range") || "").split("/")[1]) || null;
     const partialLength = Number(response.headers.get("content-length") || 0) || null;
+    // A redirect whose target was not requested says nothing about the
+    // resource's type or size, so neither is recorded.
+    const skipped = Boolean(trace.stoppedBefore);
     return {
       ok: response.status < 400 && !trace.redirectError,
       status: trace.originalStatus,
@@ -1523,11 +1568,12 @@ async function checkResource(url: string, signal?: AbortSignal) {
       redirectChain: trace.redirectChain,
       redirectLoop: trace.redirectLoop,
       redirectError: trace.redirectError,
-      contentType: response.headers.get("content-type") || "",
-      contentLength: response.status === 206 ? rangeTotal ?? partialLength : partialLength,
-      contentEncoding: response.headers.get("content-encoding") || "",
+      contentType: skipped ? "" : response.headers.get("content-type") || "",
+      contentLength: skipped ? null : response.status === 206 ? rangeTotal ?? partialLength : partialLength,
+      contentEncoding: skipped ? "" : response.headers.get("content-encoding") || "",
       error: trace.redirectError,
       failureKind: trace.redirectError ? "redirect" : "",
+      ...(skipped ? { skippedRedirect: trace.stoppedBefore } : {}),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Request failed";
@@ -1550,56 +1596,6 @@ function failedResourceCheck(url: string, message: string) {
     error: message,
     failureKind: resourceFailureKind(message),
   };
-}
-
-// Google reads the first 500 KiB of robots.txt and ignores the rest.
-const MAX_ROBOTS_BYTES = 500 * 1024;
-
-// How Google treats a robots.txt response that is not a 2xx: a redirect that
-// never resolves or a 4xx (except 429) means there are no rules, so every URL
-// is allowed; 429, 5xx, and unreachable hosts mean the whole site is treated
-// as disallowed until robots.txt answers again.
-function robotsResponseAllowsAll(status: number | null | undefined) {
-  return typeof status === "number" && status >= 300 && status < 500 && status !== 429;
-}
-
-async function readRobots(origin: string, signal: AbortSignal) {
-  const url = `${origin}/robots.txt`;
-  try {
-    const response = await fetchText(url, 15000, { signal, maxBytes: MAX_ROBOTS_BYTES });
-    if (!response.ok) {
-      return {
-        exists: false,
-        url,
-        status: response.finalStatus,
-        sourceStatus: response.status,
-        redirectChain: response.redirectChain,
-        sitemaps: [],
-        disallowCount: 0,
-        blocksAll: false,
-        groups: [],
-      };
-    }
-    return {
-      exists: true,
-      url,
-      status: response.finalStatus,
-      sourceStatus: response.status,
-      redirectChain: response.redirectChain,
-      ...parseRobots(response.text),
-    };
-  } catch (error) {
-    return {
-      exists: false,
-      url,
-      status: null,
-      sitemaps: [],
-      disallowCount: 0,
-      blocksAll: false,
-      groups: [],
-      error: error instanceof Error ? error.message : "Could not fetch robots.txt",
-    };
-  }
 }
 
 // Tests one URL against the site's robots.txt, fetched live or passed in as a
@@ -1647,20 +1643,39 @@ export async function testSiteRobots(siteId: string, input: { url?: unknown; use
   };
 }
 
+// Where the crawler found a URL it did not request because robots.txt
+// disallows it (result.robotsSkipped).
+type RobotsSkipSource = "start-url" | "link" | "sitemap" | "canonical" | "hreflang" | "resource" | "redirect" | "soft-404";
+
+// Records a URL as skipped when robots.txt disallows it for the crawler and
+// returns why; null means the URL may be requested.
+type RobotsSkipCheck = (url: string, source: RobotsSkipSource, from?: string) => Promise<RobotsBlock | null>;
+
 // One request for a URL that cannot exist on the site. A 2xx answer, directly
 // or after redirects, means missing pages look like real pages (a soft 404).
 // The path is fixed per origin so the finding keeps its identity across scans.
-async function probeSoftNotFound(origin: string, signal: AbortSignal) {
+// It is not requested when robots.txt disallows it (robotsSkipped).
+async function probeSoftNotFound(origin: string, signal: AbortSignal, skipBlocked: RobotsSkipCheck) {
   const probeUrl = `${origin}/localseo-404-check-${createHash("sha1").update(origin).digest("hex").slice(0, 12)}`;
+  const block = await skipBlocked(probeUrl, "soft-404");
+  if (block) {
+    return { probeUrl, status: null, finalUrl: probeUrl, soft404: false, robotsSkipped: true, rule: block.rule, userAgentGroup: block.userAgentGroup };
+  }
   try {
-    const response = await fetchText(probeUrl, 15000, { signal, maxBytes: 64 * 1024 });
+    const response = await fetchText(probeUrl, 15000, {
+      signal,
+      maxBytes: 64 * 1024,
+      skipRedirect: async (targetUrl) => Boolean(await skipBlocked(targetUrl, "redirect", probeUrl)),
+    });
     return {
       probeUrl,
       status: response.finalStatus,
       sourceStatus: response.status,
       finalUrl: response.url,
       redirectChain: response.redirectChain,
-      soft404: response.finalStatus >= 200 && response.finalStatus < 300,
+      // A redirect to a disallowed URL ends the probe without a final answer.
+      ...(response.skippedRedirect ? { skippedRedirect: response.skippedRedirect } : {}),
+      soft404: !response.skippedRedirect && response.finalStatus >= 200 && response.finalStatus < 300,
     };
   } catch (error) {
     return {
@@ -1826,6 +1841,7 @@ function scanSummary(input: {
   imageInventory: any[];
   parameterUrlCount: number;
   parameterUrlTargetCount: number;
+  robotsSkippedCount: number;
   phase: string;
   partial?: boolean;
 }) {
@@ -1897,6 +1913,8 @@ function scanSummary(input: {
     externalLinks,
     parameterUrls: input.parameterUrlCount,
     parameterUrlTargets: input.parameterUrlTargetCount,
+    // URLs not requested because robots.txt disallows them for LocalSEO.
+    robotsSkipped: input.robotsSkippedCount,
     imageTags: imageInventory.length,
     imageTagsWithIssues: imageInventory.filter((image) => image.issues?.length).length,
     ...issueSummary(input.issues),
@@ -1907,6 +1925,7 @@ function scanSummary(input: {
 // plus the true count.
 const MAX_STORED_SITEMAP_URLS = 1000;
 const MAX_STORED_PARAMETER_URLS = 500;
+const MAX_STORED_ROBOTS_SKIPPED = 500;
 
 function scanResult(input: {
   startUrl: string;
@@ -1925,9 +1944,10 @@ function scanResult(input: {
   parameterUrlCount: number;
   parameterUrlTargetCount: number;
   robots: any;
+  robotsSkipped: { count: number; urls: any[] };
   sitemap: any;
   softNotFound: any;
-  limits: typeof scanLimits;
+  limits: ScanLimits;
   partial?: boolean;
   comparison?: any;
 }) {
@@ -1940,8 +1960,9 @@ function scanResult(input: {
     phase: input.phase,
     limits: input.limits,
     progress: input.progress,
-    summary: scanSummary({ ...input, issues: sortedIssues }),
+    summary: scanSummary({ ...input, robotsSkippedCount: input.robotsSkipped.count, issues: sortedIssues }),
     robots: input.robots,
+    robotsSkipped: input.robotsSkipped,
     sitemap: {
       ...input.sitemap,
       urls: sitemapUrls.slice(0, MAX_STORED_SITEMAP_URLS),
@@ -2284,25 +2305,33 @@ function pushNearDuplicateIssues(issues: any[], pages: any[]) {
   }
 }
 
+// Googlebot's view, whatever the crawler fetched: crawled pages Googlebot may
+// not crawl, page URLs the crawler skipped (robots.txt disallows them for
+// LocalSEO too, so they have no page row), and blocked sitemap entries.
 function pushRobotsBlockedIssues(
   issues: any[],
   pages: any[],
+  skippedPageUrls: string[],
   sitemapUrls: string[],
   robotsCheck: (url: string) => RobotsVerdict | null,
   robotsUrl: string,
 ) {
   const verdictEvidence = (verdict: RobotsVerdict) => ({ rule: verdict.matchedRule, userAgentGroup: verdict.userAgentGroup, robotsUrl });
-  for (const page of pages) {
-    const verdict = page.robotsBlocked ? robotsCheck(page.url) : null;
-    if (!verdict) continue;
+  const blockedPages = [
+    ...pages.flatMap((page) => (page.robotsBlocked ? [{ url: page.url, crawled: true }] : [])),
+    ...skippedPageUrls.map((url) => ({ url, crawled: false })),
+  ];
+  for (const { url, crawled } of blockedPages) {
+    const verdict = robotsCheck(url);
+    if (!verdict || verdict.allowed) continue;
     pushScanIssue(issues, {
-      url: page.url,
+      url,
       severity: "medium",
       category: "robots",
       type: "robots-blocked-page",
       message: "robots.txt disallows this URL for Googlebot",
       recommendation: "Narrow or remove the Disallow rule if the page should be crawled; use noindex, not robots.txt, to keep a page out of search.",
-      evidence: verdictEvidence(verdict),
+      evidence: { ...verdictEvidence(verdict), ...(crawled ? {} : { crawled: false }) },
     });
   }
   // Every sitemap entry is checked; issues keep a bounded sample plus the count.
@@ -2338,7 +2367,8 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   const siteMaxPages = Math.round(Number(site?.crawl_max_pages || 0));
   const defaultMaxPages = Math.round(Number(getConfigValue("default_crawl_max_pages") || 0));
   const maxPages = Math.max(10, Math.min(1000, siteMaxPages > 0 ? siteMaxPages : defaultMaxPages > 0 ? defaultMaxPages : scanLimits.maxPages));
-  const limits = scanLimitsFor(maxPages);
+  const robotsMode = crawlRobotsMode(site?.crawl_robots);
+  const limits = scanLimitsFor(maxPages, robotsMode);
   // Pacing only matters against real remote hosts; localhost targets crawl at full speed.
   const politeTarget = crawlSpeed === "polite" && !localHostFirst(new URL(startUrl).hostname);
   const localTarget = localHostFirst(new URL(startUrl).hostname);
@@ -2413,6 +2443,54 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     }
     return robotsVerdicts.get(url) ?? null;
   };
+  // The crawler's own robots.txt gate (the LocalSEO group, else `*`), set
+  // once robots.txt is read; the site's other origins (www, http) are read on
+  // first use. A URL it disallows is never requested: it is recorded once in
+  // robotsSkipped instead and does not use the page budget.
+  let crawlBlocked: (url: string) => Promise<RobotsBlock | null> = async () => null;
+  const robotsSkipped = { count: 0, urls: [] as any[] };
+  const robotsSkippedUrls = new Set<string>();
+  // The site's other origins whose robots.txt could not be read, each
+  // reported once (the start origin's is reported before the crawl).
+  const unavailableRobotsUrls = new Set<string>();
+  const skipBlocked: RobotsSkipCheck = async (url, source, from) => {
+    const block = await crawlBlocked(url);
+    if (!block || robotsSkippedUrls.has(url)) return block;
+    robotsSkippedUrls.add(url);
+    robotsSkipped.count += 1;
+    if (!block.rule && block.robotsUrl !== robots.url && !unavailableRobotsUrls.has(block.robotsUrl)) {
+      unavailableRobotsUrls.add(block.robotsUrl);
+      pushScanIssue(issues, {
+        url: block.robotsUrl,
+        severity: "high",
+        category: "robots",
+        type: "robots-unavailable",
+        message: `robots.txt could not be read (${block.robotsStatus ? `HTTP ${block.robotsStatus}` : "no answer"}), so URLs on ${new URL(block.robotsUrl).origin} were not crawled`,
+        recommendation: "Make /robots.txt answer 200 with your rules, or 404 if there are none, then rescan.",
+        evidence: { status: block.robotsStatus, error: block.robotsError, robotsMode, firstSkippedUrl: url },
+      });
+    }
+    if (robotsSkipped.urls.length < MAX_STORED_ROBOTS_SKIPPED) {
+      robotsSkipped.urls.push({
+        url,
+        rule: block.rule,
+        userAgentGroup: block.userAgentGroup,
+        source,
+        ...(from ? { from } : {}),
+        robotsUrl: block.robotsUrl,
+        ...(block.robotsStatus !== undefined ? { robotsStatus: block.robotsStatus } : {}),
+        ...(block.robotsError ? { robotsError: block.robotsError } : {}),
+      });
+    }
+    return block;
+  };
+  // A redirect hop from `from` to a disallowed URL stops there.
+  const skipRedirectFrom = (from: string) => async (url: string) => Boolean(await skipBlocked(url, "redirect", from));
+  // Page URLs the crawl skipped, for Googlebot's robots-blocked-page check.
+  const skippedPageUrls: string[] = [];
+  const skippedPageKeys = new Set<string>();
+  // The first crawled page linking to each page URL, as skip evidence.
+  const linkedFrom = new Map<string, string>();
   // Every resolved hreflang alternate per page URL; page rows keep a capped copy.
   const hreflangByPage = new Map<string, { lang: string; href: string }[]>();
   const startedAtMs = Date.now();
@@ -2532,6 +2610,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       startedAt: new Date(startedAtMs).toISOString(),
       elapsedMs,
       pagesPerSecond: elapsedMs > 0 ? Math.round((pages.length * 100_000) / elapsedMs) / 100 : 0,
+      robotsSkipped: robotsSkipped.count,
       phase,
     };
   };
@@ -2545,6 +2624,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     imageInventory,
     parameterUrlCount: parameterUrlKeys.size,
     parameterUrlTargetCount: parameterTargetKeys.size,
+    robotsSkippedCount: robotsSkipped.count,
     phase,
   });
 
@@ -2558,6 +2638,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       pageLinks,
       parameterUrls,
       robots,
+      robotsSkipped,
       sitemap,
       softNotFound,
       limits,
@@ -2575,7 +2656,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   const persistProgress = (mode: "tick" | "phase" | "checkpoint" = "tick") => {
     if (signal.aborted) return;
     const now = Date.now();
-    const signature = [pages.length, issues.length, checkedLinks.length, checkedImages.length, checkedAssets.length].join("|");
+    const signature = [pages.length, issues.length, checkedLinks.length, checkedImages.length, checkedAssets.length, robotsSkipped.count].join("|");
     if (signature !== savedResultSignature && (mode === "checkpoint" || now - lastResultSaveAt >= RESULT_SAVE_INTERVAL_MS)) {
       if (!crawlSettled) settlePages();
       saveScanResult(scanId, scan.site_id, "running", 0, currentResult());
@@ -2659,23 +2740,31 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   };
 
   // After a full crawl: sitemap pages the crawl never reached count as
-  // sitemap.notCrawledCount. When the sitemap lists more crawlable pages than
-  // the page limit, those were left out because of the limit.
-  const pushSitemapCoverageIssue = () => {
-    const notCrawledCount = sitemapTargets.filter((target) => !visited.has(target.key) && !processedContent.has(target.key)).length;
-    sitemap = { ...sitemap, notCrawledCount };
-    if (!notCrawledCount || sitemapTargets.length <= limits.maxPages) return;
+  // sitemap.notCrawledCount, and those robots.txt disallows for the crawler
+  // as sitemap.robotsBlockedCount. When the sitemap lists more crawlable pages
+  // than the page limit, the rest were left out because of the limit.
+  const pushSitemapCoverageIssue = async () => {
+    const notCrawled = sitemapTargets.filter((target) => !visited.has(target.key) && !processedContent.has(target.key));
+    let robotsBlockedCount = 0;
+    for (const target of notCrawled) {
+      if (skippedPageKeys.has(target.key) || (await crawlBlocked(target.url))) robotsBlockedCount += 1;
+    }
+    sitemap = { ...sitemap, notCrawledCount: notCrawled.length, robotsBlockedCount };
+    const crawlableCount = sitemapTargets.length - robotsBlockedCount;
+    const limitedCount = notCrawled.length - robotsBlockedCount;
+    if (!limitedCount || crawlableCount <= limits.maxPages) return;
     pushScanIssue(issues, {
       url: `${origin}/sitemap.xml`,
       severity: "low",
       category: "sitemap",
       type: "sitemap-larger-than-crawl-limit",
-      message: `${notCrawledCount} of ${sitemapTargets.length} sitemap pages were not crawled because of the ${limits.maxPages}-page limit`,
+      message: `${limitedCount} of ${crawlableCount} sitemap pages were not crawled because of the ${limits.maxPages}-page limit`,
       recommendation: "Raise the site's crawl page limit for a full-site run, or scan important sections separately.",
       evidence: {
         sitemapUrls: (sitemap.urls || []).length,
-        sitemapPages: sitemapTargets.length,
-        notCrawled: notCrawledCount,
+        sitemapPages: crawlableCount,
+        notCrawled: limitedCount,
+        robotsBlocked: robotsBlockedCount,
         pageLimit: limits.maxPages,
       },
     });
@@ -2707,9 +2796,13 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   phase = "robots";
   robots = await readRobots(origin, signal);
   throwIfCancelled();
-  if (robots.exists || robotsResponseAllowsAll(robots.status)) {
+  // A robots.txt answering 429/5xx or not at all: Google treats the whole
+  // site as disallowed, so in "respect" mode nothing is crawled.
+  const robotsUnavailable = !robots.exists && !robotsResponseAllowsAll(robots.status);
+  if (!robotsUnavailable) {
     robotsVerdictFor = robotsMatcher(robots.groups || [], "Googlebot");
   }
+  crawlBlocked = crawlRobotsGate({ mode: robotsMode, governs: (url) => sameSiteUrl(url, startUrl), files: [robots], signal });
   const robotsDelaySeconds = Number((robots as any).crawlDelaySeconds || 0);
   if (politeTarget && robotsDelaySeconds > 0) {
     pageDelayMs = Math.max(pageDelayMs, Math.min(robotsDelaySeconds * 1000, 10_000));
@@ -2730,7 +2823,21 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       sitemapTargets.push(target);
     }
   }
-  if (!robots.exists) {
+  if (robotsUnavailable) {
+    const answer = robots.status ? `HTTP ${robots.status}` : "no answer";
+    pushScanIssue(issues, {
+      url: robots.url,
+      severity: "high",
+      category: "robots",
+      type: "robots-unavailable",
+      message:
+        robotsMode === "respect"
+          ? `robots.txt could not be read (${answer}), so no page was crawled`
+          : `robots.txt could not be read (${answer}), so Google treats the whole site as disallowed`,
+      recommendation: "Make /robots.txt answer 200 with your rules, or 404 if there are none, then rescan.",
+      evidence: { status: robots.status, error: robots.error, robotsMode },
+    });
+  } else if (!robots.exists) {
     pushScanIssue(issues, {
       url: `${origin}/robots.txt`,
       severity: "low",
@@ -2806,9 +2913,29 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       evidence: { sitemaps: sitemap.sitemaps },
     });
   }
-  softNotFound = await probeSoftNotFound(origin, signal);
+  // A start URL the crawler may not request stops the scan here: no page, no
+  // probe, and a site-level issue explaining why (an unreadable robots.txt
+  // already has one).
+  const startBlock = await skipBlocked(startUrl, "start-url");
+  const crawlStopped = Boolean(startBlock);
+  if (startBlock) {
+    skippedPageKeys.add(startKey);
+    skippedPageUrls.push(startUrl);
+  }
+  if (startBlock?.rule) {
+    pushScanIssue(issues, {
+      url: startUrl,
+      severity: "high",
+      category: "robots",
+      type: "robots-blocks-start-url",
+      message: `robots.txt disallows the start URL for ${CRAWLER_ROBOTS_AGENT}, so no page was crawled`,
+      recommendation: `Allow the start URL for ${CRAWLER_ROBOTS_AGENT} in robots.txt, or set this site's robots.txt setting to Ignore to crawl disallowed URLs anyway.`,
+      evidence: { rule: startBlock.rule, userAgentGroup: startBlock.userAgentGroup, robotsUrl: startBlock.robotsUrl, userAgent: CRAWLER_ROBOTS_AGENT },
+    });
+  }
+  if (!crawlStopped) softNotFound = await probeSoftNotFound(origin, signal, skipBlocked);
   throwIfCancelled();
-  if (softNotFound.soft404) {
+  if (softNotFound?.soft404) {
     pushScanIssue(issues, {
       url: softNotFound.probeUrl,
       severity: "medium",
@@ -2840,7 +2967,11 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       pages.push(page);
     };
     const fetchPage = () =>
-      fetchText(requestedUrl, 15000, { signal, knownResponse: (url) => crawledPageResponses.get(url) });
+      fetchText(requestedUrl, 15000, {
+        signal,
+        knownResponse: (url) => crawledPageResponses.get(url),
+        skipRedirect: skipRedirectFrom(requestedUrl),
+      });
 
     try {
       // loadMs times the request itself: sleeps and queue waits are excluded.
@@ -2873,8 +3004,22 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         contentEncoding: response.contentEncoding,
         error: response.redirectError,
         failureKind: response.redirectError ? "redirect" : "",
+        ...(response.skippedRedirect ? { skippedRedirect: response.skippedRedirect } : {}),
         fromCrawl: true,
       });
+      // The redirect lands on a URL robots.txt disallows for the crawler: the
+      // hop is evidence about this URL, the target is never requested (it is
+      // in robotsSkipped) and has no page row.
+      if (response.skippedRedirect) {
+        recordRedirectIssues(requestedUrl, response);
+        const targetKey = normalizedUrlKey(response.skippedRedirect);
+        if (!skippedPageKeys.has(targetKey)) {
+          skippedPageKeys.add(targetKey);
+          skippedPageUrls.push(response.skippedRedirect);
+        }
+        persistProgress();
+        return;
+      }
       if (response.redirectError) {
         recordRedirectIssues(requestedUrl, response);
         const finalUrl = response.url || requestedUrl;
@@ -3104,10 +3249,17 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         if (resources.size >= max) return;
         resources.set(url, { url, from: current, sourcePages: [current], ...meta });
       };
-      const addAsset = (url: string, type: "css" | "js", meta: Record<string, unknown> = {}) =>
+      // CSS, JS, and images the page loads to render, for Googlebot's
+      // robots-blocked-resource check (every one, not only those checked).
+      const renderResources = new Map<string, "css" | "js" | "image">();
+      const addAsset = (url: string, type: "css" | "js", meta: Record<string, unknown> = {}) => {
+        renderResources.set(url, type);
         addResourceToCheck(assetsToCheck, limits.maxAssetsToCheck, url, { type, ...meta });
-      const addImageToCheck = (url: string, meta: Record<string, unknown> = {}) =>
+      };
+      const addImageToCheck = (url: string, meta: Record<string, unknown> = {}) => {
+        if (meta.purpose !== "og:image") renderResources.set(url, "image");
         addResourceToCheck(imagesToCheck, limits.maxImagesToCheck, url, meta);
+      };
 
       if (/^https?:\/\//i.test(ogImage)) addImageToCheck(ogImage, { purpose: "og:image" });
 
@@ -3243,11 +3395,13 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           internalInlinks.set(target.key, (internalInlinks.get(target.key) || 0) + 1);
           linkTargets.push(target.key);
           if (!discoveryByUrl.has(target.key)) discoveryByUrl.set(target.key, "internal-link");
+          if (!linkedFrom.has(target.key)) linkedFrom.set(target.key, current);
         }
         if (
           target &&
           !visited.has(target.key) &&
           !queued.has(target.key) &&
+          !skippedPageKeys.has(target.key) &&
           linkQueue.length + visited.size < limits.maxQueuedUrls
         ) {
           queued.add(target.key);
@@ -3906,6 +4060,23 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
           evidence: { count: robotsBlockedLinks.length, blockedUrls: robotsBlockedLinks.slice(0, 20), robotsUrl: robots.url },
         });
       }
+      const robotsBlockedResources = [...renderResources].flatMap(([url, kind]) => {
+        const verdict = robotsCheck(url);
+        return verdict && !verdict.allowed ? [{ url, kind, rule: verdict.matchedRule }] : [];
+      });
+      if (robotsBlockedResources.length > 0) {
+        // Blocked CSS/JS changes how Google renders the page; images alone do not.
+        const blocksRendering = robotsBlockedResources.some((resource) => resource.kind !== "image");
+        pushScanIssue(issues, {
+          url: current,
+          severity: blocksRendering ? "medium" : "low",
+          category: "robots",
+          type: "robots-blocked-resource",
+          message: `${robotsBlockedResources.length} resources this page loads are disallowed for Googlebot`,
+          recommendation: "Allow Googlebot to fetch the stylesheets, scripts, and images the page needs to render.",
+          evidence: { count: robotsBlockedResources.length, blockedResources: robotsBlockedResources.slice(0, 20), robotsUrl: robots.url },
+        });
+      }
       const trackingInternalLinks = linkRows.filter((link) => link.type === "internal" && isLikelyTrackingUrl(link.href));
       if (trackingInternalLinks.length > 0) {
         pushScanIssue(issues, {
@@ -4241,9 +4412,12 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   // Up to pageConcurrency page requests in flight, taken from the queue in
   // order. The page budget counts page rows plus requests in flight, so it is
   // never overshot: URLs that redirect to a page already crawled, or off the
-  // site, do not use it. Total requests stay bounded by the queue limit.
+  // site, do not use it, and neither do URLs robots.txt disallows (never
+  // requested). Total requests stay bounded by the queue limit.
   let fetchedPages = 0;
   let crawlSequence = 0;
+  const pageSkipSource = (key: string): RobotsSkipSource =>
+    key === startKey ? "start-url" : discoveryByUrl.get(key) === "sitemap" ? "sitemap" : "link";
   try {
     while (true) {
       throwIfCancelled();
@@ -4256,6 +4430,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         );
       }
       const canStart =
+        !crawlStopped &&
         inFlight.size < pageConcurrency &&
         pages.length + inFlight.size < limits.maxPages &&
         visited.size < limits.maxQueuedUrls;
@@ -4267,7 +4442,12 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
       }
       const requestedKey = normalizedUrlKey(requestedUrl);
       queued.delete(requestedKey);
-      if (visited.has(requestedKey) || processedContent.has(requestedKey)) continue;
+      if (visited.has(requestedKey) || processedContent.has(requestedKey) || skippedPageKeys.has(requestedKey)) continue;
+      if (await skipBlocked(requestedUrl, pageSkipSource(requestedKey), linkedFrom.get(requestedKey))) {
+        skippedPageKeys.add(requestedKey);
+        skippedPageUrls.push(requestedUrl);
+        continue;
+      }
       visited.add(requestedKey);
       if (politeTarget && fetchedPages > 0) {
         await sleep(pageDelayMs * (0.75 + Math.random() * 0.5), signal);
@@ -4284,16 +4464,24 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     await Promise.all(inFlight);
   }
   settleCrawl();
-  pushSitemapCoverageIssue();
+  if (!crawlStopped) await pushSitemapCoverageIssue();
   persistProgress("checkpoint");
 
-  // Resource checks: URLs the crawl already fetched reuse that response; the
-  // rest run concurrently (6 at once, at most 2 per host, 1 at a time against
-  // the scanned site when crawling politely).
+  // Resource checks: URLs the crawl already fetched reuse that response; URLs
+  // robots.txt disallows for the crawler are skipped (skipAs names where each
+  // was found); the rest run concurrently (6 at once, at most 2 per host, 1 at
+  // a time against the scanned site when crawling politely).
   const siteKey = siteHostKey(startUrl);
-  const checkResources = async (candidates: any[], afterCheck?: (candidate: any, result: any) => Promise<void>) => {
+  const checkResources = async (
+    candidates: any[],
+    skipAs: (candidate: any) => [RobotsSkipSource, string | undefined],
+    afterCheck?: (candidate: any, result: any) => Promise<void>,
+  ) => {
     const results: any[] = candidates.map((candidate) => crawledResources.get(candidate.url));
-    const pendingIndexes = results.flatMap((result, index) => (result ? [] : [index]));
+    const pendingIndexes: number[] = [];
+    for (const [index, candidate] of candidates.entries()) {
+      if (!results[index] && !(await skipBlocked(candidate.url, ...skipAs(candidate)))) pendingIndexes.push(index);
+    }
     pendingChecks = pendingIndexes.length;
     persistProgress("phase");
     await runBounded(
@@ -4305,7 +4493,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         if (politeTarget && siteHostKey(candidate.url) === siteKey) await sleep(120 + Math.random() * 180, signal);
         if (signal.aborted) return;
         progressUrl = candidate.url;
-        const result = await checkResource(candidate.url, signal);
+        const result = await checkResource(candidate.url, signal, skipRedirectFrom(candidate.url));
         if (signal.aborted) return;
         if (afterCheck) await afterCheck(candidate, result);
         results[index] = result;
@@ -4326,7 +4514,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
 
   phase = "checking links";
   const linkCandidates = [...linksToCheck.values()];
-  const linkResults = await checkResources(linkCandidates);
+  const linkResults = await checkResources(linkCandidates, (candidate) => ["link", candidate.sources.keys().next().value]);
   for (const [index, candidate] of linkCandidates.entries()) {
     const result = linkResults[index];
     if (!result) continue;
@@ -4413,16 +4601,21 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   phase = "checking canonical, hreflang, and sitemap links";
   const urlResponses = knownUrlResponses(crawledResources, checkedLinks, pages);
   const sitemapEntries = sitemapEntriesToAudit(sitemap.urls || [], pages, urlResponses, startUrl);
-  const targetUrls = [
-    ...new Set([
-      ...pages.map(canonicalTargetUrl),
-      ...[...hreflangByPage.values()].flatMap((entries) => entries.map((entry) => entry.href)),
-      ...sitemapEntries,
-    ]),
-  ]
-    .filter((url) => url && !urlResponses.has(url))
-    .slice(0, limits.maxLinksToCheck);
-  const targetResults = await checkResources(targetUrls.map((url) => ({ url })));
+  // Each target URL once, with where it was first found.
+  const targetSources = new Map<string, [RobotsSkipSource, string | undefined]>();
+  const addTarget = (url: string, source: RobotsSkipSource, from?: string) => {
+    if (url && !urlResponses.has(url) && !targetSources.has(url)) targetSources.set(url, [source, from]);
+  };
+  for (const page of pages) addTarget(canonicalTargetUrl(page), "canonical", page.url);
+  for (const [from, entries] of hreflangByPage) {
+    for (const entry of entries) addTarget(entry.href, "hreflang", from);
+  }
+  for (const url of sitemapEntries) addTarget(url, "sitemap");
+  const targetUrls = [...targetSources.keys()].slice(0, limits.maxLinksToCheck);
+  const targetResults = await checkResources(
+    targetUrls.map((url) => ({ url })),
+    (candidate) => targetSources.get(candidate.url) as [RobotsSkipSource, string | undefined],
+  );
   for (const [index, url] of targetUrls.entries()) {
     if (targetResults[index]) urlResponses.set(url, targetResults[index]);
   }
@@ -4436,7 +4629,8 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   const checkQueuedImages = async () => {
     const candidates = [...imagesToCheck.values()].filter((candidate) => !checkedImageUrls.has(candidate.url));
     for (const candidate of candidates) checkedImageUrls.add(candidate.url);
-    const results = await checkResources(candidates);
+    // Images found in a stylesheet were found on that stylesheet.
+    const results = await checkResources(candidates, (candidate) => ["resource", candidate.css || candidate.from]);
     for (const [index, candidate] of candidates.entries()) {
       const result = results[index];
       if (!result) continue;
@@ -4514,16 +4708,17 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
   const assetCandidates = [...assetsToCheck.values()];
   // Background images referenced from stylesheets, found while checking CSS.
   const cssImageUrls = new Map<string, string[]>();
-  const assetResults = await checkResources(assetCandidates, async (candidate, result) => {
+  const assetResults = await checkResources(assetCandidates, (candidate) => ["resource", candidate.from], async (candidate, result) => {
     if (
       candidate.type !== "css" ||
       !result.ok ||
+      result.skippedRedirect ||
       (result.contentType && !/(text\/css|octet-stream|text\/plain)/i.test(result.contentType)) ||
       (result.contentLength && result.contentLength > 1000000)
     ) {
       return;
     }
-    const cssResponse = await fetchText(candidate.url, 8000, { signal }).catch(() => null);
+    const cssResponse = await fetchText(candidate.url, 8000, { signal, skipRedirect: skipRedirectFrom(candidate.url) }).catch(() => null);
     if (cssResponse?.ok) cssImageUrls.set(candidate.url, cssUrlValues(cssResponse.text, cssResponse.url || candidate.url));
   });
   for (const [index, candidate] of assetCandidates.entries()) {
@@ -4662,7 +4857,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     }
   }
   pushNearDuplicateIssues(issues, pages);
-  pushRobotsBlockedIssues(issues, pages, sitemap.urls || [], robotsCheck, robots.url);
+  pushRobotsBlockedIssues(issues, pages, skippedPageUrls, sitemap.urls || [], robotsCheck, robots.url);
   if (sitemapUrlSet.size > 0) {
     for (const page of pages.filter((item) => item.indexable)) {
       if (!sitemapUrlSet.has(normalizedUrlKey(page.finalUrl || page.url)) && !sitemapUrlSet.has(normalizedUrlKey(page.url))) {
@@ -4702,7 +4897,8 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
     });
   }
   // Failed pages have rows, but a scan where nothing answered has no evidence.
-  if (!pages.some((page) => !page.error)) {
+  // A crawl robots.txt stopped already has a site-level issue saying why.
+  if (!crawlStopped && !pages.some((page) => !page.error)) {
     pushScanIssue(issues, {
       url: startUrl,
       severity: "high",
@@ -4717,6 +4913,7 @@ async function runLocalScan(scanId: string, signal: AbortSignal) {
         checkedLinks: checkedLinks.length,
         checkedImages: checkedImages.length,
         checkedAssets: checkedAssets.length,
+        robotsSkipped: robotsSkipped.count,
       },
     });
   }

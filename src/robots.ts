@@ -1,7 +1,10 @@
 // robots.txt parsing and Google-style URL matching (RFC 9309 plus Google's
 // documented interpretation): the most specific user-agent group applies,
 // the longest matching rule wins, Allow wins ties, and `*` / trailing `$`
-// are wildcards.
+// are wildcards. The end of the file reads robots.txt over HTTP and decides
+// which URLs this app's own crawler may request.
+
+import { fetchText } from "./http";
 
 export type RobotsRule = { type: "allow" | "disallow"; path: string };
 export type RobotsGroup = { userAgents: string[]; rules: RobotsRule[] };
@@ -184,4 +187,130 @@ export function robotsMatcher(groups: RobotsGroup[], userAgent = "Googlebot") {
 
 export function testRobots(robotsTxt: string, url: string, userAgent = "Googlebot"): RobotsVerdict {
   return robotsMatcher(parseRobots(robotsTxt).groups, userAgent)(url);
+}
+
+// Google reads the first 500 KiB of robots.txt and ignores the rest.
+export const MAX_ROBOTS_BYTES = 500 * 1024;
+
+// How Google treats a robots.txt response that is not a 2xx: a redirect that
+// never resolves or a 4xx (except 429) means there are no rules, so every URL
+// is allowed; 429, 5xx, and unreachable hosts mean the whole site is treated
+// as disallowed until robots.txt answers again.
+export function robotsResponseAllowsAll(status: number | null | undefined) {
+  return typeof status === "number" && status >= 300 && status < 500 && status !== 429;
+}
+
+export async function readRobots(origin: string, signal?: AbortSignal) {
+  const url = `${origin}/robots.txt`;
+  try {
+    const response = await fetchText(url, 15000, { signal, maxBytes: MAX_ROBOTS_BYTES });
+    if (!response.ok) {
+      return {
+        exists: false,
+        url,
+        status: response.finalStatus,
+        sourceStatus: response.status,
+        redirectChain: response.redirectChain,
+        sitemaps: [],
+        disallowCount: 0,
+        blocksAll: false,
+        groups: [],
+      };
+    }
+    return {
+      exists: true,
+      url,
+      status: response.finalStatus,
+      sourceStatus: response.status,
+      redirectChain: response.redirectChain,
+      ...parseRobots(response.text),
+    };
+  } catch (error) {
+    return {
+      exists: false,
+      url,
+      status: null,
+      sitemaps: [],
+      disallowCount: 0,
+      blocksAll: false,
+      groups: [],
+      error: error instanceof Error ? error.message : "Could not fetch robots.txt",
+    };
+  }
+}
+
+export type RobotsFile = Awaited<ReturnType<typeof readRobots>>;
+
+// The product token of the crawler's User-Agent ("LocalSEO/0.1 ..." in
+// http.ts). robots.txt groups naming it apply to the crawler, else `*`.
+export const CRAWLER_ROBOTS_AGENT = "LocalSEO";
+
+// Per-site setting (sites.crawl_robots): "respect" never requests a URL
+// robots.txt disallows for the crawler; "ignore" requests it anyway. Either
+// way the Googlebot checks still report what Google may not crawl.
+export type CrawlRobotsMode = "respect" | "ignore";
+
+export function crawlRobotsMode(value: unknown): CrawlRobotsMode {
+  return value === "ignore" ? "ignore" : "respect";
+}
+
+// Why the crawler must not request a URL: the rule and user-agent group that
+// disallow it, or (rule null) a robots.txt that could not be read, which
+// counts as disallowing every URL on that host.
+export type RobotsBlock = {
+  rule: RobotsRule | null;
+  userAgentGroup: string;
+  robotsUrl: string;
+  robotsStatus?: number | null;
+  robotsError?: string;
+};
+
+function crawlerBlockFor(file: RobotsFile) {
+  if (file.exists) {
+    const verdictFor = robotsMatcher(file.groups, CRAWLER_ROBOTS_AGENT);
+    return (url: string): RobotsBlock | null => {
+      const verdict = verdictFor(url);
+      return verdict.allowed ? null : { rule: verdict.matchedRule, userAgentGroup: verdict.userAgentGroup, robotsUrl: file.url };
+    };
+  }
+  if (robotsResponseAllowsAll(file.status)) return () => null;
+  const block: RobotsBlock = {
+    rule: null,
+    userAgentGroup: "",
+    robotsUrl: file.url,
+    robotsStatus: file.status,
+    ...("error" in file && file.error ? { robotsError: file.error } : {}),
+  };
+  return (url: string) => (robotsUrlPath(url) === "/robots.txt" ? null : block);
+}
+
+// The crawler's robots.txt gate: resolves to the block for a URL it must not
+// request, or null. Each origin's own robots.txt decides (read once, on first
+// use; `files` are already-read ones). URLs outside `governs` (other sites)
+// and every URL in "ignore" mode are allowed.
+export function crawlRobotsGate(options: {
+  mode: CrawlRobotsMode;
+  governs?: (url: string) => boolean;
+  files?: RobotsFile[];
+  signal?: AbortSignal;
+}) {
+  const byOrigin = new Map<string, Promise<(url: string) => RobotsBlock | null>>();
+  for (const file of options.files || []) byOrigin.set(new URL(file.url).origin, Promise.resolve(crawlerBlockFor(file)));
+  return async (url: string): Promise<RobotsBlock | null> => {
+    if (options.mode === "ignore" || (options.governs && !options.governs(url))) return null;
+    let origin: string;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      origin = parsed.origin;
+    } catch {
+      return null;
+    }
+    let blockFor = byOrigin.get(origin);
+    if (!blockFor) {
+      blockFor = readRobots(origin, options.signal).then(crawlerBlockFor);
+      byOrigin.set(origin, blockFor);
+    }
+    return (await blockFor)(url);
+  };
 }

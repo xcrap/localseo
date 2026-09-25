@@ -8,6 +8,7 @@ import { getConfigValue } from "./config";
 import { DEFAULT_KEYWORD_LANGUAGE_CODE, DEFAULT_KEYWORD_LOCATION_CODE } from "./defaults";
 import { badRequest, notFound } from "./errors";
 import { fetchJson } from "./http";
+import type { CrawlRobotsMode } from "./robots";
 import { clearIssueIgnores, clearScans, createIssueIgnore, deleteIssueIgnore, deleteScan, getScan, listAllScans, listIssueIgnores, listScans, sameSiteUrl, startScan } from "./scans";
 
 export { clearIssueIgnores, clearScans, createIssueIgnore, deleteIssueIgnore, deleteScan, getScan, listAllScans, listIssueIgnores, listScans, sameSiteUrl, startScan };
@@ -23,6 +24,7 @@ export type Site = {
   crawl_host: CrawlHost;
   crawl_speed: CrawlSpeed;
   crawl_max_pages: number;
+  crawl_robots: CrawlRobotsMode;
   created_at: string;
   updated_at: string;
 };
@@ -100,6 +102,14 @@ export function normalizeCrawlMaxPages(value: unknown) {
   const pages = Math.round(Number(value));
   if (!Number.isFinite(pages) || pages <= 0) return 0;
   return Math.max(10, Math.min(1000, pages));
+}
+
+// Whether scans skip URLs robots.txt disallows: absent keeps `fallback`, and
+// anything other than "respect" or "ignore" is refused rather than guessed.
+function crawlRobotsInput(value: unknown, fallback: CrawlRobotsMode): CrawlRobotsMode {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === "respect" || value === "ignore") return value;
+  throw badRequest('robots.txt handling must be "respect" or "ignore".');
 }
 
 function defaultLocationCode() {
@@ -455,6 +465,8 @@ export function createSite(input: {
   crawl_host?: CrawlHost | string;
   crawl_speed?: CrawlSpeed | string;
   crawl_max_pages?: number;
+  crawlRobots?: unknown;
+  crawl_robots?: unknown;
 }) {
   const id = randomUUID();
   const domain = domainInput(input.domain);
@@ -468,10 +480,11 @@ export function createSite(input: {
   const crawlHost = normalizeCrawlHost(input.crawlHost ?? input.crawl_host ?? getConfigValue("default_crawl_host"));
   const crawlSpeed = normalizeCrawlSpeed(input.crawlSpeed ?? input.crawl_speed);
   const crawlMaxPages = normalizeCrawlMaxPages(input.crawlMaxPages ?? input.crawl_max_pages);
+  const crawlRobots = crawlRobotsInput(input.crawlRobots ?? input.crawl_robots, "respect");
   run(
     `
-    INSERT INTO sites (id, name, domain, notes, location_code, language_code, crawl_protocol, crawl_host, crawl_speed, crawl_max_pages)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sites (id, name, domain, notes, location_code, language_code, crawl_protocol, crawl_host, crawl_speed, crawl_max_pages, crawl_robots)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     [
       id,
@@ -484,6 +497,7 @@ export function createSite(input: {
       crawlHost,
       crawlSpeed,
       crawlMaxPages,
+      crawlRobots,
     ],
   );
   return getSite(id)!;
@@ -497,7 +511,7 @@ export function updateSite(siteId: string, input: Record<string, unknown>) {
   run(
     `
     UPDATE sites
-    SET name = ?, domain = ?, notes = ?, location_code = ?, language_code = ?, crawl_protocol = ?, crawl_host = ?, crawl_speed = ?, crawl_max_pages = ?, updated_at = CURRENT_TIMESTAMP
+    SET name = ?, domain = ?, notes = ?, location_code = ?, language_code = ?, crawl_protocol = ?, crawl_host = ?, crawl_speed = ?, crawl_max_pages = ?, crawl_robots = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
     `,
     [
@@ -510,6 +524,7 @@ export function updateSite(siteId: string, input: Record<string, unknown>) {
       normalizeCrawlHost(input.crawl_host ?? input.crawlHost ?? existing.crawl_host),
       normalizeCrawlSpeed(input.crawl_speed ?? input.crawlSpeed ?? existing.crawl_speed),
       normalizeCrawlMaxPages(input.crawl_max_pages ?? input.crawlMaxPages ?? existing.crawl_max_pages),
+      crawlRobotsInput(input.crawl_robots ?? input.crawlRobots, existing.crawl_robots),
       siteId,
     ],
   );

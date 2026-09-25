@@ -109,6 +109,11 @@ export const crawlSpeedOptions = [
   { value: "fast", label: "Fast — local and staging" },
 ] as const;
 
+export const crawlRobotsOptions = [
+  { value: "respect", label: "Respect (recommended)" },
+  { value: "ignore", label: "Ignore — crawl disallowed URLs anyway" },
+] as const;
+
 export function defaultCrawlSpeedFromConfig(config?: any): "polite" | "fast" {
   return config?.default_crawl_speed === "fast" ? "fast" : "polite";
 }
@@ -999,6 +1004,8 @@ export function scanLiveProgress(scan: any) {
     crawled,
     limit,
     queued: optionalNumber(progress.queued),
+    /** URLs skipped so far because robots.txt disallows them; null for older scans. */
+    robotsSkipped: optionalNumber(progress.robotsSkipped),
     currentUrl: String(progress.currentUrl || ""),
     pagesPerSecond: optionalNumber(progress.pagesPerSecond),
     elapsedMs,
@@ -1197,6 +1204,10 @@ export function scanCoverageMetrics(scan: any, result: any = {}, summary: any = 
     storedSitemapUrls: storedSitemapUrls ? storedSitemapUrls.length : null,
     /** Sitemap URLs this crawl never fetched; null when the crawler did not report it. */
     sitemapUrlsNotCrawled: knownNumber(result.sitemap?.notCrawledCount),
+    /** URLs not requested because robots.txt disallows them for LocalSEO; null for scans from before the crawler respected robots.txt. */
+    robotsSkipped: knownNumber(result.robotsSkipped?.count ?? summary.robotsSkipped ?? result.progress?.robotsSkipped),
+    /** robots.txt mode the scan crawled with ("respect" / "ignore"); null for older scans. */
+    robotsMode: result.limits?.robots === "respect" || result.limits?.robots === "ignore" ? (result.limits.robots as "respect" | "ignore") : null,
     /** Crawled pages that a sitemap lists. */
     sitemapListedPages: maxCount(summary.sitemapUrls, pages.filter((page: any) => page.sitemapListed).length),
     pagesMissingFromSitemap: summary.pagesMissingFromSitemap != null

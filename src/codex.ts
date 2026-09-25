@@ -6,12 +6,40 @@ import { codexModel, codexReasoningEffort } from "./config";
 import { all, get, run } from "./db";
 import { badRequest, notFound } from "./errors";
 
-// Local Codex CLI jobs, saved in ai_jobs. Each job runs `codex exec` in an
-// empty temp directory with the read-only sandbox, which can still read the
-// whole disk (database/ holds Google refresh tokens). Web search is the job's
-// only way to send data out, so it is turned off for jobs whose prompt embeds
-// crawled page content (scan.prioritize, jobs with `context` or a `scanId`);
-// ai_jobs.web_search records which mode a job ran in.
+// Local Codex CLI jobs, saved in ai_jobs. A job only needs the model to read
+// its prompt and answer in text, and prompts can carry text from crawled pages
+// (a prompt-injection channel), so every `codex exec` run (see codexArgs and
+// codexEnv; checked against codex-cli 0.155.1) gets:
+// - no shell: the shell_tool and unified_exec features are off, so the model
+//   has no command tool and cannot read database/ (Google refresh tokens,
+//   sessions), .env, or ~/.codex; a call to one answers "unsupported call";
+// - no other tools that reach data or the outside: ChatGPT apps/connectors
+//   (Gmail, Drive, GitHub… offered even with --ignore-user-config), plugins,
+//   browser and computer use, image tools, hooks, memories, multi-agent, goals;
+// - --ignore-user-config and --ignore-rules: the user's ~/.codex config.toml
+//   (MCP servers, profiles, model/provider settings) and execpolicy rules are
+//   not loaded; login still comes from CODEX_HOME (auth.json) or CODEX_API_KEY;
+// - --ephemeral: no session file with the prompt is written under ~/.codex;
+// - an environment reduced to codexEnvKeys, so app secrets loaded from .env
+//   (GOOGLE_CLIENT_SECRET, MCP_TOKEN, PAGESPEED_API_KEY, DB_PATH…) never reach it;
+// - web search set explicitly: "live" only for jobs built from the user's own
+//   prompt, "disabled" for jobs whose prompt embeds crawled page content
+//   (scan.prioritize, jobs with `context` or a `scanId`). Codex otherwise
+//   defaults to cached web search. ai_jobs.web_search records the mode.
+// What stays (no 0.155.1 setting removes it): apply_patch and
+// request_user_input; and, when the model's catalog entry asks for them (such
+// as gpt-6-astra), a JavaScript `exec` tool — a V8 isolate with no file
+// system, network, or Node APIs whose only nested tools are then apply_patch
+// and a clock — plus agent-coordination tools (spawning a sub-agent fails in
+// an --ephemeral run). The read-only sandbox rejects every apply_patch write,
+// but Codex checks a patch against the target file before the sandbox, so a
+// patch can learn whether a file exists and whether an exact guessed line is
+// in it (never the file's content). The Codex process itself runs as the user
+// and sends the prompt to the model provider. A future Codex release could
+// add a tool under a new feature name: an unknown name in
+// disabledCodexFeatures fails the job ("Unknown feature flag"), but new names
+// are not switched off by themselves, so re-check `codex features list` and
+// the tools a job is offered when upgrading Codex.
 
 const codexTimeoutMs = Number(process.env.CODEX_TIMEOUT_MS || 600000);
 // Each job is a full Codex CLI process; run at most this many at once and keep
@@ -19,8 +47,58 @@ const codexTimeoutMs = Number(process.env.CODEX_TIMEOUT_MS || 600000);
 const maxConcurrentJobs = Math.max(1, Number(process.env.CODEX_MAX_CONCURRENT || 2) || 2);
 const pendingJobs: string[] = [];
 let runningJobCount = 0;
-// App credentials Codex never needs; keep them out of the spawned environment.
-const hiddenEnvKeys = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "MCP_TOKEN", "PAGESPEED_API_KEY"];
+
+// Codex features, on by default, that give the model tools app jobs never use.
+// Each name must exist in the installed CLI (see `codex features list`).
+export const disabledCodexFeatures = [
+  "shell_tool",
+  "unified_exec",
+  "shell_snapshot",
+  "apps",
+  "plugins",
+  "remote_plugin",
+  "tool_suggest",
+  "browser_use",
+  "browser_use_external",
+  "computer_use",
+  "in_app_browser",
+  "view_image",
+  "image_generation",
+  "hooks",
+  "memories",
+  "multi_agent",
+  "goals",
+  "sleep_tool",
+];
+
+// The only environment variables a Codex job gets: what the CLI needs to run,
+// find its login, and reach the API through a proxy or custom CA.
+const codexEnvKeys = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "CODEX_HOME",
+  "CODEX_SQLITE_HOME",
+  "CODEX_API_KEY",
+  "OPENAI_API_KEY",
+  "CODEX_CA_CERTIFICATE",
+  "SSL_CERT_FILE",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+];
 
 export type AiJob = {
   id: string;
@@ -209,20 +287,18 @@ async function runAiJob(id: string) {
 }
 
 // Codex runs in an empty per-job directory, never in the app checkout, with
-// the read-only sandbox. Read-only still lets Codex read any file the user can
-// (including database/ with Google refresh tokens and .env); it only blocks
-// writes and network access from commands. The one outbound channel left is
-// web search (--search), which is off for jobs that embed crawled content
-// (see jobUsesCrawledContent). The prompt goes after "--" so text starting
-// with "-" can never be parsed as a CLI option.
+// the tools listed in the module comment switched off. The read-only sandbox
+// stays on as a backstop for apply_patch. The prompt goes after "--" so text
+// starting with "-" can never be parsed as a CLI option.
 export function codexArgs(prompt: string, workDir: string, outputPath: string, webSearch = false) {
   const args = [
     "codex",
-    ...(webSearch ? ["--search"] : []),
     "--ask-for-approval",
     "never",
     "exec",
     "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
     "--skip-git-repo-check",
     "--color",
     "never",
@@ -230,26 +306,42 @@ export function codexArgs(prompt: string, workDir: string, outputPath: string, w
     workDir,
     "-s",
     "read-only",
+    "--config",
+    `web_search="${webSearch ? "live" : "disabled"}"`,
+    "--config",
+    "skills.include_instructions=false",
+    "--config",
+    'history.persistence="none"',
   ];
+  for (const feature of disabledCodexFeatures) args.push("--disable", feature);
   const model = codexModel();
   const effort = codexReasoningEffort();
   if (model) args.push("--model", model);
-  if (effort) args.push("--config", `model_reasoning_effort="${effort}"`);
+  if (effort) args.push("--config", `model_reasoning_effort=${JSON.stringify(effort)}`);
   args.push("-o", outputPath, "--", prompt);
   return args;
+}
+
+export function codexEnv(source: Record<string, string | undefined> = process.env) {
+  const env: Record<string, string> = {};
+  for (const key of codexEnvKeys) {
+    const value = source[key];
+    if (value) env[key] = value;
+  }
+  return env;
 }
 
 async function runCodex(prompt: string, webSearch: boolean): Promise<{ text: string; json: unknown | null }> {
   const workDir = await mkdtemp(path.join(os.tmpdir(), "local-seo-codex-"));
   const outputPath = path.join(workDir, "last-message.txt");
   try {
-    const env = { ...process.env };
-    for (const key of hiddenEnvKeys) delete env[key];
+    // stdin is closed: `codex exec` otherwise waits to append piped input to the prompt.
     const proc = Bun.spawn(codexArgs(prompt, workDir, outputPath, webSearch), {
       cwd: workDir,
+      stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env,
+      env: codexEnv(),
     });
     const stdoutPromise = new Response(proc.stdout).text();
     const stderrPromise = new Response(proc.stderr).text();

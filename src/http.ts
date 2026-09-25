@@ -1,5 +1,29 @@
 import { gunzipSync } from "node:zlib";
-import { localFetchTls } from "./site-scan-url";
+
+export function localHostFirst(domain: string) {
+  const host = (
+    domain.startsWith("[") && domain.includes("]")
+      ? domain.slice(1, domain.indexOf("]"))
+      : domain.split(":")[0]
+  )?.toLowerCase() || "";
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+  // .localhost, .test, and .internal are reserved for local use; .local is
+  // mDNS. None of them resolve on the public internet.
+  return [".localhost", ".test", ".local", ".internal"].some((suffix) => host.endsWith(suffix));
+}
+
+// Bun's fetch validates TLS against its bundled roots and never reads the OS
+// keychain, so a locally-trusted dev CA (mkcert, Caddy internal) fails with
+// "unable to get local issuer certificate" even though browsers accept it.
+// Local hosts are this machine — skip verification there only, and keep
+// strict TLS for every real site.
+export function localFetchTls(url: string): { tls?: { rejectUnauthorized: boolean } } {
+  try {
+    return localHostFirst(new URL(url).hostname) ? { tls: { rejectUnauthorized: false } } : {};
+  } catch {
+    return {};
+  }
+}
 
 // Read at most this many bytes of a response body. Real HTML pages are far
 // smaller; the cap stops a linked PDF/ZIP/video from being buffered into memory.
@@ -16,12 +40,13 @@ const redirectStatuses = new Set([301, 302, 303, 307, 308]);
 
 // stopBefore: a redirect whose target it accepts is not followed; the trace
 // ends with that target as finalUrl and `stoppedBefore` set, so the caller can
-// reuse a response it already has for that exact URL.
+// reuse a response it already has for that exact URL, or leave a target it
+// must not request (robots.txt) unfetched.
 export async function fetchWithRedirectTrace(
   url: string,
   init: RequestInit = {},
   maxRedirects = 128,
-  stopBefore?: (targetUrl: string) => boolean,
+  stopBefore?: (targetUrl: string) => boolean | Promise<boolean>,
 ) {
   let currentUrl = url;
   const redirectChain: RedirectHop[] = [];
@@ -117,7 +142,7 @@ export async function fetchWithRedirectTrace(
     }
 
     await response.body?.cancel().catch(() => undefined);
-    if (stopBefore?.(targetUrl)) {
+    if (await stopBefore?.(targetUrl)) {
       return {
         response,
         finalUrl: targetUrl,
@@ -221,13 +246,16 @@ type FetchTextOptions = {
   // but the target is not downloaded again (the result has reused: true and
   // an empty text).
   knownResponse?: (url: string) => KnownResponse | undefined;
+  // A redirect target that must not be requested (robots.txt disallows it):
+  // the trace stops before it and the result names it in skippedRedirect.
+  skipRedirect?: (url: string) => boolean | Promise<boolean>;
 };
 
 export async function fetchText(url: string, timeoutMs = 15000, options: FetchTextOptions = {}) {
   const maxBytes = options.maxBytes ?? MAX_BODY_BYTES;
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = options.signal ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
-  const knownResponse = options.knownResponse;
+  const { knownResponse, skipRedirect } = options;
   const trace = await fetchWithRedirectTrace(
     url,
     {
@@ -238,7 +266,9 @@ export async function fetchText(url: string, timeoutMs = 15000, options: FetchTe
       },
     },
     undefined,
-    knownResponse ? (targetUrl) => Boolean(knownResponse(targetUrl)) : undefined,
+    knownResponse || skipRedirect
+      ? async (targetUrl) => Boolean(knownResponse?.(targetUrl)) || Boolean(await skipRedirect?.(targetUrl))
+      : undefined,
   );
   const known = trace.stoppedBefore ? knownResponse?.(trace.stoppedBefore) : undefined;
   if (known) {
@@ -259,9 +289,34 @@ export async function fetchText(url: string, timeoutMs = 15000, options: FetchTe
       truncated: false,
       text: "",
       reused: true,
+      skippedRedirect: "",
     };
   }
   const { response } = trace;
+  if (trace.stoppedBefore) {
+    // skipRedirect refused the target: the redirect is the last response, url
+    // names the target that was never requested, and nothing is known about
+    // that target's content.
+    return {
+      ok: false,
+      status: trace.originalStatus,
+      finalStatus: trace.finalStatus,
+      url: trace.finalUrl,
+      redirected: true,
+      redirectChain: trace.redirectChain,
+      redirectLoop: false,
+      redirectError: "",
+      contentType: "",
+      contentLength: null,
+      contentEncoding: "",
+      xRobotsTag: "",
+      retryAfter: "",
+      truncated: false,
+      text: "",
+      reused: false,
+      skippedRedirect: trace.stoppedBefore,
+    };
+  }
   const contentType = response.headers.get("content-type") || "";
   const raw = await readCappedBody(response, maxBytes);
   const body = raw.truncated ? raw : gunzipBody(raw.bytes, maxBytes);
@@ -283,6 +338,7 @@ export async function fetchText(url: string, timeoutMs = 15000, options: FetchTe
     truncated: body.truncated,
     text: decodeBody(body.bytes, contentType),
     reused: false,
+    skippedRedirect: "",
   };
 }
 

@@ -32,6 +32,7 @@ data connectors only when you configure them.
 - **Organic research:** local crawl pages plus organic CSV imports for ranked keywords, top pages, traffic, and keyword counts.
 - **Links and backlinks:** local crawl link graph from scans, plus backlink CSV import for web-wide backlink rows, referring domains, and top linked pages. Backlinks are never generated locally. Follow state comes from the export's rel, Nofollow/UGC/Sponsored, or follow columns; rows without it stay unknown and the dofollow ratio covers known rows only.
 - **Site scans:** local crawler for titles, descriptions, metadata length, H1/H2, heading hierarchy, canonicals, noindex, robots, sitemap indexes, schema, social tags, page response timing, missing/generic/long image alt text, image dimensions, broken links, broken images, broken CSS/JS assets, duplicate titles/descriptions/content, issue groups, progress, detail inspection, and deletion.
+- **robots.txt and the crawler:** scans respect robots.txt by default. The crawler (User-Agent `LocalSEO/0.1`) follows the `User-agent: LocalSEO` group, or `*` when there is none, and never requests a URL it disallows: pages, sitemap URLs, links, images, CSS/JS, canonical/hreflang targets, redirect hops on the site, and the soft-404 probe. Skipped URLs are listed with their rule and where they were found (`result.robotsSkipped`) and do not use the page budget. A robots.txt answering 429/5xx or not at all counts as disallowing everything, as it does for Google, and so does a disallowed start URL: the scan completes with nothing crawled and a site-level issue. The Googlebot-based robots issues still report what Google may not crawl. Set a site's robots.txt setting to Ignore (`crawl_robots: "ignore"`) to crawl disallowed URLs anyway, for example on a staging site.
 - **Search Console insights:** `GET /api/sites/:id/insights/gsc-crawl` matches stored Search Console pages with a completed crawl (pages with impressions that are noindex, non-200, redirected, canonicalized elsewhere, or blocked; indexable pages without impressions; Search Console pages the crawl never reached or that are missing from the sitemap; and pages whose CTR is under half the site's own median CTR at the same position). `insights/cannibalization` lists queries where two or more pages each earn at least 10% of the impressions (from query + page rows), with the URLs rank checks recorded for that keyword; `minImpressions` filters on the query's total impressions across its pages. `insights/decay` compares two windows of stored page data. By default they fit the newest page + date batch: the last 28 days that have rows (Search Console's final data stops a few days before a sync's end date) vs the 28 before, or two equal halves of at least 7 days when fewer than 56 days are stored, with a `note` saying so. Page changes come from the latest completed scan on or before each window's end. URLs match ignoring protocol, `www`, fragments, trailing slashes, and the case of percent-escapes. Without the data they need, these answer `available: false` with the reason and never estimate.
 - **Core Web Vitals:** `POST /api/sites/:id/cwv` runs PageSpeed Insights in the background (2 at a time) for chosen URLs, or the latest scan's most linked indexable pages. Field values are the Chrome UX Report p75 values PSI returns for the URL (`null` when Google has none), origin field data is kept separately, and lab values come from Lighthouse.
 - **Schedules and notifications:** each site can scan itself and each rank tracker can check its keywords daily, weekly, or monthly while the app is running (`/api/sites/:id/schedule`, `/api/rank-trackers/:id/schedule`). Everything is off until you turn it on. Monthly runs keep the day of the month the schedule was set on (the last day in shorter months). Next run times live in SQLite, so a restart picks them up; a job whose site or tracker is already running skips that slot. Notifications (`/api/notifications`) report scans with page regressions or new high-severity issues against the previous scan, failed scheduled scans, and failed or partial scheduled rank checks; they stay until you delete them.
@@ -138,16 +139,47 @@ next start.
   `bun run admin:password` signs out every session. After 5 login attempts for
   an email that did not succeed, logins for it are paused for 15 minutes;
   attempts count as they start, so parallel guesses share the limit.
-- Codex jobs run read-only in an empty temporary directory (never the app
-  checkout with `database/` and `.env`), at most `CODEX_MAX_CONCURRENT` (default
-  2) at a time, with the prompt passed after `--`. The read-only sandbox still
-  lets Codex read any file your user can, including `database/` (Google
-  refresh tokens). Jobs whose prompt embeds crawled page text — `scan.prioritize`,
-  and any job created with `context` or a `scanId` (for example from
-  `GET /api/scans/:id/ai-context`) — run without Codex web search, so text
-  planted on a crawled page cannot make Codex send data out in search queries.
-  Other job types keep web search; `ai_jobs.web_search` records which mode a
-  job used.
+- Codex jobs only read their prompt and answer in text. Each job runs
+  `codex exec` in an empty temporary directory (never the app checkout), at
+  most `CODEX_MAX_CONCURRENT` (default 2) at a time, with the prompt passed
+  after `--`, and:
+  - no shell: the `shell_tool` and `unified_exec` features are disabled, so
+    Codex has no command tool and cannot read `database/` (Google refresh
+    tokens, sessions), `.env`, or `~/.codex`;
+  - no connectors or other tools: ChatGPT apps (Gmail, Drive, GitHub…),
+    plugins, browser and computer use, image tools, hooks, memories,
+    multi-agent, and goals are disabled (the full list is
+    `disabledCodexFeatures` in `src/codex.ts`);
+  - `--ignore-user-config` and `--ignore-rules`: your `~/.codex/config.toml`
+    (MCP servers, profiles, model and provider settings) and execpolicy rules
+    are not loaded. Login still comes from `CODEX_HOME`/`~/.codex` or
+    `CODEX_API_KEY`. Set the model with `CODEX_MODEL` or in Settings;
+  - `--ephemeral`: no Codex session file with the prompt is saved;
+  - only `PATH`, `HOME`, locale/`TMPDIR`, `CODEX_HOME`, Codex/OpenAI API keys,
+    and proxy/CA variables are passed on, so app secrets from `.env`
+    (`GOOGLE_CLIENT_SECRET`, `MCP_TOKEN`, `PAGESPEED_API_KEY`, `DB_PATH`…)
+    never reach Codex;
+  - web search set explicitly. Jobs whose prompt embeds crawled page text —
+    `scan.prioritize`, and any job created with `context` or a `scanId` (for
+    example from `GET /api/scans/:id/ai-context`) — run with web search
+    disabled, so text planted on a crawled page cannot make Codex send data
+    out in search queries. Other job types get live web search;
+    `ai_jobs.web_search` records which mode a job used.
+
+  What remains (checked against `codex-cli` 0.155.1): Codex still offers tools
+  no setting removes — `apply_patch` and `request_user_input`, plus, for
+  models whose catalog entry asks for them (such as `gpt-6-astra`), a
+  JavaScript `exec` tool (a V8 isolate with no file system, network, or Node
+  APIs, whose only nested tools are then `apply_patch` and a clock) and
+  agent-coordination tools (spawning a sub-agent fails in these ephemeral
+  jobs). The read-only sandbox rejects every
+  `apply_patch` write, but Codex checks a patch against its target file before
+  the sandbox, so a patch can learn whether a file exists and whether an exact
+  guessed line is in it, never the file's content. The prompt and answer go to
+  your Codex model provider as with any Codex use. A newer Codex release can
+  add tools under new feature names: an unknown name in the disabled list
+  makes jobs fail with "Unknown feature flag", but new names are not disabled
+  automatically, so check `codex features list` when you upgrade Codex.
 
 ## Local Data Model
 

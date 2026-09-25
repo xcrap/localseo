@@ -140,6 +140,9 @@ export function gscCrawlInsights(siteId: string, input: { scanId?: unknown; star
     const key = page.requestedUrl ? pageUrlKey(String(page.requestedUrl)) : "";
     if (key && !byUrl.has(key) && !byRedirectSource.has(key)) byRedirectSource.set(key, page);
   }
+  // URLs the crawler did not request because robots.txt disallows them for it.
+  const robotsSkipped = Array.isArray(scan.result?.robotsSkipped?.urls) ? scan.result.robotsSkipped.urls : [];
+  const robotsSkippedKeys = new Set(robotsSkipped.map((row: any) => pageUrlKey(String(row?.url || ""))));
 
   const sections = emptySections();
   for (const [key, metrics] of gsc.pages) {
@@ -150,9 +153,11 @@ export function gscCrawlInsights(siteId: string, input: { scanId?: unknown; star
         ...metricsRow(metrics),
         reason: !sameSiteUrl(metrics.url, startUrl)
           ? `Outside the crawled host (the scan started at ${startUrl}).`
-          : limitReached
-            ? `Not reached: the crawl stopped at its ${maxPages}-page limit, so this page may exist beyond it.`
-            : "Not reached by the crawl through internal links or the sitemap.",
+          : robotsSkippedKeys.has(key)
+            ? "Not crawled: robots.txt disallows it for the LocalSEO crawler."
+            : limitReached
+              ? `Not reached: the crawl stopped at its ${maxPages}-page limit, so this page may exist beyond it.`
+              : "Not reached by the crawl through internal links or the sitemap.",
       });
       continue;
     }

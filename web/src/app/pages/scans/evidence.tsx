@@ -5,7 +5,7 @@ import { CountUp, EmptyState, JsonBlock, MetricTile, MetricTileGrid, ReportSecti
 import { FilteredRows } from "../../data-table";
 import { ScanSection } from "./common";
 import { ScanIssuesTable } from "./issues";
-import { RobotsGroups, RobotsTester, robotsFileSummary, softNotFoundEvidenceRow } from "./robots";
+import { RobotsGroups, RobotsSkippedUrls, RobotsTester, robotsAgent, robotsFileSummary, robotsModeEvidenceRow, softNotFoundEvidenceRow } from "./robots";
 import type { IssueCatalog } from "./issue-catalog";
 import { ScanAssetsTable, ScanSpeedPagesTable, pageCsvColumns, pageSortValues, speedVariant } from "./tables";
 
@@ -41,9 +41,11 @@ export function ScanCrawlEvidence({
 }) {
   const sitemapRows = Array.isArray(result.sitemap?.sitemaps) ? result.sitemap.sitemaps : [];
   const robotsFile = result.robots ? robotsFileSummary(result.robots) : null;
+  const sitemapRobotsBlocked = Number(result.sitemap?.robotsBlockedCount || 0);
   const sitemapEvidence = [
     "URLs listed in sitemap files and used for crawl discovery.",
     coverage.sitemapUrlsNotCrawled != null ? `${formatNumber(coverage.sitemapUrlsNotCrawled)} of them were not crawled in this scan.` : "",
+    sitemapRobotsBlocked ? `${formatNumber(sitemapRobotsBlocked)} of those are disallowed for ${robotsAgent} by robots.txt.` : "",
     coverage.storedSitemapUrls != null && coverage.sitemapUrls != null && coverage.storedSitemapUrls < coverage.sitemapUrls
       ? `This report stores the first ${formatNumber(coverage.storedSitemapUrls)}.`
       : "",
@@ -76,6 +78,9 @@ export function ScanCrawlEvidence({
   ];
   const coverageRows = [
     { metric: "Pages crawled", count: coverage.pages, detail: `${formatNumber(coverage.sitemapListedPages)} sitemap-listed pages` },
+    ...(coverage.robotsSkipped != null
+      ? [{ metric: "Not crawled (robots.txt)", count: coverage.robotsSkipped, detail: `URLs robots.txt disallows for ${robotsAgent}, never requested. Listed under URLs not crawled.` }]
+      : []),
     { metric: "Indexable pages", count: coverage.indexablePages, detail: `${formatNumber(coverage.nonIndexablePages)} noindex/non-indexable · ${formatNumber(coverage.unknownIndexabilityPages)} unknown` },
     { metric: "Missing from sitemap", count: coverage.pagesMissingFromSitemap, detail: "Indexable crawled pages not listed in XML sitemaps", problem: true },
     { metric: "Noindex in sitemap", count: coverage.noindexPagesInSitemap, detail: "Non-indexable pages that still appear in XML sitemaps", problem: true },
@@ -97,10 +102,13 @@ export function ScanCrawlEvidence({
               tone: row.tone as any,
               text: <span className="break-all">{row.evidence}</span>,
             })),
+            robotsModeEvidenceRow(result),
             softNotFoundEvidenceRow(result),
           ]}
         />
       </ReportSection>
+
+      <RobotsSkippedUrls result={result} />
 
       <RobotsGroups robots={result.robots} />
 
