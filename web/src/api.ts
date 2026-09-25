@@ -9,6 +9,8 @@ export type Site = {
   crawl_host: "auto" | "root" | "www" | "both";
   crawl_speed: "auto" | "polite" | "fast";
   crawl_max_pages: number;
+  /** "respect": scans skip URLs robots.txt disallows for LocalSEO; "ignore": they crawl them anyway. */
+  crawl_robots: "respect" | "ignore";
 };
 
 export type KeywordResult = {

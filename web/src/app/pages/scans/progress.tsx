@@ -1,5 +1,5 @@
 import { MetricTile, MetricTileGrid, ProgressBar, ReportSection, StatusEvidenceTable, formatDuration, formatNumber, scanCoverageMetrics, scanCrawlLabel, scanIsActive, scanLiveProgress, scanPhaseKey, scanPhaseLabel } from "../../shared";
-import { robotsFileSummary } from "./robots";
+import { robotsAgent, robotsFileSummary } from "./robots";
 
 type ScanStepState = "complete" | "running" | "pending" | "failed" | "cancelled" | "skipped";
 
@@ -73,6 +73,12 @@ export function ScanProgressPanel({
   const robotsFound = robotsLabel ? `robots.txt ${robotsLabel.charAt(0).toLowerCase()}${robotsLabel.slice(1)}` : "robots.txt not read yet";
   const sitemapFiles = Array.isArray(result.sitemap?.sitemaps) ? result.sitemap.sitemaps.length : 0;
   const pagesCrawled = Math.max(live.crawled, coverage.pages);
+  // Scans from before the crawler respected robots.txt have no count.
+  const robotsSkipped = Math.max(live.robotsSkipped ?? 0, coverage.robotsSkipped ?? 0);
+  const robotsSkippedText =
+    coverage.robotsSkipped != null || live.robotsSkipped != null
+      ? ` · ${formatNumber(robotsSkipped)} URLs not crawled because robots.txt disallows ${robotsAgent}`
+      : "";
   const steps = [
     {
       label: "Resolve start URL",
@@ -87,7 +93,7 @@ export function ScanProgressPanel({
     {
       label: "Crawl pages",
       detail: live.limit ? `${formatNumber(pagesCrawled)} of ${formatNumber(live.limit)} max pages crawled` : `${formatNumber(pagesCrawled)} pages crawled`,
-      evidence: `${formatNumber(coverage.linkTags)} link tags · ${formatNumber(coverage.imageTags)} image tags · ${formatNumber(coverage.assetTags)} CSS/JS refs.`,
+      evidence: `${formatNumber(coverage.linkTags)} link tags · ${formatNumber(coverage.imageTags)} image tags · ${formatNumber(coverage.assetTags)} CSS/JS refs${robotsSkippedText}.`,
     },
     {
       label: "Check links",
@@ -125,7 +131,11 @@ export function ScanProgressPanel({
       {active ? (
         <div className="space-y-4" aria-live="polite">
           <MetricTileGrid>
-            <MetricTile label="Pages crawled" value={formatNumber(live.crawled)} hint={live.limit ? `of ${formatNumber(live.limit)} max pages for this scan` : "Page limit not reported"} />
+            <MetricTile
+              label="Pages crawled"
+              value={formatNumber(live.crawled)}
+              hint={`${live.limit ? `of ${formatNumber(live.limit)} max pages for this scan` : "Page limit not reported"}${robotsSkipped ? ` · ${formatNumber(robotsSkipped)} skipped (robots.txt)` : ""}`}
+            />
             <MetricTile label="Queued" value={live.queued != null ? formatNumber(live.queued) : "—"} hint="Discovered URLs waiting to be crawled" />
             <MetricTile
               label="Pages / sec"

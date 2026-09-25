@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpRight, Bot, FileSearch, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, type Site } from "../../api";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, toast } from "@/components/ui";
-import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
+import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlRobotsOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
 import { cn } from "@/lib/utils";
 import { ScanTable } from "./scans/scan-table";
 import { CwvOverviewCard } from "../cwv";
@@ -406,6 +406,7 @@ type SiteEditForm = {
   crawl_host: Site["crawl_host"];
   crawl_speed: Site["crawl_speed"];
   crawl_max_pages: number;
+  crawl_robots: Site["crawl_robots"];
 };
 
 const emptyEditForm: SiteEditForm = {
@@ -418,6 +419,7 @@ const emptyEditForm: SiteEditForm = {
   crawl_host: "auto",
   crawl_speed: "auto",
   crawl_max_pages: 0,
+  crawl_robots: "respect",
 };
 
 // Self-contained edit dialog so "Edit site" opens in place on any page (the
@@ -454,6 +456,7 @@ export function EditSiteDialog({
       crawl_host: site.crawl_host || "auto",
       crawl_speed: site.crawl_speed || "auto",
       crawl_max_pages: Number(site.crawl_max_pages || 0),
+      crawl_robots: site.crawl_robots === "ignore" ? "ignore" : "respect",
     });
     setIgnoreCount(null);
     api
@@ -550,6 +553,21 @@ export function EditSiteDialog({
                 onChange={(e) => setEditForm({ ...editForm, crawl_max_pages: Number(e.target.value) || 0 })}
               />
             </Field>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Field label="robots.txt">
+                <Select value={editForm.crawl_robots} onValueChange={(value) => setEditForm({ ...editForm, crawl_robots: value as Site["crawl_robots"] })}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {crawlRobotsOptions.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <p className="text-xs text-muted-foreground">
+                {editForm.crawl_robots === "ignore"
+                  ? "Scans request URLs robots.txt disallows, for example on a staging site that blocks every crawler. They are still flagged."
+                  : "Scans skip URLs robots.txt disallows for LocalSEO (its own group, or * when there is none) and list them in the report."}
+              </p>
+            </div>
           </div>
           <ScanPlanPreview site={editScanPlan} />
           <Field label="Notes"><Textarea value={editForm.notes} onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })} /></Field>

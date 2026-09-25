@@ -110,7 +110,7 @@ export function ScanPageDrawer({
               <Button asChild size="sm" variant="outline">
                 <a href={pageUrl} target="_blank" rel="noreferrer"><ExternalLink /> Open page</a>
               </Button>
-              {page?.robotsBlocked === true ? <Badge variant="bad">Blocked by robots.txt</Badge> : null}
+              {page?.robotsBlocked === true ? <Badge variant="bad">Blocked for Googlebot by robots.txt</Badge> : null}
             </div>
           ) : null}
         </SheetHeader>
@@ -161,7 +161,7 @@ export function ScanPageDrawer({
                   {formatNumber(page.internalLinks || 0)} internal · {formatNumber(page.externalLinks || 0)} external
                 </Fact>
                 {typeof page.robotsBlocked === "boolean" ? (
-                  <Fact label="Robots.txt">
+                  <Fact label="Robots.txt (Googlebot)">
                     <Badge variant={page.robotsBlocked ? "bad" : "good"}>{page.robotsBlocked ? "Blocked" : "Allowed"}</Badge>
                   </Fact>
                 ) : null}

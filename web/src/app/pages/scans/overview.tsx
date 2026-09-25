@@ -43,7 +43,7 @@ export function ScanReportOverview({
     {
       label: "Pages crawled",
       value: <CountUp value={coverage.pages} />,
-      hint: `${formatNumber(coverage.indexablePages)} indexable · ${formatNumber(coverage.nonIndexablePages)} noindex · ${formatNumber(coverage.sitemapListedPages)} in sitemap`,
+      hint: `${formatNumber(coverage.indexablePages)} indexable · ${formatNumber(coverage.nonIndexablePages)} noindex · ${formatNumber(coverage.sitemapListedPages)} in sitemap${coverage.robotsSkipped ? ` · ${formatNumber(coverage.robotsSkipped)} not crawled (robots.txt)` : ""}`,
     },
     {
       label: "Links checked",

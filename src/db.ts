@@ -65,6 +65,7 @@ db.exec(`
     crawl_host TEXT NOT NULL DEFAULT 'auto',
     crawl_speed TEXT NOT NULL DEFAULT 'auto',
     crawl_max_pages INTEGER NOT NULL DEFAULT 0,
+    crawl_robots TEXT NOT NULL DEFAULT 'respect',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
@@ -433,6 +434,11 @@ if (!siteColumns.has("crawl_speed")) {
 }
 if (!siteColumns.has("crawl_max_pages")) {
   db.exec("ALTER TABLE sites ADD COLUMN crawl_max_pages INTEGER NOT NULL DEFAULT 0");
+}
+// Whether scans skip URLs robots.txt disallows for the crawler ('respect') or
+// fetch them anyway ('ignore'). Existing sites start at 'respect'.
+if (!siteColumns.has("crawl_robots")) {
+  db.exec("ALTER TABLE sites ADD COLUMN crawl_robots TEXT NOT NULL DEFAULT 'respect'");
 }
 const scanColumns = new Set(
   (db.prepare("PRAGMA table_info(scans)").all() as { name: string }[]).map((column) => column.name),
