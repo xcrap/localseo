@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpRight, Bot, FileSearch, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, type Site } from "../../api";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, toast } from "@/components/ui";
-import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlRobotsOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
+import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlRobotsOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanIsActive, scanLiveProgress, scanPhaseKey, scanPhaseLabel, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
 import { cn } from "@/lib/utils";
 import { ScanTable } from "./scans/scan-table";
 import { CwvOverviewCard } from "../cwv";
@@ -597,12 +597,10 @@ export function EditSiteDialog({
 export function SitesManager({
   sites,
   reloadSites,
-  activeSiteId,
   selectSite,
 }: {
   sites: Site[];
   reloadSites: () => Promise<void>;
-  activeSiteId: string;
   selectSite: (id: string) => void;
 }) {
   type SiteForm = {
@@ -649,11 +647,39 @@ export function SitesManager({
     };
   }, [sites.length]);
 
+  const activeScanCount = allScans.filter(scanIsActive).length;
+  const hasActiveScans = activeScanCount > 0;
+
+  useEffect(() => {
+    if (!hasActiveScans) return;
+    let cancelled = false;
+    const interval = window.setInterval(() => {
+      api.allScans()
+        .then((rows) => {
+          if (!cancelled) setAllScans(Array.isArray(rows) ? rows : []);
+        })
+        .catch(() => undefined);
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [hasActiveScans]);
+
   const healthBySite = useMemo(() => {
     const map = new Map<string, any>();
     for (const scan of sortScanRows(allScans)) {
       const key = scan.site_id;
       if (key && !map.has(key)) map.set(key, scan);
+    }
+    return map;
+  }, [allScans]);
+
+  const activeScanBySite = useMemo(() => {
+    const map = new Map<string, any>();
+    for (const scan of sortScanRows(allScans)) {
+      const key = scan.site_id;
+      if (key && scanIsActive(scan) && !map.has(key)) map.set(key, scan);
     }
     return map;
   }, [allScans]);
@@ -811,26 +837,32 @@ export function SitesManager({
 
   function renderSiteRow(site: Site) {
     const scan = healthBySite.get(site.id);
+    const activeScan = activeScanBySite.get(site.id);
+    const liveProgress = activeScan ? scanLiveProgress(activeScan) : null;
     const scanned = Boolean(scan);
     // Running or failed scans have no score yet: show "-", not 0.
     const score = knownNumber(scan?.score);
-    const isActive = activeSiteId === site.id;
     const sev = scanned ? scanSeverityCounts(scan) : { high: 0, medium: 0, low: 0 };
     const openWorkspace = () => {
       selectSite(site.id);
       navigate("/overview");
     };
+    const openActiveScan = () => {
+      if (!activeScan?.id) return;
+      selectSite(site.id);
+      setSelectedScanId(site.id, activeScan.id);
+      navigate(`/scans/${activeScan.id}`);
+    };
     return (
       <div
         key={site.id}
-        className={cn("group flex items-center gap-3 px-4 py-3.5 transition-colors hover:bg-accent/35", isActive ? "bg-primary/[0.045]" : "")}
+        className="group flex items-center gap-3 px-3.5 py-3 transition-colors hover:bg-accent/35 sm:px-4 sm:py-3.5"
       >
         <button type="button" onClick={openWorkspace} className="flex min-w-0 flex-1 items-center gap-3 text-left" title={`Open ${site.name}`}>
           <SiteAvatar site={site} className="size-10 text-sm" />
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="font-heading truncate text-[17px] transition-colors group-hover:text-primary">{site.name}</span>
-              {isActive ? <span className="inline-flex items-center gap-1.5 text-xs font-medium text-good"><StatusDot tone="good" /> Active</span> : null}
             </div>
             <div className="mt-0.5 truncate text-sm text-muted-foreground">
               {site.domain ? (
@@ -841,39 +873,93 @@ export function SitesManager({
                 "No website address"
               )}
             </div>
+            {activeScan ? (
+              <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-warn md:hidden">
+                <StatusDot tone="warn" className="animate-pulse motion-reduce:animate-none" />
+                <span className="truncate">{scanPhaseLabel(activeScan)}</span>
+                <span className="shrink-0 text-muted-foreground">· {formatNumber(activeScan.pages_crawled || 0)} pages</span>
+              </div>
+            ) : null}
           </div>
         </button>
 
-        <div className="hidden items-baseline gap-3 md:flex">
-          {scanned ? (
-            <>
+        <div className="hidden w-64 shrink-0 md:block xl:w-80">
+          {activeScan ? (
+            <div>
+              <button
+                type="button"
+                className="block w-full rounded-md text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                aria-label={`${scanPhaseLabel(activeScan)} for ${site.name}, ${formatNumber(activeScan.pages_crawled || 0)} pages scanned. Open scan report.`}
+                onClick={openActiveScan}
+              >
+                <span className="flex items-center justify-between gap-3 text-xs">
+                  <span className="flex min-w-0 items-center gap-1.5 font-medium text-warn">
+                    <StatusDot tone="warn" className="animate-pulse motion-reduce:animate-none" />
+                    <span className="truncate">{scanPhaseLabel(activeScan)}</span>
+                  </span>
+                  <span className="shrink-0 text-muted-foreground">{formatNumber(activeScan.pages_crawled || 0)} pages</span>
+                </span>
+              </button>
+              {liveProgress?.crawlPercent != null && scanPhaseKey(activeScan) === "crawl" ? (
+                <progress
+                  className="mt-1.5 block w-full accent-primary"
+                  max={100}
+                  value={liveProgress.crawlPercent}
+                  aria-label={`Pages crawled toward the scan limit for ${site.name}`}
+                  title="Crawling stops at the page limit or when no URLs remain."
+                />
+              ) : null}
+            </div>
+          ) : scanned ? (
+            <div className="grid grid-cols-[3.5rem_minmax(0,1fr)] items-baseline gap-3 xl:grid-cols-[4rem_minmax(0,1fr)] xl:gap-4">
               <span
-                className="metric w-14 shrink-0 text-right text-2xl leading-none"
+                className="metric text-right text-2xl leading-none"
                 style={score === null ? undefined : { color: scoreTone(score) }}
                 title={scan.status === "cancelled" ? "Partial crawl: the scan was cancelled" : undefined}
               >
                 {formatNumber(score)}
               </span>
-              <span className="w-44 shrink-0 truncate whitespace-nowrap text-xs text-muted-foreground">
-                <span className={sev.high ? "font-medium text-bad" : ""}>{formatNumber(sev.high)}</span> high ·{" "}
-                <span className={sev.medium ? "font-medium text-warn" : ""}>{formatNumber(sev.medium)}</span> med · {formatNumber(scan.pages_crawled)} pages
+              <span className="grid min-w-0 grid-cols-3 text-xs text-muted-foreground">
+                <span className="grid grid-cols-[2rem_auto] items-baseline gap-1 whitespace-nowrap">
+                  <span className={cn("nums text-right font-medium", sev.high ? "text-bad" : "")}>{formatNumber(sev.high)}</span>
+                  <span><span className="sr-only"> high</span><span aria-hidden>high</span></span>
+                </span>
+                <span className="grid grid-cols-[2rem_auto] items-baseline gap-1 whitespace-nowrap">
+                  <span className={cn("nums text-right font-medium", sev.medium ? "text-warn" : "")}>{formatNumber(sev.medium)}</span>
+                  <span><span className="sr-only"> medium</span><span aria-hidden>med</span></span>
+                </span>
+                <span className="grid grid-cols-[2rem_auto] items-baseline gap-1 whitespace-nowrap">
+                  <span className="nums text-right">{formatNumber(scan.pages_crawled)}</span>
+                  <span><span className="sr-only"> pages</span><span aria-hidden>pages</span></span>
+                </span>
               </span>
-            </>
+            </div>
           ) : (
-            <span className="w-[15.25rem] text-right text-xs text-muted-foreground">Not scanned</span>
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <StatusDot /> Not scanned
+            </div>
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-1">
-          {site.domain ? (
-            <Button size="sm" variant="outline" className="hidden sm:inline-flex" disabled={scanningSiteId === site.id} onClick={() => scanSite(site)}>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {activeScan ? (
+            <>
+              <Button size="icon" variant="secondary" className="size-11 sm:hidden" aria-label={`Open running scan for ${site.name}`} onClick={openActiveScan}>
+                <FileSearch />
+              </Button>
+              <Button size="sm" variant="secondary" className="hidden w-28 justify-center sm:inline-flex" onClick={openActiveScan}>
+                <FileSearch /> View scan
+              </Button>
+            </>
+          ) : site.domain ? (
+            <Button size="sm" variant="outline" className="hidden w-28 justify-center sm:inline-flex" disabled={scanningSiteId === site.id} onClick={() => scanSite(site)}>
               <FileSearch /> {scanningSiteId === site.id ? "Starting" : "Scan"}
             </Button>
           ) : null}
-          <Button size="icon" variant="ghost" className="size-8 text-muted-foreground/70 hover:text-foreground" aria-label={`Edit ${site.name}`} onClick={() => setEditing(site)}>
+          <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-foreground sm:size-8" aria-label={`Edit ${site.name}`} onClick={() => setEditing(site)}>
             <Pencil />
           </Button>
-          <Button size="icon" variant="ghost" className="size-8 text-muted-foreground/70 hover:text-destructive" aria-label={`Delete ${site.name}`} onClick={() => setDeleting(site)}>
+          <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-destructive sm:size-8" aria-label={`Delete ${site.name}`} onClick={() => setDeleting(site)}>
             <Trash2 />
           </Button>
         </div>
@@ -963,7 +1049,7 @@ export function SitesManager({
     <>
       <PageHeader
         title="Your sites"
-        meta={`${formatNumber(sites.length)} ${sites.length === 1 ? "site" : "sites"} · open one to enter its workspace`}
+        meta={`${formatNumber(sites.length)} ${sites.length === 1 ? "site" : "sites"}${activeScanCount ? ` · ${formatNumber(activeScanCount)} ${activeScanCount === 1 ? "scan" : "scans"} running` : ""} · open one to enter its workspace`}
         action={
           sites.length ? (
             <Button onClick={() => setOpen(true)}>

@@ -437,7 +437,6 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 									<SitesManager
 										sites={sites}
 										reloadSites={loadSites}
-										activeSiteId={activeSite?.id || ""}
 										selectSite={selectSite}
 									/>
 								}
@@ -448,7 +447,6 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 									<SitesManager
 										sites={sites}
 										reloadSites={loadSites}
-										activeSiteId={activeSite?.id || ""}
 										selectSite={selectSite}
 									/>
 								}
