@@ -1,3 +1,4 @@
+import { storedGscTotals } from "./gsc-store";
 import * as cheerio from "cheerio";
 import { randomUUID } from "node:crypto";
 import { parse as parseDomain } from "tldts";
@@ -142,12 +143,15 @@ function cleanText(value: string) {
 }
 
 function decodeDuckDuckGoHref(href: string) {
+  if (!href.trim()) return "";
   try {
     const url = new URL(href, "https://duckduckgo.com");
-    const uddg = url.searchParams.get("uddg");
-    return uddg ? decodeURIComponent(uddg) : url.toString();
+    const target = url.searchParams.get("uddg");
+    if (!target && !/^(?:https?:)?\/\//i.test(href)) return "";
+    const result = target ? new URL(target) : url;
+    return result.protocol === "https:" || result.protocol === "http:" ? result.href : "";
   } catch {
-    return href;
+    return "";
   }
 }
 
@@ -1568,7 +1572,10 @@ function relativePath(url: string) {
   }
 }
 
-function localScanPagesForDomain(siteId: string, domain: string, page: number, pageSize: number, search: string) {
+function localScanPagesForDomain(
+  siteId: string, domain: string, page: number, pageSize: number, search: string,
+  options: { allRows?: boolean; sortMode?: string; sortOrder?: string },
+) {
   const scope = `https://${domain}`;
   const scans = all<any>(
     `
@@ -1583,7 +1590,7 @@ function localScanPagesForDomain(siteId: string, domain: string, page: number, p
 
   for (const scan of scans) {
     const result = jsonParse<any>(scan.result_json, null);
-    const pages = Array.isArray(result?.pages) ? result.pages : [];
+    const pages: any[] = Array.isArray(result?.pages) ? result.pages : [];
     // Page issues live once in result.issues, recorded on the page URL or on
     // the URL it was requested as (redirect findings).
     const issueCounts = new Map<string, number>();
@@ -1614,14 +1621,15 @@ function localScanPagesForDomain(siteId: string, domain: string, page: number, p
         `${row.page} ${row.relativePath || ""} ${row.title || ""}`.toLowerCase().includes(search),
       )
       : rows;
-    const offset = (page - 1) * pageSize;
+    if (options.sortMode) sortResearchRows(filtered, options.sortMode, options.sortOrder, "page", "asc");
+    const paged = paginateRows(filtered, page, pageSize, options.allRows);
     return {
       domain,
-      page,
-      pageSize,
-      totalCount: filtered.length,
-      hasMore: offset + pageSize < filtered.length,
-      pages: filtered.slice(offset, offset + pageSize),
+      page: paged.page,
+      pageSize: paged.pageSize,
+      totalCount: paged.totalCount,
+      hasMore: paged.hasMore,
+      pages: paged.rows,
       fetchedAt: nowIso(),
       warning: "Showing real pages from the latest local scan. Traffic and keyword counts stay unavailable without an imported organic dataset.",
     };
@@ -1689,7 +1697,7 @@ function normalizeImportedOrganicRow(raw: Record<string, unknown>, domain: strin
         relativePath: relativePath(url),
         title: csvText(row, ["title", "page title", "meta title"]),
         organicTraffic: traffic,
-        keywords: keywordCount || (keyword ? 1 : null),
+        keywords: keywordCount ?? (keyword ? 1 : null),
         value: csvNumber(row, ["value", "traffic value", "estimated value", "cost"]),
         source: "organic-import",
       }
@@ -1710,6 +1718,10 @@ function normalizeImportedOrganicRow(raw: Record<string, unknown>, domain: strin
   return { keyword: keywordRow, page };
 }
 
+function addKnown(left: number | null, right: number | null) {
+  return left === null ? right : left + (right ?? 0);
+}
+
 function mergeOrganicPages(rows: ImportedOrganicPageRow[]) {
   const byPage = new Map<string, ImportedOrganicPageRow>();
   for (const row of rows) {
@@ -1720,27 +1732,39 @@ function mergeOrganicPages(rows: ImportedOrganicPageRow[]) {
       continue;
     }
     current.title ||= row.title;
-    current.organicTraffic = (Number(current.organicTraffic || 0) + Number(row.organicTraffic || 0)) || null;
-    current.keywords = (Number(current.keywords || 0) + Number(row.keywords || 0)) || null;
-    current.value = (Number(current.value || 0) + Number(row.value || 0)) || null;
+    current.organicTraffic = addKnown(current.organicTraffic, row.organicTraffic);
+    current.keywords = addKnown(current.keywords, row.keywords);
+    current.value = addKnown(current.value, row.value);
   }
   return [...byPage.values()].sort((a, b) => Number(b.organicTraffic || 0) - Number(a.organicTraffic || 0));
 }
 
 function organicSummary(keywords: ImportedOrganicKeywordRow[], pages: ImportedOrganicPageRow[]) {
   const keywordSet = new Set(keywords.map((row) => row.keyword.toLowerCase()).filter(Boolean));
-  const organicKeywords = keywordSet.size || keywords.length || pages.reduce((total, row) => total + Number(row.keywords || 0), 0);
+  const pageTraffic = pages.reduce<number | null>((total, row) => addKnown(total, row.organicTraffic), null);
+  // Page aggregates already include the traffic of keywords with landing URLs.
+  const keywordTraffic = keywords.reduce<number | null>((total, row) =>
+    pageTraffic !== null && row.url ? total : addKnown(total, row.traffic), null);
   return {
-    organicKeywords,
-    organicTraffic: pages.reduce((total, row) => total + Number(row.organicTraffic || 0), 0) || keywords.reduce((total, row) => total + Number(row.traffic || 0), 0) || null,
-    estimatedValue: pages.reduce((total, row) => total + Number(row.value || 0), 0) || null,
+    organicKeywords: keywordSet.size || pages.reduce<number | null>((total, row) => addKnown(total, row.keywords), null),
+    organicTraffic: addKnown(pageTraffic, keywordTraffic),
+    estimatedValue: pages.reduce<number | null>((total, row) => addKnown(total, row.value), null),
   };
 }
 
 function mapOrganicImport(row: any) {
   const keywords = jsonParse<ImportedOrganicKeywordRow[]>(row.keywords_json, []);
   const pages = jsonParse<ImportedOrganicPageRow[]>(row.pages_json, []);
-  const summary = jsonParse<Record<string, any>>(row.summary_json, {});
+  // Older imports converted a zero sum to null when multiple rows shared a
+  // page. A retained keyword row with measured zero distinguishes this case
+  // from a page whose CSV supplied no traffic at all.
+  const zeroTrafficUrls = new Set(keywords.filter((keyword) => keyword.traffic === 0).map((keyword) => keyword.url));
+  for (const page of pages) {
+    if (page.organicTraffic === null && zeroTrafficUrls.has(page.page)) page.organicTraffic = 0;
+  }
+  const summary = keywords.length || pages.length
+    ? organicSummary(keywords, pages)
+    : jsonParse<Record<string, any>>(row.summary_json, {});
   return {
     id: row.id,
     siteId: row.site_id,
@@ -1763,9 +1787,11 @@ function mapOrganicImport(row: any) {
   };
 }
 
-function latestOrganicImport(siteId: string, domain: string) {
+function latestOrganicImport(siteId: string, domain: string, countColumn?: "keyword_count" | "page_count") {
   const row = get<any>(
-    "SELECT * FROM organic_imports WHERE site_id = ? AND domain = ? ORDER BY created_at DESC LIMIT 1",
+    `SELECT * FROM organic_imports WHERE site_id = ? AND domain = ?
+     ${countColumn ? `AND ${countColumn} > 0` : ""}
+     ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     [siteId, domain],
   );
   return row ? mapOrganicImport(row) : null;
@@ -1773,7 +1799,7 @@ function latestOrganicImport(siteId: string, domain: string) {
 
 export function listOrganicImports(siteId: string) {
   return all<any>(
-    "SELECT * FROM organic_imports WHERE site_id = ? ORDER BY created_at DESC",
+    "SELECT * FROM organic_imports WHERE site_id = ? ORDER BY created_at DESC, rowid DESC",
     [siteId],
   ).map(mapOrganicImport);
 }
@@ -1845,6 +1871,7 @@ export async function getDomainKeywordsPage(input: {
   includeSubdomains?: boolean;
   page?: number;
   pageSize?: number;
+  allRows?: boolean;
   sortMode?: string;
   sortOrder?: string;
   search?: string;
@@ -1856,18 +1883,18 @@ export async function getDomainKeywordsPage(input: {
   const page = Math.max(1, Number(input.page || 1));
   const pageSize = Math.max(10, Math.min(200, Number(input.pageSize || 50)));
   const search = String(input.search || "").trim().toLowerCase();
-  const imported = latestOrganicImport(site.id, target);
+  const imported = latestOrganicImport(site.id, target, "keyword_count");
   if (imported) {
-    const rows = (search
+    const rows = search
       ? imported.keywords.filter((row) => `${row.keyword} ${row.url}`.toLowerCase().includes(search))
-      : imported.keywords
-    ).sort((a, b) => Number(a.position || 999999) - Number(b.position || 999999));
-    const paged = paginateRows(rows, page, pageSize);
+      : imported.keywords;
+    sortResearchRows(rows, input.sortMode, input.sortOrder, "position", "asc");
+    const paged = paginateRows(rows, page, pageSize, input.allRows);
     return {
       source: "organic-import",
       domain: target,
-      page,
-      pageSize,
+      page: paged.page,
+      pageSize: paged.pageSize,
       totalCount: paged.totalCount,
       hasMore: paged.hasMore,
       keywords: paged.rows,
@@ -1895,6 +1922,7 @@ export async function getDomainPagesPage(input: {
   includeSubdomains?: boolean;
   page?: number;
   pageSize?: number;
+  allRows?: boolean;
   sortMode?: string;
   sortOrder?: string;
   search?: string;
@@ -1906,17 +1934,18 @@ export async function getDomainPagesPage(input: {
   const page = Math.max(1, Number(input.page || 1));
   const pageSize = Math.max(10, Math.min(200, Number(input.pageSize || 50)));
   const search = String(input.search || "").trim().toLowerCase();
-  const imported = latestOrganicImport(site.id, target);
-  if (imported?.pages.length) {
+  const imported = latestOrganicImport(site.id, target, "page_count");
+  if (imported) {
     const rows = search
       ? imported.pages.filter((row) => `${row.page} ${row.relativePath || ""} ${row.title || ""}`.toLowerCase().includes(search))
       : imported.pages;
-    const paged = paginateRows(rows, page, pageSize);
+    sortResearchRows(rows, input.sortMode, input.sortOrder, "organicTraffic", "desc");
+    const paged = paginateRows(rows, page, pageSize, input.allRows);
     return {
       source: "organic-import",
       domain: target,
-      page,
-      pageSize,
+      page: paged.page,
+      pageSize: paged.pageSize,
       totalCount: paged.totalCount,
       hasMore: paged.hasMore,
       pages: paged.rows,
@@ -1926,7 +1955,7 @@ export async function getDomainPagesPage(input: {
     };
   }
   if (sameSiteUrl(`https://${target}`, `https://${site.domain}`)) {
-    const localPages = localScanPagesForDomain(site.id, target, page, pageSize, search);
+    const localPages = localScanPagesForDomain(site.id, target, page, pageSize, search, input);
     if (localPages) {
       return { source: "local-scan", ...localPages };
     }
@@ -1987,6 +2016,7 @@ export async function getBacklinksProfile(input: {
   tab?: "backlinks" | "domains" | "pages";
   page?: number;
   pageSize?: number;
+  allRows?: boolean;
   sortField?: string;
   sortOrder?: string;
   mode?: string;
@@ -2017,13 +2047,12 @@ export async function getBacklinksProfile(input: {
         ? backlinkDomainRows(importedRows)
         : tab === "pages"
           ? backlinkPageRows(importedRows)
-          : [...importedRows].sort((a, b) => Number(b.rank || 0) - Number(a.rank || 0));
-    const pageRows = paginateRows(rows, page, pageSize);
+          : importedRows;
+    sortResearchRows(rows, input.sortField, input.sortOrder, tab === "backlinks" ? "rank" : "backlinks", "desc");
+    const pageRows = paginateRows(rows, page, pageSize, input.allRows);
     source = "backlink-import";
     result = {
       ...pageRows,
-      page,
-      pageSize,
       fetchedAt: nowIso(),
       importId: imported.id,
       sourceName: imported.sourceName,
@@ -2047,6 +2076,9 @@ type ImportedBacklinkRow = {
   domainFrom: string;
   urlFrom: string;
   urlTo: string;
+  unverifiedUrlFrom?: string;
+  unverifiedUrlTo?: string;
+  unverifiedLinksCount?: number;
   anchor: string;
   itemType: string;
   isDofollow: boolean | null;
@@ -2113,7 +2145,7 @@ function backlinkDomainFromRow(row: CsvRow, urlFrom: string) {
   return normalizeDomain(domain || urlFrom);
 }
 
-function normalizeImportedBacklinkRow(raw: Record<string, unknown>, fallbackDomain: string): ImportedBacklinkRow | null {
+function normalizeImportedBacklinkRow(raw: Record<string, unknown>): ImportedBacklinkRow | null {
   const row = csvRow(raw);
   const urlFrom =
     csvText(row, [
@@ -2143,13 +2175,15 @@ function normalizeImportedBacklinkRow(raw: Record<string, unknown>, fallbackDoma
       "linked url",
       "landing page",
       "to",
-    ]) || `https://${fallbackDomain}`;
+    ]);
   const relAttributes = parseList(csvText(row, ["rel", "rel attributes", "attributes", "link rel"]));
   const status = csvText(row, ["status", "link status"]).toLowerCase();
   const httpStatus = backlinkHttpStatus(row);
+  const countColumns = ["links count", "count", "backlinks", "backlink count"];
+  const count = csvNumber(row, countColumns);
   return {
     domainFrom,
-    urlFrom: urlFrom || `https://${domainFrom}`,
+    urlFrom,
     urlTo,
     anchor: csvText(row, ["anchor", "anchor text", "text", "link text"]),
     itemType: csvText(row, ["item type", "item_type", "type", "link type"]) || "link",
@@ -2163,7 +2197,8 @@ function normalizeImportedBacklinkRow(raw: Record<string, unknown>, fallbackDoma
     lastSeen: csvText(row, ["last seen", "last_seen", "last found", "date last seen"]) || null,
     isLost: /\b(lost|removed|deleted|missing)\b/.test(status) || csvFlag(row, ["lost link", "lost", "is lost"]) === true,
     isBroken: (httpStatus !== null && httpStatus >= 400) || /\b(broken|error)\b/.test(status),
-    linksCount: csvNumber(row, ["links count", "links_count", "count"]) ?? 1,
+    linksCount: count !== null && Number.isInteger(count) && count >= 0 ? count
+      : urlFrom && !csvText(row, countColumns) ? 1 : null,
   };
 }
 
@@ -2171,37 +2206,76 @@ function parseBacklinkCsv(csv: string) {
   return parseCsvRows(csv, "Backlink CSV").rows;
 }
 
+// A domain rollup without a count can establish a referring domain, but
+// cannot supply an exact link total for any group containing that row.
+function addLinkCount(total: number | null, count: number | null) {
+  return total === null || count === null ? null : total + count;
+}
+
 function backlinkSummary(rows: ImportedBacklinkRow[]) {
   const referringDomains = new Set(rows.map((row) => row.domainFrom).filter(Boolean));
-  const followKnown = rows.filter((row) => row.isDofollow !== null);
-  const dofollowRows = followKnown.filter((row) => row.isDofollow === true).length;
-  const anchorCounts = new Map<string, number>();
+  let backlinks: number | null = 0;
+  let dofollowBacklinks: number | null = 0;
+  let nofollowBacklinks: number | null = 0;
+  let followUnknownBacklinks: number | null = 0;
+  let lostBacklinks: number | null = 0;
+  let brokenBacklinks: number | null = 0;
+  const anchorCounts = new Map<string, number | null>();
   for (const row of rows) {
-    const anchor = row.anchor || "(empty anchor)";
-    anchorCounts.set(anchor, (anchorCounts.get(anchor) || 0) + 1);
+    backlinks = addLinkCount(backlinks, row.linksCount);
+    if (row.isDofollow === true) dofollowBacklinks = addLinkCount(dofollowBacklinks, row.linksCount);
+    else if (row.isDofollow === false) nofollowBacklinks = addLinkCount(nofollowBacklinks, row.linksCount);
+    else followUnknownBacklinks = addLinkCount(followUnknownBacklinks, row.linksCount);
+    if (row.isLost) lostBacklinks = addLinkCount(lostBacklinks, row.linksCount);
+    if (row.isBroken) brokenBacklinks = addLinkCount(brokenBacklinks, row.linksCount);
+    if (row.anchor) {
+      const current = anchorCounts.get(row.anchor);
+      anchorCounts.set(row.anchor, addLinkCount(current === undefined ? 0 : current, row.linksCount));
+    }
   }
+  const followKnown = addLinkCount(dofollowBacklinks, nofollowBacklinks);
   return {
-    backlinks: rows.length,
+    backlinks,
     referringDomains: referringDomains.size,
     // Share of followed links among rows whose export states follow/nofollow;
     // rows without that evidence are counted separately, never as nofollow.
-    dofollowRatio: followKnown.length ? Math.round((dofollowRows / followKnown.length) * 100) : null,
-    dofollowBacklinks: dofollowRows,
-    nofollowBacklinks: followKnown.length - dofollowRows,
-    followUnknownBacklinks: rows.length - followKnown.length,
+    dofollowRatio: followKnown && dofollowBacklinks !== null ? Math.round((dofollowBacklinks / followKnown) * 100) : null,
+    dofollowBacklinks,
+    nofollowBacklinks,
+    followUnknownBacklinks,
     topAnchors: [...anchorCounts.entries()]
-      .sort((a, b) => b[1] - a[1])
+      .sort((a, b) => (b[1] ?? -1) - (a[1] ?? -1))
       .slice(0, 10)
       .map(([anchor, count]) => ({ anchor, count })),
-    lostBacklinks: rows.filter((row) => row.isLost).length,
-    brokenBacklinks: rows.filter((row) => row.isBroken).length,
+    lostBacklinks,
+    brokenBacklinks,
     prospects: [],
   };
 }
 
 function mapBacklinkImport(row: any) {
   const rows = jsonParse<ImportedBacklinkRow[]>(row.rows_json, []);
-  const summary = jsonParse<Record<string, unknown>>(row.summary_json, {});
+  const storedSummary = jsonParse<Record<string, unknown>>(row.summary_json, {});
+  for (const link of rows) {
+    if (link.linksCount === undefined) link.linksCount = link.urlFrom ? 1 : null;
+    if (storedSummary.urlEvidenceVersion !== 1) {
+      // Older imports filled missing URLs with these exact strings. Keep the
+      // original values inspectable without claiming they appeared in the CSV.
+      if (link.domainFrom && link.urlFrom === `https://${link.domainFrom}`) {
+        link.unverifiedUrlFrom = link.urlFrom;
+        link.urlFrom = "";
+        if (link.linksCount === 1) {
+          link.unverifiedLinksCount = 1;
+          link.linksCount = null;
+        }
+      }
+      if (link.urlTo === `https://${row.domain}`) {
+        link.unverifiedUrlTo = link.urlTo;
+        link.urlTo = "";
+      }
+    }
+  }
+  const summary = rows.length ? backlinkSummary(rows) : storedSummary;
   return {
     id: row.id,
     siteId: row.site_id,
@@ -2220,7 +2294,7 @@ function mapBacklinkImport(row: any) {
 
 function latestBacklinkImport(siteId: string, domain: string) {
   const row = get<any>(
-    "SELECT * FROM backlink_imports WHERE site_id = ? AND domain = ? ORDER BY created_at DESC LIMIT 1",
+    "SELECT * FROM backlink_imports WHERE site_id = ? AND domain = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
     [siteId, domain],
   );
   return row ? mapBacklinkImport(row) : null;
@@ -2228,7 +2302,7 @@ function latestBacklinkImport(siteId: string, domain: string) {
 
 export function listBacklinkImports(siteId: string) {
   return all<any>(
-    "SELECT * FROM backlink_imports WHERE site_id = ? ORDER BY created_at DESC",
+    "SELECT * FROM backlink_imports WHERE site_id = ? ORDER BY created_at DESC, rowid DESC",
     [siteId],
   ).map(mapBacklinkImport);
 }
@@ -2246,7 +2320,7 @@ export function importBacklinksCsv(input: {
   if (!domain) throw badRequest("Domain is required.");
   const rawRows = importRows(input, parseBacklinkCsv);
   const rows = rawRows
-    .map((row) => normalizeImportedBacklinkRow(row, domain))
+    .map(normalizeImportedBacklinkRow)
     .filter((row): row is ImportedBacklinkRow => Boolean(row))
     .filter((row) => !row.urlTo || sameSiteUrl(row.urlTo, `https://${domain}`));
   if (!rows.length) {
@@ -2266,17 +2340,41 @@ export function importBacklinksCsv(input: {
       domain,
       String(input.sourceName || "Backlink CSV").slice(0, 160),
       rows.length,
-      JSON.stringify(summary),
+      JSON.stringify({ ...summary, urlEvidenceVersion: 1 }),
       JSON.stringify(rows),
     ],
   );
   return mapBacklinkImport(get<any>("SELECT * FROM backlink_imports WHERE id = ?", [id]));
 }
 
-function paginateRows<T>(rows: T[], page: number, pageSize: number) {
+// Sort the complete result before taking a page. Missing evidence goes last in
+// either direction, including when zero is a valid measured value.
+function sortResearchRows<T extends Record<string, unknown>>(
+  rows: T[], mode: string | undefined, order: string | undefined, defaultField: string, defaultOrder: "asc" | "desc",
+) {
+  if (rows.length < 2) return;
+  const fields = Object.keys(rows[0]);
+  const name = normalizeCsvHeader(typeof mode === "string" && mode ? mode : defaultField);
+  const aliases: Record<string, string> = { volume: "searchVolume", difficulty: "keywordDifficulty", traffic: "organicTraffic" };
+  const field = fields.find((key) => normalizeCsvHeader(key) === name) || (fields.includes(aliases[name]) ? aliases[name] : defaultField);
+  const direction = (order === "asc" || order === "desc" ? order : defaultOrder) === "asc" ? 1 : -1;
+  rows.sort((a, b) => {
+    const left = a[field];
+    const right = b[field];
+    if (left == null || left === "") return right == null || right === "" ? 0 : 1;
+    if (right == null || right === "") return -1;
+    if (typeof left === "number" && typeof right === "number") return (left - right) * direction;
+    return String(left).localeCompare(String(right)) * direction;
+  });
+}
+
+function paginateRows<T>(rows: T[], page: number, pageSize: number, allRows?: boolean) {
   const totalCount = rows.length;
+  if (allRows === true) return { rows, totalCount, page: 1, pageSize: totalCount, hasMore: false };
   const start = (page - 1) * pageSize;
   return {
+    page,
+    pageSize,
     rows: rows.slice(start, start + pageSize),
     totalCount,
     hasMore: start + pageSize < totalCount,
@@ -2291,19 +2389,24 @@ function backlinkDomainRows(rows: ImportedBacklinkRow[]) {
       domain: row.domainFrom,
       backlinks: 0,
       referringPageSet: new Set<string>(),
+      missingReferringPage: false,
       rank: null,
       spamScore: null,
       firstSeen: row.firstSeen,
       brokenBacklinks: 0,
       brokenPageSet: new Set<string>(),
+      missingBrokenPage: false,
     };
-    entry.backlinks += 1;
-    entry.referringPageSet.add(row.urlFrom);
-    entry.rank = Math.max(Number(entry.rank || 0), Number(row.domainFromRank || row.rank || 0)) || null;
-    entry.spamScore = Math.max(Number(entry.spamScore || 0), Number(row.spamScore || 0)) || null;
+    entry.backlinks = addLinkCount(entry.backlinks, row.linksCount);
+    if (row.urlFrom) entry.referringPageSet.add(row.urlFrom);
+    else if (row.linksCount !== 0) entry.missingReferringPage = true;
+    const rank = row.domainFromRank ?? row.rank;
+    if (rank != null) entry.rank = Math.max(entry.rank ?? rank, rank);
+    if (row.spamScore != null) entry.spamScore = Math.max(entry.spamScore ?? row.spamScore, row.spamScore);
     if (row.isBroken) {
-      entry.brokenBacklinks += 1;
-      entry.brokenPageSet.add(row.urlTo);
+      entry.brokenBacklinks = addLinkCount(entry.brokenBacklinks, row.linksCount);
+      if (row.urlTo) entry.brokenPageSet.add(row.urlTo);
+      else if (row.linksCount !== 0) entry.missingBrokenPage = true;
     }
     byDomain.set(row.domainFrom, entry);
   }
@@ -2311,20 +2414,20 @@ function backlinkDomainRows(rows: ImportedBacklinkRow[]) {
     .map((row) => ({
       domain: row.domain,
       backlinks: row.backlinks,
-      referringPages: row.referringPageSet.size,
+      referringPages: row.missingReferringPage ? null : row.referringPageSet.size,
       rank: row.rank,
       spamScore: row.spamScore,
       firstSeen: row.firstSeen,
       brokenBacklinks: row.brokenBacklinks,
-      brokenPages: row.brokenPageSet.size,
-    }))
-    .sort((a, b) => b.backlinks - a.backlinks);
+      brokenPages: row.missingBrokenPage ? null : row.brokenPageSet.size,
+    }));
 }
 
 function backlinkPageRows(rows: ImportedBacklinkRow[]) {
   const byPage = new Map<string, any>();
   for (const row of rows) {
-    const page = row.urlTo || "/";
+    const page = row.urlTo;
+    if (!page) continue;
     const entry = byPage.get(page) || {
       page,
       backlinks: 0,
@@ -2332,10 +2435,11 @@ function backlinkPageRows(rows: ImportedBacklinkRow[]) {
       rank: null,
       brokenBacklinks: 0,
     };
-    entry.backlinks += 1;
+    entry.backlinks = addLinkCount(entry.backlinks, row.linksCount);
     if (row.domainFrom) entry.domainSet.add(row.domainFrom);
-    entry.rank = Math.max(Number(entry.rank || 0), Number(row.rank || row.pageFromRank || 0)) || null;
-    if (row.isBroken) entry.brokenBacklinks += 1;
+    const rank = row.rank ?? row.pageFromRank;
+    if (rank != null) entry.rank = Math.max(entry.rank ?? rank, rank);
+    if (row.isBroken) entry.brokenBacklinks = addLinkCount(entry.brokenBacklinks, row.linksCount);
     byPage.set(page, entry);
   }
   return [...byPage.values()]
@@ -2345,8 +2449,7 @@ function backlinkPageRows(rows: ImportedBacklinkRow[]) {
       referringDomains: row.domainSet.size,
       rank: row.rank,
       brokenBacklinks: row.brokenBacklinks,
-    }))
-    .sort((a, b) => b.backlinks - a.backlinks);
+    }));
 }
 
 function emptySerpResult(keyword: string, domain: string) {
@@ -2697,7 +2800,7 @@ export function dashboardSummary(siteId?: string) {
           startDate: latestGscImport.start_date ?? null,
           endDate: latestGscImport.end_date ?? null,
           rowCount: latestGscImport.row_count,
-          totals: jsonParse(latestGscImport.totals_json, {}),
+          totals: storedGscTotals(latestGscImport),
           createdAt: latestGscImport.created_at,
         }
       : null,

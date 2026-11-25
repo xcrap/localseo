@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ExternalLink } from "lucide-react";
 import { api, type ScanPageDetail, type ScanPageLink } from "../../../api";
 import { Badge, Button, Sheet, SheetBody, SheetContent, SheetDescription, SheetHeader, SheetTitle, Skeleton } from "@/components/ui";
-import { EmptyState, IndexabilityBadge, formatBytes, formatMs, formatNumber, pageH1Count } from "../../shared";
+import { EmptyState, IndexabilityBadge, SitemapBadge, formatBytes, formatMs, formatNumber, pageH1Count } from "../../shared";
 import { severityVariant } from "./common";
 import { EvidenceList } from "./issues";
 import { issueGuidance, issueTypeTitle, type IssueCatalog } from "./issue-catalog";
@@ -131,6 +131,9 @@ export function ScanPageDrawer({
             )
           ) : (
             <>
+              {page.htmlTruncated ? (
+                <p className="text-sm text-warn">The crawler read only part of the HTML. Counts and metadata below cover the part it read.</p>
+              ) : null}
               <dl className="grid grid-cols-2 gap-x-4 gap-y-4 sm:grid-cols-3">
                 <Fact label="Status">
                   <Badge variant={page.status >= 400 ? "bad" : page.sourceStatus >= 300 || page.status >= 300 ? "warn" : "good"}>
@@ -148,15 +151,15 @@ export function ScanPageDrawer({
                 <Fact label="Crawl depth">{page.depth != null ? formatNumber(page.depth) : "-"}</Fact>
                 <Fact label="Internal inlinks">{formatNumber(data?.inlinks?.length ?? page.internalInlinks ?? 0)}</Fact>
                 <Fact label="Discovered via">{page.discovery ? String(page.discovery).replaceAll("-", " ") : "-"}</Fact>
-                <Fact label="Sitemap">{page.sitemapListed ? "Listed" : page.sitemapSourceListed ? "Redirect source listed" : "Not listed"}</Fact>
+                <Fact label="Sitemap"><SitemapBadge page={page} /></Fact>
                 <Fact label="Response">{formatMs(page.loadMs)}</Fact>
                 <Fact label="HTML size">{formatBytes(page.contentLength)}</Fact>
                 <Fact label="Words">{formatNumber(page.wordCount)}</Fact>
                 <Fact label="Schema blocks">
-                  {formatNumber(page.schemaCount || 0)}
+                  {formatNumber(page.schemaCount ?? (page.htmlTruncated ? null : 0))}
                   {Number(page.schemaParseErrors || 0) ? <span className="text-xs text-warn"> · {formatNumber(page.schemaParseErrors)} parse errors</span> : null}
                 </Fact>
-                <Fact label="Hreflang links">{formatNumber(Array.isArray(page.hreflang) ? page.hreflang.length : page.hreflangCount || 0)}</Fact>
+                <Fact label="Hreflang links">{formatNumber(Array.isArray(page.hreflang) ? page.hreflang.length : page.hreflangCount ?? (page.htmlTruncated ? null : 0))}</Fact>
                 <Fact label="Links out">
                   {formatNumber(page.internalLinks || 0)} internal · {formatNumber(page.externalLinks || 0)} external
                 </Fact>
@@ -169,7 +172,7 @@ export function ScanPageDrawer({
 
               <DrawerSection title="Canonical">
                 <p className="break-all text-sm text-muted-foreground">
-                  {page.canonical || "No canonical tag"}
+                  {page.canonical || (page.htmlTruncated ? "Unknown" : "No canonical tag")}
                   {Number(page.canonicalCount || 0) > 1 ? ` · ${formatNumber(page.canonicalCount)} canonical tags` : ""}
                 </p>
               </DrawerSection>

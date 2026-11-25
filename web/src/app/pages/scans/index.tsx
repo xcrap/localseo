@@ -50,6 +50,7 @@ export function ScansPage({ site, switchSite }: { site: Site; switchSite?: (site
   const [scans, setScans] = useState<ScanRow[]>([]);
   const [listLoaded, setListLoaded] = useState(false);
   const [listError, setListError] = useState("");
+  const [listAttempt, setListAttempt] = useState(0);
   const [detail, setDetail] = useState<any>(null);
   const [detailState, setDetailState] = useState<DetailState>({ id: "", status: "loading" });
   const [deletingScan, setDeletingScan] = useState<any>(null);
@@ -103,7 +104,7 @@ export function ScansPage({ site, switchSite }: { site: Site; switchSite?: (site
     api
       .scan(id)
       .then((row) => {
-        if (token !== detailToken.current) return;
+        if (token !== detailToken.current || routeScanIdRef.current !== id) return;
         if (!row) {
           setDetail(null);
           setDetailState({ id, status: "missing" });
@@ -123,7 +124,7 @@ export function ScansPage({ site, switchSite }: { site: Site; switchSite?: (site
         setSelectedScanId(site.id, row.id);
       })
       .catch((err) => {
-        if (token !== detailToken.current) return;
+        if (token !== detailToken.current || routeScanIdRef.current !== id) return;
         setDetail(null);
         setDetailState({
           id,
@@ -152,15 +153,19 @@ export function ScansPage({ site, switchSite }: { site: Site; switchSite?: (site
     return () => {
       cancelled = true;
     };
-  }, [site.id, onIndexRoute]);
+  }, [site.id, onIndexRoute, listAttempt]);
 
   useEffect(() => {
     if (!routeScanId) return;
     if (detailRef.current?.id === routeScanId) {
       setDetailState({ id: routeScanId, status: "ready" });
-      return;
+      setSelectedScanId(site.id, routeScanId);
+    } else {
+      loadDetail(routeScanId);
     }
-    loadDetail(routeScanId);
+    return () => {
+      detailToken.current += 1;
+    };
   }, [routeScanId, site.id]);
 
   useEffect(() => {
@@ -359,7 +364,7 @@ export function ScansPage({ site, switchSite }: { site: Site; switchSite?: (site
           text={listError || "Start a local site scan to fill this report with crawl evidence."}
           action={
             listError ? (
-              <Button variant="secondary" onClick={() => loadList()}><RefreshCw /> Retry</Button>
+              <Button variant="secondary" onClick={() => setListAttempt((attempt) => attempt + 1)}><RefreshCw /> Retry</Button>
             ) : site.domain ? (
               <Button onClick={startSelectedSite} disabled={starting}>
                 <FileSearch /> {starting ? "Starting" : "Scan website"}
@@ -543,6 +548,7 @@ function ScanContextBar({
   const running = scanIsActive(scan);
   const completed = scan.status === "completed";
   const score = Number(scan.score || 0);
+  const truncatedPages = Number(scan.result?.summary?.truncatedHtmlPages || 0);
   return (
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/60 bg-card/40 px-4 py-3">
       <div className="min-w-0">
@@ -576,6 +582,7 @@ function ScanContextBar({
             <span className="metric text-lg leading-none" style={{ color: scoreTone(score) }}>{formatNumber(score)}%</span>
             {" · "}
             {scoreVerdict(score)}
+            {truncatedPages > 0 ? <span className="ml-2 text-xs text-warn">{formatNumber(truncatedPages)} {truncatedPages === 1 ? "page" : "pages"} with incomplete HTML</span> : null}
           </Hint>
         ) : null}
         {!running ? (

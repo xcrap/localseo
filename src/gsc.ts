@@ -5,6 +5,11 @@ import { all, get, jsonParse, run, transaction } from "./db";
 import { HttpError, badRequest, notFound } from "./errors";
 import { requireDate } from "./input";
 import { getSite } from "./seo";
+import {
+  batchRowsFilter, DIMENSION_ORDER, ensureGscRows, findGscBatch, GSC_ROW_COLUMNS, insertGscRows,
+  matchGscWindow, queryGscTotals, requireGscImport, storedGscTotals,
+  type GscImportRecord, type GscWindow, type ImportedGscPerformanceRow,
+} from "./gsc-store";
 
 const GSC_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly";
 const GSC_CALLBACK_PATH = "/api/gsc/callback";
@@ -25,31 +30,6 @@ type GscConnection = {
   auth_error: string;
 };
 
-export type GscImportRecord = {
-  id: string;
-  site_id: string;
-  site_url: string;
-  source_name: string;
-  source: string;
-  dimensions_json: string;
-  row_count: number;
-  totals_json: string;
-  rows_json: string;
-  start_date: string | null;
-  end_date: string | null;
-  created_at: string;
-};
-
-// Metrics stay null when a CSV cell is empty or unparseable instead of
-// becoming a made-up zero.
-type ImportedGscPerformanceRow = {
-  keys: string[];
-  clicks: number | null;
-  impressions: number | null;
-  ctr: number | null;
-  position: number | null;
-};
-
 const DIMENSION_ALIASES: Record<string, string[]> = {
   query: ["query", "queries", "top query", "top queries", "keyword", "keywords"],
   page: ["page", "pages", "top page", "top pages", "url", "landing page", "landing pages"],
@@ -58,7 +38,6 @@ const DIMENSION_ALIASES: Record<string, string[]> = {
   date: ["date", "day"],
 };
 
-const DIMENSION_ORDER = ["query", "page", "country", "device", "date"];
 const METRIC_ALIASES = {
   clicks: ["clicks"],
   impressions: ["impressions"],
@@ -529,27 +508,6 @@ function rowHasGscEvidence(row: ImportedGscPerformanceRow) {
   return row.keys.some(Boolean) || [row.clicks, row.impressions, row.ctr, row.position].some((value) => value !== null);
 }
 
-function computeGscTotals(rows: ImportedGscPerformanceRow[]) {
-  let clicks = 0;
-  let impressions = 0;
-  let weightedPosition = 0;
-  let weightedImpressions = 0;
-  for (const row of rows) {
-    clicks += row.clicks ?? 0;
-    impressions += row.impressions ?? 0;
-    if (row.position !== null && row.impressions !== null) {
-      weightedPosition += row.position * row.impressions;
-      weightedImpressions += row.impressions;
-    }
-  }
-  return {
-    clicks: Math.round(clicks),
-    impressions: Math.round(impressions),
-    ctr: impressions ? clicks / impressions : null,
-    position: weightedImpressions ? weightedPosition / weightedImpressions : null,
-  };
-}
-
 function mapGscImport(row: GscImportRecord) {
   return {
     id: row.id,
@@ -559,14 +517,12 @@ function mapGscImport(row: GscImportRecord) {
     source: row.source,
     dimensions: jsonParse<string[]>(row.dimensions_json, []),
     rowCount: row.row_count,
-    totals: jsonParse<Record<string, number | null>>(row.totals_json, {}),
+    totals: storedGscTotals(row),
     startDate: row.start_date,
     endDate: row.end_date,
     createdAt: row.created_at,
   };
 }
-
-const GSC_ROW_COLUMNS = "query, page, country, device, date, clicks, impressions, ctr, position";
 
 function saveGscBatch(input: {
   siteId: string;
@@ -579,12 +535,12 @@ function saveGscBatch(input: {
   rows: ImportedGscPerformanceRow[];
 }) {
   const id = randomUUID();
-  transaction(() => {
+  return transaction(() => {
     run(
       `
       INSERT INTO gsc_imports
-        (id, site_id, site_url, source_name, source, dimensions_json, row_count, totals_json, rows_json, start_date, end_date)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)
+        (id, site_id, site_url, source_name, source, dimensions_json, row_count, start_date, end_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         id,
@@ -594,64 +550,21 @@ function saveGscBatch(input: {
         input.source,
         JSON.stringify(input.dimensions),
         input.rows.length,
-        JSON.stringify(computeGscTotals(input.rows)),
         input.startDate,
         input.endDate,
       ],
     );
     insertGscRows(id, input.siteId, input.dimensions, input.rows);
+    return mapGscImport(requireGscImport(input.siteId, id));
   });
-  return mapGscImport(requireGscImport(input.siteId, id));
-}
-
-function insertGscRows(importId: string, siteId: string, dimensions: string[], rows: ImportedGscPerformanceRow[]) {
-  const columnIndex = Object.fromEntries(DIMENSION_ORDER.map((dimension) => [dimension, dimensions.indexOf(dimension)]));
-  const keyFor = (row: ImportedGscPerformanceRow, dimension: string) =>
-    columnIndex[dimension] >= 0 ? row.keys[columnIndex[dimension]] ?? null : null;
-  for (const row of rows) {
-    run(
-      `INSERT INTO gsc_rows (import_id, site_id, ${GSC_ROW_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        importId,
-        siteId,
-        keyFor(row, "query"),
-        keyFor(row, "page"),
-        keyFor(row, "country"),
-        keyFor(row, "device"),
-        keyFor(row, "date"),
-        row.clicks,
-        row.impressions,
-        row.ctr,
-        row.position,
-      ],
-    );
-  }
-}
-
-function requireGscImport(siteId: string, importId: string) {
-  const record = get<GscImportRecord>("SELECT * FROM gsc_imports WHERE id = ? AND site_id = ?", [importId, siteId]);
-  if (!record) throw notFound("Search Console import not found.");
-  return record;
-}
-
-// Imports saved before gsc_rows existed keep their rows in rows_json. The
-// first read copies them into gsc_rows (rows_json is left as it was).
-export function ensureGscRows(record: GscImportRecord) {
-  if (!record.row_count || get("SELECT 1 FROM gsc_rows WHERE import_id = ? LIMIT 1", [record.id])) return;
-  const rows = jsonParse<ImportedGscPerformanceRow[]>(record.rows_json, []);
-  if (!rows.length) return;
-  transaction(() =>
-    insertGscRows(record.id, record.site_id, jsonParse<string[]>(record.dimensions_json, []), rows),
-  );
 }
 
 // Rows in the legacy { keys, clicks, impressions, ctr, position } shape.
-function gscImportRows(record: GscImportRecord) {
+function gscImportRows(record: GscImportRecord, window: GscWindow | null = null, limit = -1) {
   ensureGscRows(record);
   const dimensions = jsonParse<string[]>(record.dimensions_json, []);
-  return all<Record<string, any>>(`SELECT ${GSC_ROW_COLUMNS} FROM gsc_rows WHERE import_id = ? ORDER BY id`, [
-    record.id,
-  ]).map((row) => ({
+  const { where, params } = batchRowsFilter(record.id, window);
+  return all<Record<string, any>>(`SELECT ${GSC_ROW_COLUMNS} FROM gsc_rows WHERE ${where} ORDER BY id LIMIT ?`, [...params, limit]).map((row) => ({
     keys: dimensions.map((dimension) => row[dimension] ?? ""),
     clicks: row.clicks,
     impressions: row.impressions,
@@ -664,7 +577,7 @@ function gscImportRows(record: GscImportRecord) {
 // through getGscImport or listGscRows.
 export function listGscImports(siteId: string) {
   return all<GscImportRecord>(
-    "SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC",
+    "SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC, rowid DESC",
     [siteId],
   ).map(mapGscImport);
 }
@@ -707,6 +620,15 @@ export function importGscPerformance(input: {
   // A CSV export does not say which dates it covers; keep the window only
   // when the caller states it.
   const window = input.startDate || input.endDate ? dateWindow(input) : null;
+  const dateIndex = dimensions.indexOf("date");
+  if (window && dateIndex !== -1) {
+    for (const row of rows) {
+      const date = requireDate(row.keys[dateIndex], "CSV date");
+      if (date < window.startDate || date > window.endDate) {
+        throw badRequest(`CSV date ${date} falls outside the stated import window.`);
+      }
+    }
+  }
   const batch = saveGscBatch({
     siteId: site.id,
     siteUrl: String(input.siteUrl || site.domain || "").trim(),
@@ -718,10 +640,6 @@ export function importGscPerformance(input: {
     rows,
   });
   return { ...batch, rows: gscImportRows(requireGscImport(site.id, batch.id)) };
-}
-
-function sameDimensions(left: string[], right: string[]) {
-  return left.length === right.length && left.every((dimension) => right.includes(dimension));
 }
 
 // Stored Search Console rows (CSV imports and API syncs alike), one batch at a
@@ -738,33 +656,13 @@ export function listGscRows(
   const offset = Math.max(0, Math.round(Number(input.offset)) || 0);
   const window = input.startDate || input.endDate ? dateWindow(input) : null;
   const dimensions = input.dimensions ? apiDimensions(input.dimensions) : null;
-  let record: GscImportRecord | undefined;
-  if (input.importId) {
-    record = requireGscImport(siteId, String(input.importId));
-  } else {
-    record = all<GscImportRecord>("SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC", [siteId]).find(
-      (candidate) => {
-        const candidateDimensions = jsonParse<string[]>(candidate.dimensions_json, []);
-        if (dimensions && !sameDimensions(candidateDimensions, dimensions)) return false;
-        if (!window) return true;
-        if (candidate.start_date === window.startDate && candidate.end_date === window.endDate) return true;
-        return (
-          candidateDimensions.includes("date") &&
-          Boolean(candidate.start_date && candidate.end_date) &&
-          String(candidate.start_date) <= window.startDate &&
-          String(candidate.end_date) >= window.endDate
-        );
-      },
-    );
-  }
-  if (!record) return { batch: null, rows: [], total: 0, limit, offset, hasMore: false };
-  ensureGscRows(record);
-  const filterByDate =
-    window &&
-    jsonParse<string[]>(record.dimensions_json, []).includes("date") &&
-    !(record.start_date === window.startDate && record.end_date === window.endDate);
-  const where = filterByDate ? "import_id = ? AND date BETWEEN ? AND ?" : "import_id = ?";
-  const params = filterByDate ? [record.id, window.startDate, window.endDate] : [record.id];
+  const explicit = input.importId ? requireGscImport(siteId, String(input.importId)) : null;
+  const match = explicit
+    ? matchGscWindow(explicit, jsonParse<string[]>(explicit.dimensions_json, []), window)
+    : findGscBatch(siteId, { include: dimensions ?? [], exactDimensions: Boolean(dimensions), window });
+  if (!match) return { batch: null, rows: [], total: 0, limit, offset, hasMore: false };
+  const { record } = match;
+  const { where, params } = batchRowsFilter(record.id, window ? match.dateFilter : null);
   const total = get<{ count: number }>(`SELECT count(*) AS count FROM gsc_rows WHERE ${where}`, params)?.count || 0;
   const rows = all(
     `SELECT ${GSC_ROW_COLUMNS} FROM gsc_rows WHERE ${where} ORDER BY clicks DESC, impressions DESC, id ASC LIMIT ? OFFSET ?`,
@@ -790,25 +688,23 @@ export async function getGscPerformance(input: {
       ...(await queryGscPerformance({ ...input, siteId })),
     };
   }
-  const latest = get<GscImportRecord>(
-    "SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC LIMIT 1",
-    [siteId],
-  );
-  if (latest) {
-    const batch = mapGscImport(latest);
-    return {
-      source: latest.source === "api" ? "local_gsc_sync" : "local_gsc_import",
-      siteUrl: batch.siteUrl,
-      dimensions: batch.dimensions,
-      totals: batch.totals,
-      rows: gscImportRows(latest),
-      startDate: batch.startDate,
-      endDate: batch.endDate,
-      importedAt: batch.createdAt,
-      sourceName: batch.sourceName,
-    };
-  }
-  throw badRequest("No Search Console data yet. Connect Google or import a Search Console CSV.");
+  const window = dateWindow(input);
+  const match = findGscBatch(siteId, { include: apiDimensions(input.dimensions), exactDimensions: true, window, siteUrl: input.siteUrl });
+  if (!match) throw badRequest("No stored Search Console batch matches the requested dimensions and date window.");
+  const { record, dimensions, dateFilter } = match;
+  const limit = input.rowLimit === undefined ? -1 : Math.max(1, Math.min(GSC_MAX_ROW_LIMIT, Math.round(Number(input.rowLimit)) || 1000));
+  const { count, ...totals } = queryGscTotals(record.id, dateFilter);
+  return {
+    source: record.source === "api" ? "local_gsc_sync" : "local_gsc_import",
+    siteUrl: record.site_url,
+    dimensions,
+    totals: count === 0 && record.source !== "api" ? { clicks: null, impressions: null, ctr: null, position: null } : totals,
+    rows: gscImportRows(record, dateFilter, limit),
+    hasMore: limit >= 0 && count > limit,
+    ...window,
+    importedAt: record.created_at,
+    sourceName: record.source_name,
+  };
 }
 
 export function listGscConnections() {

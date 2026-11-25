@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { FileSearch, Globe2, Link2, Plus } from "lucide-react";
 import { api, type Site } from "../../api";
 import { Badge, Button, Input, Label, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Skeleton, SortableTableHead, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tabs, TabsContent, TabsList, TabsTrigger, toast } from "@/components/ui";
-import { EmptyState, Field, HistoryList, IndexabilityBadge, InfoTip, PageHeader, ProviderNotice, ReportSection, SiteDomainField, StatsBand, StatusDot, defaultEvidenceScan, domainKey, formatDate, formatNumber, LengthBadge, ScanLinksTable, hasIndexabilityEvidence, metricValue, pageH1Status, pageIssueTypesCount, scanIsActive, scanIssueCount, scanStatusLabel, sourceLabel, sourceVariant, setSelectedScanId, sortScanRows } from "../shared";
+import { EmptyState, Field, HistoryList, IndexabilityBadge, SitemapBadge, InfoTip, PageHeader, ProviderNotice, ReportSection, SiteDomainField, StatsBand, StatusDot, defaultEvidenceScan, domainKey, formatDate, formatNumber, LengthBadge, ScanLinksTable, hasIndexabilityEvidence, metricValue, pageH1Status, pageIssueTypesCount, scanIsActive, scanIssueCount, scanStatusLabel, sourceLabel, sourceVariant, setSelectedScanId, sortScanRows } from "../shared";
 import { FilteredRows } from "../data-table";
 
 // Scan lists are lite rows; the selected scan's pages and links come from the
@@ -104,7 +104,7 @@ export function DomainPage({ site }: { site: Site }) {
     event?.preventDefault();
     setLoading(true);
     const token = ++researchRequest.current;
-    const body = { siteId: site.id, domain, pageSize: 50 };
+    const body = { siteId: site.id, domain, allRows: true };
     try {
       const [overviewData, keywordData, pageData] = await Promise.all([
         api.domainOverview(body),
@@ -138,7 +138,7 @@ export function DomainPage({ site }: { site: Site }) {
       });
       toast.success(`Imported ${formatNumber(imported.keywordCount || 0)} keyword rows and ${formatNumber(imported.pageCount || 0)} page rows from ${file.name}.`);
       const token = ++researchRequest.current;
-      const body = { siteId: site.id, domain, pageSize: 50 };
+      const body = { siteId: site.id, domain, allRows: true };
       const [overviewData, keywordData, pageData] = await Promise.all([
         api.domainOverview(body),
         api.domainKeywords(body),
@@ -238,12 +238,12 @@ export function DomainPage({ site }: { site: Site }) {
           </TabsList>
           <TabsContent value="keywords">
             <ReportSection title="Ranked keywords" meta={keywords ? <SourceMeta source={keywords.source} /> : undefined}>
-              {keywords?.keywords?.length ? <FilteredRows rows={keywords.keywords} placeholder="Filter keywords…" csvName={`ranked-keywords-${domainKey(domain)}`}>{(rows) => <DomainKeywordsTable rows={rows} />}</FilteredRows> : <EmptyState title="No keyword rows" text={keywords?.warning || "Analyze an organic research site to load ranked keyword data."} />}
+              {keywords?.keywords?.length ? <FilteredRows minRows={1} pageSize={50} rows={keywords.keywords} placeholder="Filter keywords…" csvName={`ranked-keywords-${domainKey(keywords.domain)}`}>{(rows) => <DomainKeywordsTable rows={rows} />}</FilteredRows> : <EmptyState title="No keyword rows" text={keywords?.warning || "Analyze an organic research site to load ranked keyword data."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="pages">
             <ReportSection title="Top pages" meta={pages ? <SourceMeta source={pages.source} /> : undefined}>
-              {pages?.pages?.length ? <FilteredRows rows={pages.pages} placeholder="Filter pages…" csvName={`top-pages-${domainKey(domain)}`}>{(rows) => <DomainPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={pages?.warning || "Analyze an organic research site to load top page data."} />}
+              {pages?.pages?.length ? <FilteredRows minRows={1} pageSize={50} rows={pages.pages} placeholder="Filter pages…" csvName={`top-pages-${domainKey(pages.domain || overview?.domain)}`}>{(rows) => <DomainPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={pages?.warning || "Analyze an organic research site to load top page data."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="snapshot">
@@ -323,8 +323,8 @@ function LocalOrganicEvidence({
   const rows = useMemo(() => [...pages].sort((a, b) => scanIssueCount(b) - scanIssueCount(a)), [pages]);
   const indexableCount = pages.filter((page: any) => page.indexable === true).length;
   const unknownIndexabilityCount = pages.filter((page: any) => !hasIndexabilityEvidence(page)).length;
-  const missingTitleCount = pages.filter((page: any) => !page.title).length;
-  const missingDescriptionCount = pages.filter((page: any) => !page.description).length;
+  const missingTitleCount = pages.filter((page: any) => !page.htmlTruncated && !page.title).length;
+  const missingDescriptionCount = pages.filter((page: any) => !page.htmlTruncated && !page.description).length;
   const h1IssueCount = pages.reduce((total: number, page: any) => total + pageIssueTypesCount(page, ["h1-count", "h1-empty"]), 0);
   return (
     <ReportSection
@@ -408,12 +408,12 @@ function LocalOrganicPagesTable({ rows }: { rows: any[] }) {
             </TableCell>
             <TableCell><IndexabilityBadge page={page} /></TableCell>
             <TableCell className="min-w-56">
-              <div className="line-clamp-2">{page.title || "Missing"}</div>
-              <LengthBadge value={page.title} savedLength={page.titleLength} min={30} max={60} />
+              <div className="line-clamp-2">{page.title || (page.htmlTruncated ? "Unknown" : "Missing")}</div>
+              {page.title || !page.htmlTruncated ? <LengthBadge value={page.title} savedLength={page.titleLength} min={30} max={60} /> : null}
             </TableCell>
             <TableCell className="min-w-64">
-              <div className="line-clamp-2">{page.description || "Missing"}</div>
-              <LengthBadge value={page.description} savedLength={page.descriptionLength} min={70} max={160} />
+              <div className="line-clamp-2">{page.description || (page.htmlTruncated ? "Unknown" : "Missing")}</div>
+              {page.description || !page.htmlTruncated ? <LengthBadge value={page.description} savedLength={page.descriptionLength} min={70} max={160} /> : null}
             </TableCell>
             <TableCell className="max-w-xs">
               <div className="line-clamp-2">{h1.label}</div>
@@ -445,7 +445,7 @@ function OrganicSnapshot({ result, domain, keywordRows, pageRows }: { result: an
       meta={
         <SourceMeta
           source={result.source}
-          extra={<span>· {domain || result.domain || "-"}{savedAt ? ` · ${formatDate(savedAt)}` : ""}</span>}
+          extra={<span>· {result.domain || domain || "-"}{savedAt ? ` · ${formatDate(savedAt)}` : ""}</span>}
         />
       }
     >
@@ -589,7 +589,7 @@ export function LinksPage({ site }: { site: Site }) {
     const token = ++backlinkRequest.current;
     setLoading(true);
     setError("");
-    const body = { siteId: site.id, domain, tab: nextTab, pageSize: 50 };
+    const body = { siteId: site.id, domain, tab: nextTab, allRows: true };
     try {
       const [overviewData, profileData] = await Promise.all([
         api.backlinksOverview(body),
@@ -628,7 +628,7 @@ export function LinksPage({ site }: { site: Site }) {
       await loadHistory();
       toast.success(`Imported ${formatNumber(imported.rowCount || imported.row_count || 0)} backlink rows from ${file.name}.`);
       const token = ++backlinkRequest.current;
-      const body = { siteId: site.id, domain, tab, pageSize: 50 };
+      const body = { siteId: site.id, domain, tab, allRows: true };
       const [overviewData, profileData] = await Promise.all([
         api.backlinksOverview(body),
         api.backlinksProfile(body),
@@ -737,17 +737,17 @@ export function LinksPage({ site }: { site: Site }) {
           </TabsList>
           <TabsContent value="backlinks">
             <ReportSection title="External backlinks" meta={profile ? <SourceMeta source={profile.source} /> : undefined}>
-              {profile?.tab === "backlinks" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter backlinks…" csvName={`backlinks-${domainKey(domain)}`}>{(rows) => <BacklinksRowsTable rows={rows} />}</FilteredRows> : <EmptyState title="No web-wide backlink index" text={profile?.warning || "Import a backlink CSV above to populate this table. Local scans do not invent web-wide backlinks."} />}
+              {profile?.tab === "backlinks" && profile.rows?.length ? <FilteredRows minRows={1} pageSize={50} rows={profile.rows} placeholder="Filter backlinks…" csvName={`backlinks-${domainKey(profile.domain || overview?.domain)}`}>{(rows) => <BacklinksRowsTable rows={rows} />}</FilteredRows> : <EmptyState title="No web-wide backlink index" text={profile?.warning || "Import a backlink CSV above to populate this table. Local scans do not invent web-wide backlinks."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="domains">
             <ReportSection title="Referring domains">
-              {profile?.tab === "domains" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter referring domains…" csvName={`referring-domains-${domainKey(domain)}`}>{(rows) => <ReferringDomainsTable rows={rows} />}</FilteredRows> : <EmptyState title="No domain rows" text={profile?.warning || "Switch tabs after running a backlink analysis."} />}
+              {profile?.tab === "domains" && profile.rows?.length ? <FilteredRows minRows={1} pageSize={50} rows={profile.rows} placeholder="Filter referring domains…" csvName={`referring-domains-${domainKey(profile.domain || overview?.domain)}`}>{(rows) => <ReferringDomainsTable rows={rows} />}</FilteredRows> : <EmptyState title="No domain rows" text={profile?.warning || "No referring domains were recorded for this selection."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="pages">
             <ReportSection title="Top linked pages">
-              {profile?.tab === "pages" && profile.rows?.length ? <FilteredRows rows={profile.rows} placeholder="Filter linked pages…" csvName={`linked-pages-${domainKey(domain)}`}>{(rows) => <BacklinkPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={profile?.warning || "Switch tabs after running a backlink analysis."} />}
+              {profile?.tab === "pages" && profile.rows?.length ? <FilteredRows minRows={1} pageSize={50} rows={profile.rows} placeholder="Filter linked pages…" csvName={`linked-pages-${domainKey(profile.domain || overview?.domain)}`}>{(rows) => <BacklinkPagesTable rows={rows} />}</FilteredRows> : <EmptyState title="No page rows" text={profile?.warning || "No target URLs were recorded for this selection."} />}
             </ReportSection>
           </TabsContent>
           <TabsContent value="snapshot">
@@ -939,7 +939,7 @@ function LocalInternalGraphTable({ rows }: { rows: any[] }) {
             <TableCell className="nums">{formatNumber(page.internalInlinks || 0)}</TableCell>
             <TableCell className="nums">{formatNumber(page.internalLinks || 0)}</TableCell>
             <TableCell className="nums">{formatNumber(page.externalLinks || 0)}</TableCell>
-            <TableCell><Badge variant={page.sitemapListed ? "good" : "warn"}>{page.sitemapListed ? "Listed" : "Missing"}</Badge></TableCell>
+            <TableCell><SitemapBadge page={page} /></TableCell>
             <TableCell><Badge variant={scanIssueCount(page) ? "warn" : "good"}>{formatNumber(scanIssueCount(page))}</Badge></TableCell>
           </TableRow>
         ))}
@@ -960,8 +960,8 @@ function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: 
   const followKnown = dofollowCount != null && nofollowCount != null ? Number(dofollowCount) + Number(nofollowCount) : null;
   const ratioDetail =
     followKnown != null
-      ? `Share of followed links among the ${formatNumber(followKnown)} rows with known follow status. Rows without follow evidence are not counted.`
-      : "Share of followed links among rows whose export states follow or nofollow. Rows without follow evidence are not counted.";
+      ? `Share of followed links among links with known follow status (${formatNumber(followKnown)}).`
+      : "Share of followed links among links with known follow status.";
   return (
     <ReportSection
       title="Snapshot"
@@ -971,7 +971,7 @@ function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: 
           source={result.source}
           extra={
             <>
-              <span>· {domain || result.domain || "-"}{result.createdAt ? ` · ${formatDate(result.createdAt)}` : ""}</span>
+              <span>· {result.domain || domain || "-"}{result.createdAt ? ` · ${formatDate(result.createdAt)}` : ""}</span>
               {result.warning ? <InfoTip label="Snapshot warning">{result.warning}</InfoTip> : null}
             </>
           }
@@ -980,22 +980,28 @@ function BacklinkSnapshot({ result, domain, rows, tab }: { result: any; domain: 
     >
       <StatsBand
         items={[
-          { title: "Visible rows", value: rows, detail: `Rows currently loaded in the ${tab} tab.` },
+          { title: "Dataset rows", value: rows, detail: `Rows available in the ${tab} tab.` },
           { title: "Backlinks", value: backlinks, detail: "Total backlinks from the imported rows." },
           { title: "Referring domains", value: referringDomains, detail: "Unique linking domains from the imported rows." },
           { title: "Dofollow %", value: dofollowRatio, detail: ratioDetail, format: (value) => `${formatNumber(value)}%` },
-          { title: "Nofollow", value: nofollowCount, detail: "Imported rows the export marks as not followed." },
-          { title: "Follow unknown", value: followUnknown, detail: "Imported rows whose export did not state follow or nofollow." },
+          { title: "Nofollow", value: nofollowCount, detail: "Links the export marks as not followed." },
+          { title: "Follow unknown", value: followUnknown, detail: "Links whose export did not state follow or nofollow." },
         ]}
       />
       {dofollowRatio != null && followKnown != null ? (
         <p className="mt-3 text-xs text-muted-foreground">
-          Dofollow % is over the {formatNumber(followKnown)} rows with known follow status
-          {Number(followUnknown || 0) > 0 ? `; ${formatNumber(followUnknown)} rows have no follow evidence and are left out` : ""}.
+          Dofollow % is over the {formatNumber(followKnown)} links with known follow status
+          {Number(followUnknown || 0) > 0 ? `; ${formatNumber(followUnknown)} links have no follow evidence and are left out` : ""}.
         </p>
       ) : null}
     </ReportSection>
   );
+}
+
+function BacklinkUrl({ url, unverified, missing }: { url?: string; unverified?: string; missing: string }) {
+  if (url) return <>{url}</>;
+  if (!unverified) return <>{missing}</>;
+  return <span>{unverified} <InfoTip label="Unverified URL">Older imports could infer a homepage. The original export did not establish this URL.</InfoTip> <span className="text-xs text-warn">Unverified</span></span>;
 }
 
 function BacklinksRowsTable({ rows }: { rows: any[] }) {
@@ -1004,6 +1010,8 @@ function BacklinksRowsTable({ rows }: { rows: any[] }) {
       <TableHeader>
         <TableRow>
           <SortableTableHead sortKey="domainFrom">From</SortableTableHead>
+          <SortableTableHead sortKey="urlTo">Target URL</SortableTableHead>
+          <SortableTableHead sortKey="linksCount">Links</SortableTableHead>
           <SortableTableHead sortKey="anchor">Anchor</SortableTableHead>
           <SortableTableHead sortKey="rank">Rank</SortableTableHead>
           <SortableTableHead sortKey="spamScore">Spam</SortableTableHead>
@@ -1013,7 +1021,12 @@ function BacklinksRowsTable({ rows }: { rows: any[] }) {
       <TableBody>
         {rows.map((row, index) => (
           <TableRow key={`${row.urlFrom}:${index}`}>
-            <TableCell className="max-w-sm truncate font-medium">{row.domainFrom || row.urlFrom}</TableCell>
+            <TableCell className="max-w-sm break-all">
+              <div className="font-medium">{row.domainFrom || "Unknown domain"}</div>
+              <div className="text-xs text-muted-foreground"><BacklinkUrl url={row.urlFrom} unverified={row.unverifiedUrlFrom} missing="Source URL unavailable" /></div>
+            </TableCell>
+            <TableCell className="max-w-sm break-all"><BacklinkUrl url={row.urlTo} unverified={row.unverifiedUrlTo} missing="Target URL unavailable" /></TableCell>
+            <TableCell className="nums">{formatNumber(row.linksCount)}</TableCell>
             <TableCell className="max-w-xs truncate">{row.anchor || "-"}</TableCell>
             <TableCell className="nums">{formatNumber(row.rank)}</TableCell>
             <TableCell className="nums">{formatNumber(row.spamScore)}</TableCell>

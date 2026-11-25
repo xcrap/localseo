@@ -333,50 +333,68 @@ function McpExample({ title, value }: { title: string; value: unknown }) {
   );
 }
 
+function appPreferences(data: Record<string, unknown> | null): Record<string, string> {
+  return {
+    codex_model: String(data?.codex_model || "").trim(),
+    codex_reasoning_effort: String(data?.codex_reasoning_effort || "medium").trim(),
+    default_location_code: String(defaultLocationCodeFromConfig(data)),
+    default_language_code: defaultLanguageCodeFromConfig(data),
+    default_crawl_protocol: defaultCrawlProtocolFromConfig(data) || "auto",
+    default_crawl_host: defaultCrawlHostFromConfig(data) || "auto",
+    default_crawl_speed: defaultCrawlSpeedFromConfig(data),
+    default_crawl_max_pages: String(defaultCrawlMaxPagesFromConfig(data)),
+  };
+}
+
 export function SettingsPage() {
-  const [config, setConfig] = useState<any>({});
-  const [form, setForm] = useState<any>({});
+  const [config, setConfig] = useState<any>(null);
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
 
-  async function load() {
-    const data = await api.config();
+  function receiveConfig(data: any) {
     setConfig(data);
-    setForm({
-      codex_model: data.codex_model || "",
-      codex_reasoning_effort: data.codex_reasoning_effort || "medium",
-      default_location_code: defaultLocationCodeFromConfig(data),
-      default_language_code: defaultLanguageCodeFromConfig(data),
-      default_crawl_protocol: defaultCrawlProtocolFromConfig(data),
-      default_crawl_host: defaultCrawlHostFromConfig(data),
-      default_crawl_speed: defaultCrawlSpeedFromConfig(data),
-      default_crawl_max_pages: defaultCrawlMaxPagesFromConfig(data),
-    });
+    setForm(appPreferences(data));
+  }
+  async function load() {
+    setLoadError("");
+    try {
+      receiveConfig(await api.config());
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not load app settings.");
+    }
   }
   useEffect(() => {
-    load().catch(console.error);
+    void load();
   }, []);
+
+  const baseline = appPreferences(config);
+  const changes = Object.fromEntries(
+    Object.entries(appPreferences(form)).filter(([key, value]) => value !== baseline[key]),
+  );
+  const hasChanges = Object.keys(changes).length > 0;
 
   async function save(event: SyntheticEvent) {
     event.preventDefault();
+    if (!config || saving || !hasChanges) return;
     setSaving(true);
     try {
-      await api.saveConfig({
-        codex_model: String(form.codex_model || "").trim(),
-        codex_reasoning_effort: String(form.codex_reasoning_effort || "medium").trim(),
-        default_location_code: String(form.default_location_code || defaultKeywordLocationCode),
-        default_language_code: String(form.default_language_code || defaultKeywordLanguageCode),
-        default_crawl_protocol: String(form.default_crawl_protocol || "auto"),
-        default_crawl_host: String(form.default_crawl_host || "auto"),
-        default_crawl_speed: form.default_crawl_speed === "fast" ? "fast" : "polite",
-        default_crawl_max_pages: String(Math.max(10, Math.min(1000, Number(form.default_crawl_max_pages) || 100))),
-      });
-      await load();
+      const saved = await api.saveConfig(changes);
+      receiveConfig(saved);
       toast.success("App settings saved locally.");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not save app settings");
     } finally {
       setSaving(false);
     }
+  }
+
+  if (!config) {
+    return loadError ? (
+      <EmptyState title="Could not load app settings" text={loadError} action={<Button onClick={load}><RefreshCw /> Retry</Button>} />
+    ) : (
+      <p role="status" className="text-sm text-muted-foreground">Loading app settings…</p>
+    );
   }
 
   return (
@@ -391,7 +409,7 @@ export function SettingsPage() {
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Default keyword market">
-                <Select value={String(form.default_location_code || defaultKeywordLocationCode)} onValueChange={(value) => setForm({ ...form, default_location_code: Number(value) })}>
+                <Select value={String(form.default_location_code || defaultKeywordLocationCode)} onValueChange={(value) => setForm({ ...form, default_location_code: value })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {marketOptions.map((market) => <SelectItem key={market.code} value={String(market.code)}>{market.label}</SelectItem>)}
@@ -461,7 +479,7 @@ export function SettingsPage() {
                 </Field>
               </div>
             </div>
-            <Button disabled={saving}><Settings /> {saving ? "Saving settings" : "Save app settings"}</Button>
+            <Button disabled={saving || !hasChanges}><Settings /> {saving ? "Saving settings" : "Save app settings"}</Button>
           </form>
         </ReportSection>
         <ReportSection title="Data sources" description="What the app can run locally now and what needs real imported data or a local provider.">

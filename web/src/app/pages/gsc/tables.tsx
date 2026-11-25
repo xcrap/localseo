@@ -168,19 +168,18 @@ export function GscImportHistory({
   );
 }
 
-// Totals over the rows on screen. A metric no row carries stays unavailable
-// instead of summing to zero.
+// Partial columns cannot establish a total over the displayed rows.
 export function GscPerformanceSummary({ rows }: { rows: GscLegacyRow[] }) {
-  let clicks: number | null = null;
-  let impressions: number | null = null;
+  let clicks: number | null = rows.length ? 0 : null;
+  let impressions: number | null = rows.length ? 0 : null;
   let weightedPosition = 0;
   let weightedImpressions = 0;
   for (const row of rows) {
     const rowClicks = metricNumber(row.clicks);
     const rowImpressions = metricNumber(row.impressions);
     const rowPosition = metricNumber(row.position);
-    if (rowClicks !== null) clicks = (clicks ?? 0) + rowClicks;
-    if (rowImpressions !== null) impressions = (impressions ?? 0) + rowImpressions;
+    clicks = rowClicks === null || clicks === null ? null : clicks + rowClicks;
+    impressions = rowImpressions === null || impressions === null ? null : impressions + rowImpressions;
     if (rowPosition !== null && rowImpressions) {
       weightedPosition += rowPosition * rowImpressions;
       weightedImpressions += rowImpressions;

@@ -1129,6 +1129,13 @@ export function IndexabilityBadge({ page }: { page: any }) {
   return <Badge variant={page.indexable ? "good" : "bad"}>{page.indexable ? "Yes" : "No"}</Badge>;
 }
 
+export function SitemapBadge({ page }: { page: any }) {
+  if (page.sitemapListed === true) return <Badge variant="good">Listed</Badge>;
+  if (page.sitemapSourceListed === true) return <Badge variant="warn">Redirect source listed</Badge>;
+  if (page.sitemapListed === false) return <Badge variant="warn">Not listed</Badge>;
+  return <Badge variant="outline">Unknown</Badge>;
+}
+
 export function scanCoverageMetrics(scan: any, result: any = {}, summary: any = {}) {
   const pages = Array.isArray(result.pages) ? result.pages : [];
   const links = Array.isArray(result.links) ? result.links : [];
@@ -1199,6 +1206,7 @@ export function scanCoverageMetrics(scan: any, result: any = {}, summary: any = 
     indexablePages: pages.length ? pages.filter((page: any) => page.indexable === true).length : indexablePages,
     nonIndexablePages: pages.length ? pages.filter((page: any) => page.indexable === false).length : nonIndexablePages,
     unknownIndexabilityPages,
+    truncatedPages: knownNumber(summary.truncatedHtmlPages) ?? pages.filter((page: any) => page.htmlTruncated).length,
     /** URLs listed across the sitemap files; null when the scan saved no sitemap evidence. */
     sitemapUrls: knownNumber(result.sitemap?.urlCount) ?? (storedSitemapUrls ? storedSitemapUrls.length : null),
     storedSitemapUrls: storedSitemapUrls ? storedSitemapUrls.length : null,
@@ -1210,7 +1218,7 @@ export function scanCoverageMetrics(scan: any, result: any = {}, summary: any = 
     robotsMode: result.limits?.robots === "respect" || result.limits?.robots === "ignore" ? (result.limits.robots as "respect" | "ignore") : null,
     /** Crawled pages that a sitemap lists. */
     sitemapListedPages: maxCount(summary.sitemapUrls, pages.filter((page: any) => page.sitemapListed).length),
-    pagesMissingFromSitemap: summary.pagesMissingFromSitemap != null
+    pagesMissingFromSitemap: result.sitemap?.coverageComplete === false ? null : summary.pagesMissingFromSitemap != null
       ? metricNumber(summary.pagesMissingFromSitemap)
       : pages.filter((page: any) => page.indexable === true && page.sitemapListed === false).length,
     noindexPagesInSitemap: summary.noindexPagesInSitemap != null
@@ -1458,6 +1466,13 @@ export function pageH1Count(page: any) {
 export function pageH1Status(page: any) {
   const text = pageH1Text(page);
   const count = pageH1Count(page);
+  if (page.htmlTruncated) {
+    return {
+      label: text || "Incomplete HTML",
+      badge: `${formatNumber(count)} observed`,
+      variant: count > 1 ? "warn" : "outline",
+    };
+  }
   const hasEmptyIssue = pageIssueTypeCount(page, "h1-empty") > 0;
   const hasCountIssue = pageIssueTypeCount(page, "h1-count") > 0;
   if (text) {

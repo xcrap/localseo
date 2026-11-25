@@ -326,7 +326,7 @@ const coreTools: ToolDefinition[] = [
   },
   {
     name: "get_gsc_performance",
-    description: "Read Search Console performance for a saved site live from Google OAuth, or from the latest locally stored CSV import or API sync.",
+    description: "Read Search Console performance for a saved site live from Google OAuth, or from a stored CSV import or API sync matching the requested date window and dimensions.",
     inputSchema: {
       type: "object",
       properties: {

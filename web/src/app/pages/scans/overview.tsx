@@ -114,6 +114,11 @@ export function ScanReportOverview({
                       label={isPartial ? "partial crawl" : isCompleted ? scoreVerdict(finalScore) : "score"}
                     />
                     <p className="text-xs font-medium text-muted-foreground">{scoreMeaning}</p>
+                    {coverage.truncatedPages > 0 ? (
+                      <p className="max-w-[220px] text-xs leading-5 text-warn">
+                        HTML checks were incomplete on {formatNumber(coverage.truncatedPages)} {coverage.truncatedPages === 1 ? "page" : "pages"} included in this score.
+                      </p>
+                    ) : null}
                     {isPartial ? (
                       <p className="max-w-[220px] text-xs leading-5 text-muted-foreground">
                         {formatNumber(partialPages)} {partialPages === 1 ? "page" : "pages"} crawled before {scan.status === "cancelled" ? "the scan was cancelled" : "the crawl stopped"}; the score covers only those pages.

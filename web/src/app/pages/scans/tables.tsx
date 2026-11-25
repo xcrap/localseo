@@ -1,6 +1,6 @@
 import { CheckCircle2, EyeOff, PanelRightOpen } from "lucide-react";
 import { Badge, Button, SortableTableHead, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui";
-import { IndexabilityBadge, LengthBadge, formatBytes, formatMs, formatNumber, ignorePageKey, pageH1Status, pageIssueTypeCount, pageIssueTypesCount } from "../../shared";
+import { IndexabilityBadge, SitemapBadge, LengthBadge, formatBytes, formatMs, formatNumber, ignorePageKey, pageH1Status, pageIssueTypeCount, pageIssueTypesCount } from "../../shared";
 
 function activePageIssues(page: any) {
   return (Array.isArray(page?.issues) ? page.issues : []).filter((issue: any) => !issue.ignored);
@@ -36,6 +36,7 @@ export const pageCsvColumns = [
   { label: "indexable", value: (page: any) => page.indexable },
   { label: "indexability_reason", value: (page: any) => page.indexabilityReason },
   { label: "canonical", value: (page: any) => page.canonical },
+  { label: "html_truncated", value: (page: any) => page.htmlTruncated },
   { label: "sitemap_listed", value: (page: any) => page.sitemapListed },
   { label: "depth", value: (page: any) => page.depth },
   { label: "internal_inlinks", value: (page: any) => page.internalInlinks },
@@ -95,22 +96,23 @@ export function ScanMetadataTable({ rows, onOpenPage }: { rows: any[]; onOpenPag
             <TableRow key={page.url}>
               <TableCell className="max-w-xs">
                 <PageLinkButton page={page} onOpenPage={onOpenPage} />
+                {page.htmlTruncated ? <Badge variant="warn">Incomplete HTML</Badge> : null}
               </TableCell>
               <TableCell className="min-w-64">
-                <div className="line-clamp-2 text-sm">{page.title || "Missing"}</div>
-                <LengthBadge value={page.title} savedLength={page.titleLength} min={30} max={60} />
+                <div className="line-clamp-2 text-sm">{page.title || (page.htmlTruncated ? "Unknown" : "Missing")}</div>
+                {page.title || !page.htmlTruncated ? <LengthBadge value={page.title} savedLength={page.titleLength} min={30} max={60} /> : null}
               </TableCell>
               <TableCell className="min-w-72">
-                <div className="line-clamp-2 text-sm">{page.description || "Missing"}</div>
-                <LengthBadge value={page.description} savedLength={page.descriptionLength} min={70} max={160} />
+                <div className="line-clamp-2 text-sm">{page.description || (page.htmlTruncated ? "Unknown" : "Missing")}</div>
+                {page.description || !page.htmlTruncated ? <LengthBadge value={page.description} savedLength={page.descriptionLength} min={70} max={160} /> : null}
               </TableCell>
               <TableCell className="min-w-56">
                 <div className="line-clamp-2 text-sm">{h1.label}</div>
                 <Badge variant={h1.variant as any}>{h1.badge}</Badge>
               </TableCell>
               <TableCell className="max-w-xs">
-                <div className="truncate text-xs text-muted-foreground">{page.canonical || "Missing"}</div>
-                <Badge variant={page.canonical ? "good" : "warn"}>{page.canonicalCount || 0}</Badge>
+                <div className="truncate text-xs text-muted-foreground">{page.canonical || (page.htmlTruncated ? "Unknown" : "Missing")}</div>
+                {page.canonical || !page.htmlTruncated ? <Badge variant={page.canonical ? "good" : "warn"}>{page.canonicalCount || 0}</Badge> : null}
               </TableCell>
               <TableCell><IndexabilityBadge page={page} /></TableCell>
             </TableRow>
@@ -195,6 +197,7 @@ export function ScanPagesTable({
             <TableRow key={page.url}>
               <TableCell className="max-w-sm">
                 <PageLinkButton page={page} onOpenPage={onOpenPage} />
+                {page.htmlTruncated ? <Badge variant="warn">Incomplete HTML</Badge> : null}
                 {page.requestedUrl && page.requestedUrl !== page.url ? <div className="truncate text-xs text-warn">via {page.requestedUrl}</div> : null}
               </TableCell>
               <TableCell><Badge variant={page.status >= 400 ? "bad" : page.sourceStatus >= 300 || page.status >= 300 ? "warn" : "good"}>{page.sourceStatus != null && page.sourceStatus !== page.status ? `${page.sourceStatus} → ${page.status}` : page.status}</Badge></TableCell>
@@ -203,9 +206,7 @@ export function ScanPagesTable({
                 {page.indexabilityReason && page.indexabilityReason !== "indexable" ? <div className="mt-1 text-xs text-muted-foreground">{String(page.indexabilityReason).replaceAll("-", " ")}</div> : null}
               </TableCell>
               <TableCell>
-                <Badge variant={page.sitemapListed ? "good" : "warn"}>
-                  {page.sitemapListed ? "Listed" : page.sitemapSourceListed ? "Redirect source listed" : "Missing"}
-                </Badge>
+                <SitemapBadge page={page} />
               </TableCell>
               <TableCell className="text-right nums tabular-nums">{page.depth != null ? formatNumber(page.depth) : "-"}</TableCell>
               <TableCell className="text-right nums tabular-nums">{formatNumber(page.internalInlinks || 0)}</TableCell>
@@ -293,17 +294,24 @@ export function ScanImageSummaryTable({ rows, onOpenPage }: { rows: any[]; onOpe
           <TableRow key={page.url}>
             <TableCell className="max-w-xs">
               <PageLinkButton page={page} onOpenPage={onOpenPage} />
+              {page.htmlTruncated ? <Badge variant="warn">Incomplete HTML</Badge> : null}
             </TableCell>
             <TableCell className="nums">{page.images || 0}</TableCell>
-            <TableCell><Badge variant={page.imagesMissingSrc ? "bad" : "good"}>{page.imagesMissingSrc || 0}</Badge></TableCell>
-            <TableCell><Badge variant={page.imagesMissingFallbackSrc ? "warn" : "good"}>{page.imagesMissingFallbackSrc || 0}</Badge></TableCell>
-            <TableCell><Badge variant={page.imagesInvalidSrcset ? "bad" : "good"}>{page.imagesInvalidSrcset || 0}</Badge></TableCell>
-            <TableCell><Badge variant={page.imagesMissingAlt ? "warn" : "good"}>{page.imagesMissingAlt || 0}</Badge></TableCell>
-            <TableCell><Badge variant={page.imagesEmptyAlt ? "warn" : "good"}>{page.imagesEmptyAlt || 0}</Badge></TableCell>
-            <TableCell><Badge variant={page.imagesMissingDimensions ? "warn" : "good"}>{page.imagesMissingDimensions || 0}</Badge></TableCell>
-            <TableCell><Badge variant={pageIssueTypeCount(page, "image-srcset-missing") ? "warn" : "good"}>{pageIssueTypeCount(page, "image-srcset-missing")}</Badge></TableCell>
-            <TableCell><Badge variant={pageIssueTypeCount(page, "image-lazy-loading-missing") ? "warn" : "good"}>{pageIssueTypeCount(page, "image-lazy-loading-missing")}</Badge></TableCell>
-            <TableCell><Badge variant={pageIssueTypeCount(page, "broken-image") ? "bad" : "good"}>{pageIssueTypeCount(page, "broken-image")}</Badge></TableCell>
+            {page.htmlTruncated ? (
+              <TableCell colSpan={9} className="text-sm text-muted-foreground">Image checks incomplete</TableCell>
+            ) : (
+              <>
+                <TableCell><Badge variant={page.imagesMissingSrc ? "bad" : "good"}>{page.imagesMissingSrc || 0}</Badge></TableCell>
+                <TableCell><Badge variant={page.imagesMissingFallbackSrc ? "warn" : "good"}>{page.imagesMissingFallbackSrc || 0}</Badge></TableCell>
+                <TableCell><Badge variant={page.imagesInvalidSrcset ? "bad" : "good"}>{page.imagesInvalidSrcset || 0}</Badge></TableCell>
+                <TableCell><Badge variant={page.imagesMissingAlt ? "warn" : "good"}>{page.imagesMissingAlt || 0}</Badge></TableCell>
+                <TableCell><Badge variant={page.imagesEmptyAlt ? "warn" : "good"}>{page.imagesEmptyAlt || 0}</Badge></TableCell>
+                <TableCell><Badge variant={page.imagesMissingDimensions ? "warn" : "good"}>{page.imagesMissingDimensions || 0}</Badge></TableCell>
+                <TableCell><Badge variant={pageIssueTypeCount(page, "image-srcset-missing") ? "warn" : "good"}>{pageIssueTypeCount(page, "image-srcset-missing")}</Badge></TableCell>
+                <TableCell><Badge variant={pageIssueTypeCount(page, "image-lazy-loading-missing") ? "warn" : "good"}>{pageIssueTypeCount(page, "image-lazy-loading-missing")}</Badge></TableCell>
+                <TableCell><Badge variant={pageIssueTypeCount(page, "broken-image") ? "bad" : "good"}>{pageIssueTypeCount(page, "broken-image")}</Badge></TableCell>
+              </>
+            )}
           </TableRow>
         ))}
       </TableBody>

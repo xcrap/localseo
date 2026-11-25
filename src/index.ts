@@ -1,5 +1,5 @@
-import "./db";
-import { recoverInterruptedJobs } from "./db";
+import { Database } from "bun:sqlite";
+import { dbPath, recoverInterruptedJobs } from "./db";
 import dotenv from "dotenv";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
@@ -914,6 +914,24 @@ if (!isDev) {
   app.get("/*", serveStatic({ root: "./web/dist", path: "index.html" }));
 }
 
+// The OS releases this SQLite write lock when the process exits, including
+// after a crash. Keep it separate from the app database so admin tools and
+// the request handlers can still write normally.
+const runnerLock = new Database(`${dbPath}.runner.sqlite`);
+try {
+  runnerLock.exec("PRAGMA busy_timeout = 0");
+  runnerLock.exec("BEGIN EXCLUSIVE");
+} catch (error) {
+  runnerLock.close();
+  if (error instanceof Error && "code" in error && error.code === "SQLITE_BUSY") {
+    throw new Error(`Another Local SEO API already owns the job runner for ${dbPath}.`);
+  }
+  throw error;
+}
+process.on("exit", () => runnerLock.close());
+
+// A failed bind must leave interrupted-job state untouched as well.
+const server = Bun.serve({ port, hostname: apiHost, fetch: app.fetch });
 const recovered = recoverInterruptedJobs();
 if (recovered.scans || recovered.jobs || recovered.rankRuns || recovered.cwvRuns) {
   console.log(
@@ -923,15 +941,9 @@ if (recovered.scans || recovered.jobs || recovered.rankRuns || recovered.cwvRuns
 const schedulerTickMs = startScheduler();
 if (!schedulerTickMs) console.log("Scheduler disabled (SCHEDULER_DISABLED).");
 
-console.log(`Local SEO API running on http://${apiHost === "0.0.0.0" ? "localhost" : apiHost}:${port}`);
+console.log(`Local SEO API running on http://${apiHost === "0.0.0.0" ? "localhost" : apiHost}:${server.port}`);
 if (mcpBoundBeyondLoopback && !getConfigValue("mcp_token")) {
   console.warn(
     `API_HOST=${apiHost} exposes this server beyond loopback but no mcp_token is set — the MCP endpoint is disabled until you configure one.`,
   );
 }
-
-export default {
-  port,
-  hostname: apiHost,
-  fetch: app.fetch,
-};

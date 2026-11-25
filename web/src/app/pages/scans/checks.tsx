@@ -208,6 +208,9 @@ export function ScanCheckMatrix({
 
   return (
     <ReportSection title="Scan checks" description="Every local check grouped into one readable table. Use the issue buttons to open the matching rows.">
+      {coverage.truncatedPages > 0 ? (
+        <p className="mb-3 text-sm text-warn">HTML checks cover the captured content. The crawler only read part of the HTML on {formatNumber(coverage.truncatedPages)} {coverage.truncatedPages === 1 ? "page" : "pages"}.</p>
+      ) : null}
       <Table>
         <TableHeader>
           <TableRow>

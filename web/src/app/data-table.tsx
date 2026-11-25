@@ -151,7 +151,7 @@ function PagerControls({
 }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 text-[13px] text-muted-foreground">
-      <span className="nums">
+      <span className="nums" role="status" aria-atomic="true">
         Rows {formatNumber(shown ? start + 1 : 0)}–{formatNumber(start + shown)} of {formatNumber(total)}
       </span>
       <div className="flex items-center gap-1.5">

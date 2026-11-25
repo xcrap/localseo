@@ -1,6 +1,6 @@
-import { all, get, jsonParse } from "./db";
+import { all, get } from "./db";
 import { badRequest } from "./errors";
-import { ensureGscRows, type GscImportRecord } from "./gsc";
+import { ensureGscRows, findGscBatch, siteBatches, type GscBatchMatch, type GscWindow } from "./gsc-store";
 import { requireDate } from "./input";
 import { pageUrlKey } from "./page-url";
 
@@ -8,8 +8,6 @@ import { pageUrlKey } from "./page-url";
 // gsc_imports/gsc_rows) as per-page metrics for a date window. Nothing is
 // estimated: a window is answered only by a batch whose own window is exactly
 // that window, or by a batch with the date dimension whose dates cover it.
-
-export type GscWindow = { startDate: string; endDate: string };
 
 export type GscPageMetrics = {
   url: string;
@@ -19,15 +17,15 @@ export type GscPageMetrics = {
   position: number | null;
 };
 
-export type GscBatchMatch = {
-  record: GscImportRecord;
-  dimensions: string[];
-  source: "api" | "csv";
-  // The dates the rows answer: the requested window, else the batch's own.
-  range: { startDate: string | null; endDate: string | null };
-  // Set when only the rows inside the window are read (date-dimension batch).
-  dateFilter: GscWindow | null;
-};
+export function totalPageMetric(pages: GscPageMetrics[], key: "clicks" | "impressions") {
+  let total = 0;
+  for (const page of pages) {
+    const value = page[key];
+    if (value === null) return null;
+    total += value;
+  }
+  return total;
+}
 
 export type GscPageData = GscBatchMatch & {
   // Page totals summed from query+page rows leave out anonymized queries.
@@ -54,63 +52,11 @@ export function dayCount(startDate: string, endDate: string) {
   return Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000) + 1;
 }
 
-function siteBatches(siteId: string) {
-  return all<GscImportRecord>("SELECT * FROM gsc_imports WHERE site_id = ? ORDER BY created_at DESC, rowid DESC", [
-    siteId,
-  ]).map((record) => ({ record, dimensions: jsonParse<string[]>(record.dimensions_json, []) }));
-}
-
-// A batch's own window: the one it was synced or imported for, or — for a
-// date-dimension CSV imported without one — the dates its rows hold.
-function batchRange(record: GscImportRecord, dimensions: string[]) {
-  if (record.start_date && record.end_date) return { startDate: record.start_date, endDate: record.end_date };
-  if (!dimensions.includes("date")) return { startDate: null, endDate: null };
-  ensureGscRows(record);
-  const row = get<{ startDate: string | null; endDate: string | null }>(
-    "SELECT min(date) AS startDate, max(date) AS endDate FROM gsc_rows WHERE import_id = ? AND date IS NOT NULL AND date != ''",
-    [record.id],
-  );
-  return { startDate: row?.startDate ?? null, endDate: row?.endDate ?? null };
-}
-
-// Newest batch that has every `include` dimension and none of `exclude`, and
-// that answers the window (any window when none is asked for).
-export function findGscBatch(
-  siteId: string,
-  input: { include: string[]; exclude?: string[]; window: GscWindow | null },
-): GscBatchMatch | null {
-  for (const { record, dimensions } of siteBatches(siteId)) {
-    if (!input.include.every((dimension) => dimensions.includes(dimension))) continue;
-    if ((input.exclude || []).some((dimension) => dimensions.includes(dimension))) continue;
-    const range = batchRange(record, dimensions);
-    const source = record.source === "api" ? "api" : "csv";
-    const window = input.window;
-    if (!window) {
-      ensureGscRows(record);
-      return { record, dimensions, source, range, dateFilter: null };
-    }
-    if (range.startDate === window.startDate && range.endDate === window.endDate) {
-      ensureGscRows(record);
-      return { record, dimensions, source, range: window, dateFilter: null };
-    }
-    const covers =
-      dimensions.includes("date") &&
-      Boolean(range.startDate && range.endDate) &&
-      String(range.startDate) <= window.startDate &&
-      String(range.endDate) >= window.endDate;
-    if (covers) {
-      ensureGscRows(record);
-      return { record, dimensions, source, range: window, dateFilter: window };
-    }
-  }
-  return null;
-}
-
 // Summed metrics per stored page (and query) group. Position is averaged
 // weighted by impressions, the way Search Console aggregates it.
 const METRIC_COLUMNS = `
-  SUM(clicks) AS clicks,
-  SUM(impressions) AS impressions,
+  CASE WHEN count(clicks) = count(*) THEN sum(clicks) END AS clicks,
+  CASE WHEN count(impressions) = count(*) THEN sum(impressions) END AS impressions,
   SUM(CASE WHEN position IS NOT NULL AND impressions > 0 THEN position * impressions END) AS weightedPosition,
   SUM(CASE WHEN position IS NOT NULL AND impressions > 0 THEN impressions END) AS positionWeight,
   MAX(ctr) AS ctr,
@@ -146,11 +92,6 @@ export function readMetricRows(match: GscBatchMatch, groupBy: "page" | "query, p
   );
 }
 
-function addNullable(left: number | null, right: number | null) {
-  if (left === null) return right;
-  return right === null ? left : left + right;
-}
-
 // One entry per page identity (http/https, www, and trailing-slash variants
 // merge). A single stored row keeps its own CTR and position.
 export function mergePageRows(rows: MetricRow[]) {
@@ -180,8 +121,8 @@ export function mergePageRows(rows: MetricRow[]) {
       existing.url = row.page;
       existing.urlImpressions = impressions;
     }
-    existing.clicks = addNullable(existing.clicks, row.clicks);
-    existing.impressions = addNullable(existing.impressions, row.impressions);
+    existing.clicks = existing.clicks === null || row.clicks === null ? null : existing.clicks + row.clicks;
+    existing.impressions = existing.impressions === null || row.impressions === null ? null : existing.impressions + row.impressions;
     existing.weighted += row.weightedPosition ?? 0;
     existing.weight += row.positionWeight ?? 0;
     existing.rowCount += row.rowCount;

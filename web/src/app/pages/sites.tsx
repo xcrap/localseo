@@ -99,11 +99,11 @@ export function Overview({
         crawlHost: firstCrawlHost,
       } as any);
       selectSite(created.id);
+      await reloadSites();
       const result = await api.scanSite(created.id);
       if (result.scan?.id) {
         setSelectedScanId(created.id, result.scan.id);
       }
-      await reloadSites();
       if (result.scan?.id) navigate(`/scans/${result.scan.id}`);
       else navigate("/scans");
     } catch (err) {
@@ -722,17 +722,22 @@ export function SitesManager({
       selectSite(created.id);
       setOpen(false);
       setForm(siteDefaults);
+      await reloadSites();
       if (scanAfterCreate) {
-        const result = await api.scanSite(created.id);
-        if (result.scan?.id) {
-          setSelectedScanId(created.id, result.scan.id);
+        try {
+          const result = await api.scanSite(created.id);
+          if (result.scan?.id) {
+            setSelectedScanId(created.id, result.scan.id);
+            navigate(`/scans/${result.scan.id}`);
+          } else {
+            navigate("/scans");
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : "Could not start the crawl.";
+          toast.error(`${created.name || created.domain} was saved. ${reason}`);
         }
-        await reloadSites();
-        if (result.scan?.id) navigate(`/scans/${result.scan.id}`);
-        else navigate("/scans");
         return;
       }
-      await reloadSites();
       toast.success(`${cleanSiteDomain(created.domain) || created.name || "Site"} saved locally.`);
     } catch (err) {
       const message = err instanceof Error ? err.message : scanAfterCreate ? "Could not add and scan site" : "Could not add site";

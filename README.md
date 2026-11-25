@@ -59,7 +59,9 @@ optional data-source credentials such as Google OAuth, a self-hosted OpenSERP
 or SearXNG URL, MCP token, or a custom Codex
 model. In-app Settings are for app preferences, not secret fields.
 If you override storage, `DB_PATH` points to the database directory; the app
-owns the `local-seo.sqlite` filename.
+owns the `local-seo.sqlite` filename. One API process runs jobs for each database.
+It holds a SQLite lock in `local-seo.sqlite.runner.sqlite` until it exits.
+A second process reports the conflict and leaves queued work with the first.
 
 The first load lets you create the local admin user in the browser. You can also
 create or update it from the terminal:

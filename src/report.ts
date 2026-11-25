@@ -1,5 +1,5 @@
 import { get } from "./db";
-import { gscPageData } from "./gsc-pages";
+import { gscPageData, totalPageMetric } from "./gsc-pages";
 import { activeIssues, issueCounts, pagesWithoutHighIssues, requireScan, SEVERITIES, scanIssueGroups } from "./scan-summary";
 
 // A single self-contained HTML report for one saved scan, for sharing with a
@@ -40,6 +40,7 @@ function formatDuration(start: unknown, end: unknown) {
 }
 
 function formatNumber(value: unknown) {
+  if (value == null || value === "") return "—";
   const number = Number(value);
   return Number.isFinite(number) ? Math.round(number).toLocaleString("en-US") : "—";
 }
@@ -93,8 +94,8 @@ function searchConsoleSection(siteId: string) {
   const gsc = gscPageData(siteId, null, { allowQueryRows: true });
   if (!gsc?.pages.size) return "";
   const pages = [...gsc.pages.values()];
-  const clicks = pages.reduce((sum, page) => sum + (page.clicks ?? 0), 0);
-  const impressions = pages.reduce((sum, page) => sum + (page.impressions ?? 0), 0);
+  const clicks = totalPageMetric(pages, "clicks");
+  const impressions = totalPageMetric(pages, "impressions");
   const top = pages
     .sort((a, b) => (b.clicks ?? 0) - (a.clicks ?? 0) || (b.impressions ?? 0) - (a.impressions ?? 0))
     .slice(0, TOP_GSC_PAGES)
@@ -116,7 +117,7 @@ function searchConsoleSection(siteId: string) {
       <div class="cards">
         <div class="card"><span class="value">${formatNumber(clicks)}</span><span class="name">Clicks</span></div>
         <div class="card"><span class="value">${formatNumber(impressions)}</span><span class="name">Impressions</span></div>
-        <div class="card"><span class="value">${impressions ? esc(`${((100 * clicks) / impressions).toFixed(1)}%`) : "—"}</span><span class="name">Click-through rate</span></div>
+        <div class="card"><span class="value">${clicks !== null && impressions ? esc(`${((100 * clicks) / impressions).toFixed(1)}%`) : "—"}</span><span class="name">Click-through rate</span></div>
       </div>
       <h3>Top pages by clicks</h3>
       <table><thead><tr><th>Page</th><th class="num">Clicks</th><th class="num">Impressions</th><th class="num">Avg. position</th></tr></thead><tbody>${top}</tbody></table>
@@ -233,6 +234,7 @@ export function scanReport(scanId: string) {
       <div class="card"><span class="value">${formatNumber(scan.ignored_issue_count || 0)}</span><span class="name">Ignored issues</span></div>
     </div>
     ${health ? `<p class="muted">${formatNumber(health.withoutHighIssues)} of ${formatNumber(health.pages)} crawled pages have no open high-severity issue.</p>` : ""}
+    ${health?.coverageNote ? `<p class="muted">${esc(health.coverageNote)}</p>` : ""}
     ${maxPages && Number(scan.pages_crawled) >= Number(maxPages) ? `<p class="muted">The crawl reached its ${formatNumber(maxPages)}-page limit; pages beyond it were not checked.</p>` : ""}
   </section>
 

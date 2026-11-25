@@ -2,10 +2,8 @@ import { all, get } from "./db";
 import { badRequest, notFound } from "./errors";
 import {
   dayCount,
-  findGscBatch,
   type GscPageData,
   type GscPageMetrics,
-  type GscWindow,
   gscPageData,
   gscRangeView,
   mergePageRows,
@@ -13,7 +11,9 @@ import {
   pageDataRange,
   readMetricRows,
   shiftDate,
+  totalPageMetric,
 } from "./gsc-pages";
+import { findGscBatch, type GscWindow } from "./gsc-store";
 import { optionalInt } from "./input";
 import { pageUrlKey } from "./page-url";
 import { scanPages, siteCompletedScan } from "./scan-summary";
@@ -171,7 +171,7 @@ export function gscCrawlInsights(siteId: string, input: { scanId?: unknown; star
         reason: problem,
         canonical: page.canonical || null,
       });
-    } else if (!problem && hasImpressions && sitemapFound && page.sitemapListed === false) {
+    } else if (!problem && page.indexable === true && hasImpressions && sitemapFound && page.sitemapListed === false) {
       sections.gscPagesNotInSitemap.push({
         ...metricsRow(metrics),
         status: page.status ?? null,
@@ -188,7 +188,7 @@ export function gscCrawlInsights(siteId: string, input: { scanId?: unknown; star
     if (byUrl.get(key) !== page || page.indexable !== true || Number(page.status) !== 200 || page.isHtml === false) continue;
     if (indexabilityProblem(page, false)) continue;
     const metrics = gsc.pages.get(key);
-    if (metrics && (metrics.impressions ?? 0) > 0) continue;
+    if (metrics && metrics.impressions !== 0) continue;
     sections.indexableNoImpressions.push({
       url: page.url,
       clicks: metrics ? metrics.clicks : null,
@@ -197,7 +197,7 @@ export function gscCrawlInsights(siteId: string, input: { scanId?: unknown; star
       position: null,
       status: 200,
       indexable: true,
-      inSitemap: sitemapFound ? page.sitemapListed === true : null,
+      inSitemap: sitemapFound ? page.sitemapListed ?? null : null,
       reason: metrics
         ? "0 impressions in this window."
         : exportCapped
@@ -284,7 +284,7 @@ export function cannibalization(
   const rows: any[] = [];
   for (const [query, queryRows] of byQuery) {
     const pages = [...mergePageRows(queryRows).values()];
-    const totalImpressions = pages.reduce((sum, page) => sum + (page.impressions ?? 0), 0);
+    const totalImpressions = totalPageMetric(pages, "impressions");
     if (!totalImpressions || totalImpressions < minImpressions) continue;
     const competing = pages
       .filter((page) => (page.impressions ?? 0) / totalImpressions >= 0.1)
@@ -294,7 +294,7 @@ export function cannibalization(
     rows.push({
       query,
       totalImpressions,
-      totalClicks: pages.reduce((sum, page) => sum + (page.clicks ?? 0), 0),
+      totalClicks: totalPageMetric(pages, "clicks"),
       pages: competing,
       rankUrls: [...(rankUrls.get(query.toLowerCase()) || [])],
     });

@@ -44,6 +44,7 @@ export function ScanCrawlEvidence({
   const sitemapRobotsBlocked = Number(result.sitemap?.robotsBlockedCount || 0);
   const sitemapEvidence = [
     "URLs listed in sitemap files and used for crawl discovery.",
+    result.sitemap?.coverageComplete === false ? "Sitemap coverage is incomplete. Membership is unknown for URLs absent from the files read." : "",
     coverage.sitemapUrlsNotCrawled != null ? `${formatNumber(coverage.sitemapUrlsNotCrawled)} of them were not crawled in this scan.` : "",
     sitemapRobotsBlocked ? `${formatNumber(sitemapRobotsBlocked)} of those are disallowed for ${robotsAgent} by robots.txt.` : "",
     coverage.storedSitemapUrls != null && coverage.sitemapUrls != null && coverage.storedSitemapUrls < coverage.sitemapUrls
@@ -72,7 +73,7 @@ export function ScanCrawlEvidence({
     {
       area: "Sitemap URLs found",
       status: formatNumber(coverage.sitemapUrls),
-      tone: coverage.sitemapUrls ? "good" : "warn",
+      tone: result.sitemap?.coverageComplete === false ? "warn" : coverage.sitemapUrls ? "good" : "warn",
       evidence: sitemapEvidence,
     },
   ];
@@ -141,7 +142,7 @@ export function ScanCrawlEvidence({
             </TableBody>
           </Table>
         ) : (
-          <EmptyState title="No sitemap files parsed" text="The crawler did not find a sitemap file for this scan." />
+          <EmptyState title="No sitemap files parsed" text={result.sitemap?.coverageComplete === false ? "Sitemap discovery was incomplete." : "The crawler did not find a sitemap file for this scan."} />
         )}
       </ReportSection>
 
@@ -158,7 +159,7 @@ export function ScanCrawlEvidence({
           <TableBody>
             {coverageRows.map((row) => {
               const count = Number(row.count || 0);
-              const tone = row.problem ? (count ? "warn" : "good") : "outline";
+              const tone = row.count == null ? "outline" : row.problem ? (count ? "warn" : "good") : "outline";
               return (
                 <TableRow key={row.metric}>
                   <TableCell className="font-medium">{row.metric}</TableCell>
@@ -166,7 +167,7 @@ export function ScanCrawlEvidence({
                   <TableCell>
                     <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-sm">
                       <StatusDot tone={tone as any} />
-                      {row.problem ? (count ? "inspect" : "clear") : "measured"}
+                      {row.count == null ? "unknown" : row.problem ? (count ? "inspect" : "clear") : "measured"}
                     </span>
                   </TableCell>
                   <TableCell className="min-w-96 text-sm text-muted-foreground">{row.detail}</TableCell>

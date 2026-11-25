@@ -12,7 +12,14 @@ process.env.DB_PATH = scopeDbDir;
 process.env.CODEX_MODEL = "";
 process.env.CODEX_REASONING_EFFORT = "";
 
+const { checkCrawlerEvidence } = await import("./crawler-evidence-smoke");
+await checkCrawlerEvidence();
+
+const { checkGscStorage } = await import("./gsc-storage-smoke");
+await checkGscStorage();
+
 const { sameSiteUrl } = await import("../src/seo");
+await (await import("./seo-import-smoke")).verifySeoImports();
 const { parseRobots, resourceFailureKind, robotsDirectives } = await import("../src/scans");
 const { fetchText, fetchWithRedirectTrace } = await import("../src/http");
 const { probeScanUrl } = await import("../src/site-scan-url");
@@ -1075,6 +1082,37 @@ async function waitForScan(scanId: string) {
 
 try {
   await waitForServer();
+  // Neither a competing API on another port nor a failed bind may recover
+  // jobs belonging to an active process.
+  {
+    const marker = randomUUID();
+    const serverDb = openServerDb();
+    const { run: runScopeSql, get: getScopeSql } = await import("../src/db");
+    const insert = "INSERT INTO ai_jobs (id, type, prompt, status) VALUES (?, 'test', 'test', 'queued')";
+    try {
+      serverDb.query(insert).run(marker);
+      runScopeSql(insert, [marker]);
+      for (const [dbDir, apiUrl, errorPattern] of [
+        [serverDbDir, "http://127.0.0.1:0", /already owns the job runner/],
+        [scopeDbDir, baseUrl, /address already in use|port.*in use|EADDRINUSE/i],
+      ] as const) {
+        const competing = Bun.spawn([process.execPath, "src/index.ts"], {
+          cwd: rootDir, env: { ...process.env, DB_PATH: dbDir, API_URL: apiUrl, API_HOST: "127.0.0.1", SCHEDULER_DISABLED: "1" },
+          stdout: "ignore", stderr: "pipe", signal: AbortSignal.timeout(5000),
+        });
+        const [exit, stderr] = await Promise.all([competing.exited, new Response(competing.stderr).text()]);
+        if (!exit || !errorPattern.test(stderr)) throw new Error(`Expected duplicate startup to stop: ${stderr}`);
+      }
+      const statusQuery = "SELECT status FROM ai_jobs WHERE id = ?";
+      if (serverDb.query<{ status: string }, [string]>(statusQuery).get(marker)?.status !== "queued"
+          || getScopeSql<{ status: string }>(statusQuery, [marker])?.status !== "queued") {
+        throw new Error("An unsuccessful startup changed queued jobs.");
+      }
+    } finally {
+      serverDb.query("DELETE FROM ai_jobs WHERE id = ?").run(marker);
+      serverDb.close();
+    }
+  }
   await request("/api/auth/setup", {
     method: "POST",
     body: JSON.stringify({ email: "admin@example.com", password: "local-password-123" }),
@@ -1568,7 +1606,7 @@ try {
   ) {
     throw new Error("Fixture scan indexability summary does not match page-level evidence.");
   }
-  if (fixtureScan.result?.scanVersion !== 6 || fixtureScan.result?.limits?.robots !== "respect") {
+  if (fixtureScan.result?.scanVersion !== 7 || fixtureScan.result?.limits?.robots !== "respect") {
     throw new Error("Fresh scans must identify the crawl semantics used for safe scan-to-scan comparisons.");
   }
   const redirectPage = fixturePages.find((page: any) => page.url === `${fixtureUrl}/redirect-final`);
@@ -2858,7 +2896,7 @@ try {
       const respectPage = (pagePath: string) => respectPages.find((row) => row.url === `${robotsFixtureUrl}${pagePath}`);
       const respectIssuesFor = (pagePath: string, type: string) =>
         respectIssues.filter((issue) => issue.url === `${robotsFixtureUrl}${pagePath}` && issue.type === type);
-      if (respectScan.status !== "completed" || respectResult.scanVersion !== 6 || respectResult.limits?.robots !== "respect") {
+      if (respectScan.status !== "completed" || respectResult.scanVersion !== 7 || respectResult.limits?.robots !== "respect") {
         throw new Error(`A robots-respecting scan must complete and record its mode: ${JSON.stringify({ status: respectScan.status, error: respectScan.error, limits: respectResult.limits })}`);
       }
 
@@ -3007,7 +3045,7 @@ try {
         startIssue.evidence.userAgentGroup !== "*" ||
         startSkip?.source !== "start-url" ||
         blockedStartIssues.some((issue) => issue.type === "no-pages-crawled") ||
-        stoppedRequests.blocked.some((requested) => requested !== "/robots.txt" && requested !== "/sitemap.xml")
+        stoppedRequests.blocked.some((requested) => requested !== "/robots.txt")
       ) {
         throw new Error(`A disallowed start URL must end the scan with a site-level issue and no page request: ${JSON.stringify({ status: blockedStartScan.status, pages: blockedStartScan.pages_crawled, startIssue, startSkip, requested: stoppedRequests.blocked, issues: blockedStartIssues.map((issue) => issue.type) })}`);
       }
@@ -3029,7 +3067,7 @@ try {
         unavailableSkip?.source !== "start-url" ||
         unavailableSkip.rule !== null ||
         unavailableSkip.robotsStatus !== 503 ||
-        stoppedRequests.unavailable.some((requested) => requested !== "/robots.txt" && requested !== "/sitemap.xml")
+        stoppedRequests.unavailable.some((requested) => requested !== "/robots.txt")
       ) {
         throw new Error(`An unreadable robots.txt must stop the crawl with a site-level issue: ${JSON.stringify({ status: unavailableScan.status, pages: unavailableScan.pages_crawled, unavailableIssue, unavailableSkip, requested: stoppedRequests.unavailable })}`);
       }
@@ -4070,6 +4108,8 @@ try {
       siteId: site.id,
       siteUrl: "sc-domain:example.com",
       sourceName: "search-console.csv",
+      startDate: "2026-01-01",
+      endDate: "2026-01-31",
       csv: "Top queries,Clicks,Impressions,CTR,Position\nseo software,10,100,10%,3.2\nlocal seo,5,50,10%,4.8\n",
     }),
   });

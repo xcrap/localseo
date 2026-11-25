@@ -309,7 +309,7 @@ export type CannibalizationInsights = {
   total?: number;
   /** The minimum-impressions threshold applies to each query's total, not to single pages. */
   minImpressionsAppliesTo?: "query" | string;
-  rows: { query: string; totalImpressions: number; totalClicks: number; pages: CannibalizationPage[]; rankUrls: string[] }[];
+  rows: { query: string; totalImpressions: number; totalClicks: number | null; pages: CannibalizationPage[]; rankUrls: string[] }[];
 };
 
 export type DecayMetrics = { clicks: number | null; impressions: number | null; position: number | null };

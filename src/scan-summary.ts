@@ -129,7 +129,11 @@ export function pagesWithoutHighIssues(scan: any) {
     if (issue.severity === "high" && pageKeys.has(key)) highPages.add(key);
   }
   const clean = pages.length - highPages.size;
-  return { pages: pages.length, withoutHighIssues: clean, percent: Math.round((100 * clean) / pages.length) };
+  const truncated = Number(scan.result?.summary?.truncatedHtmlPages) || 0;
+  const coverageNote = truncated
+    ? `The crawler could only check part of the HTML on ${truncated} ${truncated === 1 ? "page" : "pages"}. The percentage includes findings from the downloaded sections.`
+    : "";
+  return { pages: pages.length, withoutHighIssues: clean, percent: Math.round((100 * clean) / pages.length), coverageNote };
 }
 
 function comparisonOverview(comparison: any) {
@@ -211,6 +215,7 @@ export function scanAiContext(scanId: string) {
     `Scan: ${clip(scan.url)} on ${scan.created_at} UTC, status ${scan.status}.`,
     `Pages crawled: ${scan.pages_crawled}${limits?.maxPages ? ` of a ${limits.maxPages}-page limit` : ""}.`,
     health ? `Pages without high-severity issues: ${health.withoutHighIssues} of ${health.pages} (${health.percent}%).` : null,
+    health?.coverageNote || null,
     `Open issues: ${counts.total} (high ${counts.bySeverity.high}, medium ${counts.bySeverity.medium}, low ${counts.bySeverity.low}); ignored: ${scan.ignored_issue_count || 0}.`,
     regressions
       ? `Regressions since the previous scan: ${regressions.total} (new high issues ${regressions.newHighIssues}, new medium issues ${regressions.newMediumIssues}, pages that became non-indexable ${regressions.becameNonIndexable}, pages that stopped answering 200 ${regressions.becameNon200}).`
