@@ -487,7 +487,7 @@ export const api = {
   deleteSite: (id: string) =>
     request<any>(`/api/sites/${id}`, { method: "DELETE" }),
   scanSite: (id: string) =>
-    request<any>(`/api/sites/${id}/scan`, { method: "POST" }),
+    request<{ scan: ScanRow }>(`/api/sites/${id}/scan`, { method: "POST" }),
   researchKeywords: (body: any) =>
     request<{ id: string; source: string; rows: KeywordResult[] }>("/api/keywords/research", {
       method: "POST",

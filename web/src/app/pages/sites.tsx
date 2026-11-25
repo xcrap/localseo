@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState, type ComponentProps, type SyntheticEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps, type SyntheticEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpRight, Bot, FileSearch, Pencil, Plus, Trash2 } from "lucide-react";
-import { api, type Site } from "../../api";
+import { api, type ScanRow, type Site } from "../../api";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, toast } from "@/components/ui";
-import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlRobotsOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanIsActive, scanLiveProgress, scanPhaseKey, scanPhaseLabel, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows } from "../shared";
+import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlRobotsOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanIsActive, scanLiveProgress, scanPhaseKey, scanPhaseLabel, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows, timestampMs, upsertScanRow } from "../shared";
 import { cn } from "@/lib/utils";
 import { ScanTable } from "./scans/scan-table";
 import { CwvOverviewCard } from "../cwv";
@@ -628,60 +628,54 @@ export function SitesManager({
   const [editing, setEditing] = useState<Site | null>(null);
   const [deleting, setDeleting] = useState<Site | null>(null);
   const [error, setError] = useState("");
-  const [scanningSiteId, setScanningSiteId] = useState("");
+  const [scanningSiteIds, setScanningSiteIds] = useState(new Set<string>());
   const [creatingAction, setCreatingAction] = useState<"scan" | "save" | "">("");
   const [deletingSiteId, setDeletingSiteId] = useState("");
-  const [allScans, setAllScans] = useState<any[]>([]);
+  const [allScans, setAllScans] = useState<ScanRow[]>([]);
+  const scanListRevision = useRef(0);
   const navigate = useNavigate();
-
-  // Lite scan rows: score and severity summary per site, no report arrays.
-  useEffect(() => {
-    let cancelled = false;
-    api.allScans()
-      .then((rows) => {
-        if (!cancelled) setAllScans(Array.isArray(rows) ? rows : []);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [sites.length]);
 
   const activeScanCount = allScans.filter(scanIsActive).length;
   const hasActiveScans = activeScanCount > 0;
 
+  // Lite scan rows: score and severity summary per site, no report arrays.
   useEffect(() => {
-    if (!hasActiveScans) return;
     let cancelled = false;
-    const interval = window.setInterval(() => {
-      api.allScans()
-        .then((rows) => {
-          if (!cancelled) setAllScans(Array.isArray(rows) ? rows : []);
-        })
-        .catch(() => undefined);
-    }, 1500);
+    let timer: number | undefined;
+    async function refreshScans() {
+      const revision = scanListRevision.current;
+      try {
+        const rows = await api.allScans();
+        // A request made before a scan started may not include its row yet.
+        if (!cancelled && revision === scanListRevision.current && Array.isArray(rows)) setAllScans(rows);
+      } catch {
+        // Keep the existing rows when a refresh fails.
+      } finally {
+        if (!cancelled && hasActiveScans) timer = window.setTimeout(refreshScans, 1500);
+      }
+    }
+    void refreshScans();
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      window.clearTimeout(timer);
     };
-  }, [hasActiveScans]);
+  }, [sites.length, hasActiveScans]);
 
-  const healthBySite = useMemo(() => {
-    const map = new Map<string, any>();
+  const { healthBySite, activeScanBySite, lastScanTimeBySite } = useMemo(() => {
+    const healthBySite = new Map<string, ScanRow>();
+    const activeScanBySite = new Map<string, ScanRow>();
+    const lastScanTimeBySite = new Map<string, number>();
     for (const scan of sortScanRows(allScans)) {
-      const key = scan.site_id;
-      if (key && !map.has(key)) map.set(key, scan);
+      const siteId = scan.site_id;
+      if (!siteId) continue;
+      if (!healthBySite.has(siteId)) healthBySite.set(siteId, scan);
+      if (scanIsActive(scan) && !activeScanBySite.has(siteId)) activeScanBySite.set(siteId, scan);
+      if (scan.status === "completed") {
+        const completedAt = timestampMs(scan.updated_at) || timestampMs(scan.created_at);
+        if (completedAt > (lastScanTimeBySite.get(siteId) ?? 0)) lastScanTimeBySite.set(siteId, completedAt);
+      }
     }
-    return map;
-  }, [allScans]);
-
-  const activeScanBySite = useMemo(() => {
-    const map = new Map<string, any>();
-    for (const scan of sortScanRows(allScans)) {
-      const key = scan.site_id;
-      if (key && scanIsActive(scan) && !map.has(key)) map.set(key, scan);
-    }
-    return map;
+    return { healthBySite, activeScanBySite, lastScanTimeBySite };
   }, [allScans]);
 
   useEffect(() => {
@@ -773,20 +767,19 @@ export function SitesManager({
 
   async function scanSite(site: Site) {
     if (!site.domain) return;
-    setError("");
-    setScanningSiteId(site.id);
+    setScanningSiteIds((ids) => new Set(ids).add(site.id));
     try {
-      const result = await api.scanSite(site.id);
-      if (result.scan?.id) {
-        setSelectedScanId(site.id, result.scan.id);
-      }
-      setScanningSiteId("");
-      selectSite(site.id);
-      if (result.scan?.id) navigate(`/scans/${result.scan.id}`);
-      else navigate("/scans");
+      const { scan } = await api.scanSite(site.id);
+      scanListRevision.current += 1;
+      setAllScans((rows) => rows.some((row) => row.id === scan.id) ? rows : upsertScanRow(rows, scan));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not start site scan");
-      setScanningSiteId("");
+    } finally {
+      setScanningSiteIds((ids) => {
+        const next = new Set(ids);
+        next.delete(site.id);
+        return next;
+      });
     }
   }
 
@@ -843,11 +836,12 @@ export function SitesManager({
   function renderSiteRow(site: Site) {
     const scan = healthBySite.get(site.id);
     const activeScan = activeScanBySite.get(site.id);
+    const lastScanTime = lastScanTimeBySite.get(site.id);
+    const starting = scanningSiteIds.has(site.id);
     const liveProgress = activeScan ? scanLiveProgress(activeScan) : null;
-    const scanned = Boolean(scan);
     // Running or failed scans have no score yet: show "-", not 0.
     const score = knownNumber(scan?.score);
-    const sev = scanned ? scanSeverityCounts(scan) : { high: 0, medium: 0, low: 0 };
+    const sev = scanSeverityCounts(scan);
     const openWorkspace = () => {
       selectSite(site.id);
       navigate("/overview");
@@ -877,6 +871,11 @@ export function SitesManager({
               ) : (
                 "No website address"
               )}
+            </div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {lastScanTime ? (
+                <>Last scan <time dateTime={new Date(lastScanTime).toISOString()}>{formatDate(lastScanTime)}</time></>
+              ) : "No completed scan"}
             </div>
             {activeScan ? (
               <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-warn md:hidden">
@@ -915,7 +914,7 @@ export function SitesManager({
                 />
               ) : null}
             </div>
-          ) : scanned ? (
+          ) : scan ? (
             <div className="grid grid-cols-[3.5rem_minmax(0,1fr)] items-baseline gap-3 xl:grid-cols-[4rem_minmax(0,1fr)] xl:gap-4">
               <span
                 className="metric text-right text-2xl leading-none"
@@ -939,11 +938,7 @@ export function SitesManager({
                 </span>
               </span>
             </div>
-          ) : (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <StatusDot /> Not scanned
-            </div>
-          )}
+          ) : null}
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
@@ -957,8 +952,8 @@ export function SitesManager({
               </Button>
             </>
           ) : site.domain ? (
-            <Button size="sm" variant="outline" className="hidden w-28 justify-center sm:inline-flex" disabled={scanningSiteId === site.id} onClick={() => scanSite(site)}>
-              <FileSearch /> {scanningSiteId === site.id ? "Starting" : "Scan"}
+            <Button size="sm" variant="outline" className="hidden w-28 justify-center sm:inline-flex" disabled={starting} onClick={() => scanSite(site)}>
+              <FileSearch /> {starting ? "Starting…" : "Scan"}
             </Button>
           ) : null}
           <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-foreground sm:size-8" aria-label={`Edit ${site.name}`} onClick={() => setEditing(site)}>
