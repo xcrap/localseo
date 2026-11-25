@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ComponentProps, type Synthet
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpRight, Bot, FileSearch, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, type ScanRow, type Site } from "../../api";
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea, toast } from "@/components/ui";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
 import { CountUp, EmptyState, Field, Hint, JobTable, cleanSiteDomain, KeywordToolDefaultsPanel, PageHeader, ReportSection, ScanPlanPreview, StatusDot, crawlHostOptions, crawlPreferenceLabel, crawlProtocolOptions, crawlRobotsOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlProtocolFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatMs, formatNumber, keywordToolDefaultsLabel, knownNumber, preferredScanUrl, scanIsActive, scanLiveProgress, scanPhaseKey, scanPhaseLabel, scanSeverityCounts, scanSpeedMetrics, scanStatusLabel, scanUrlCountLabel, scanUrlShortDetail, scoreTone, setSelectedScanId, SiteAvatar, siteDisplayName, sortScanRows, timestampMs, upsertScanRow } from "../shared";
 import { cn } from "@/lib/utils";
 import { ScanTable } from "./scans/scan-table";
@@ -594,6 +594,21 @@ export function EditSiteDialog({
   );
 }
 
+const minuteMs = 60_000;
+const hourMs = 60 * minuteMs;
+const dayMs = 24 * hourMs;
+const staleScanAgeMs = 30 * dayMs;
+const scanAgeFormatter = new Intl.RelativeTimeFormat();
+
+function formatScanAge(ageMs: number) {
+  if (ageMs >= 365 * dayMs) return scanAgeFormatter.format(-Math.floor(ageMs / (365 * dayMs)), "year");
+  if (ageMs >= staleScanAgeMs) return scanAgeFormatter.format(-Math.floor(ageMs / staleScanAgeMs), "month");
+  if (ageMs >= dayMs) return scanAgeFormatter.format(-Math.floor(ageMs / dayMs), "day");
+  if (ageMs >= hourMs) return scanAgeFormatter.format(-Math.floor(ageMs / hourMs), "hour");
+  if (ageMs >= minuteMs) return scanAgeFormatter.format(-Math.floor(ageMs / minuteMs), "minute");
+  return "Just now";
+}
+
 export function SitesManager({
   sites,
   reloadSites,
@@ -632,11 +647,17 @@ export function SitesManager({
   const [creatingAction, setCreatingAction] = useState<"scan" | "save" | "">("");
   const [deletingSiteId, setDeletingSiteId] = useState("");
   const [allScans, setAllScans] = useState<ScanRow[]>([]);
+  const [now, setNow] = useState(Date.now);
   const scanListRevision = useRef(0);
   const navigate = useNavigate();
 
   const activeScanCount = allScans.filter(scanIsActive).length;
   const hasActiveScans = activeScanCount > 0;
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), minuteMs);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // Lite scan rows: score and severity summary per site, no report arrays.
   useEffect(() => {
@@ -837,6 +858,8 @@ export function SitesManager({
     const scan = healthBySite.get(site.id);
     const activeScan = activeScanBySite.get(site.id);
     const lastScanTime = lastScanTimeBySite.get(site.id);
+    const scanAge = lastScanTime === undefined ? null : now - lastScanTime;
+    const scanIsStale = scanAge !== null && scanAge > staleScanAgeMs;
     const starting = scanningSiteIds.has(site.id);
     const liveProgress = activeScan ? scanLiveProgress(activeScan) : null;
     // Running or failed scans have no score yet: show "-", not 0.
@@ -853,41 +876,35 @@ export function SitesManager({
       navigate(`/scans/${activeScan.id}`);
     };
     return (
-      <div
-        key={site.id}
-        className="group flex items-center gap-3 px-3.5 py-3 transition-colors hover:bg-accent/35 sm:px-4 sm:py-3.5"
-      >
-        <button type="button" onClick={openWorkspace} className="flex min-w-0 flex-1 items-center gap-3 text-left" title={`Open ${site.name}`}>
-          <SiteAvatar site={site} className="size-10 text-sm" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="font-heading truncate text-[17px] transition-colors group-hover:text-primary">{site.name}</span>
-            </div>
-            <div className="mt-0.5 truncate text-sm text-muted-foreground">
-              {site.domain ? (
-                <Hint tip={`${crawlPreferenceLabel(site)} · ${scanUrlCountLabel(site)} · starts at ${preferredScanUrl(site)}`}>
-                  {site.domain}
-                </Hint>
-              ) : (
-                "No website address"
-              )}
-            </div>
-            <div className="mt-1 text-xs text-muted-foreground">
-              {lastScanTime ? (
-                <>Last scan <time dateTime={new Date(lastScanTime).toISOString()}>{formatDate(lastScanTime)}</time></>
-              ) : "No completed scan"}
-            </div>
-            {activeScan ? (
-              <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-warn md:hidden">
-                <StatusDot tone="warn" className="animate-pulse motion-reduce:animate-none" />
-                <span className="truncate">{scanPhaseLabel(activeScan)}</span>
-                <span className="shrink-0 text-muted-foreground">· {formatNumber(activeScan.pages_crawled || 0)} pages</span>
+      <TableRow key={site.id} className="group hover:bg-accent/35">
+        <TableCell className="py-3 pr-1 pl-3 sm:py-3.5 sm:pr-3 sm:pl-4">
+          <button type="button" onClick={openWorkspace} className="flex w-full items-center gap-3 text-left" title={`Open ${site.name}`}>
+            <SiteAvatar site={site} className="hidden size-10 shrink-0 text-sm sm:flex" />
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="font-heading text-base transition-colors group-hover:text-primary max-sm:line-clamp-2 sm:truncate sm:text-[17px]">{site.name}</span>
               </div>
-            ) : null}
-          </div>
-        </button>
+              <div className="mt-0.5 truncate text-sm text-muted-foreground">
+                {site.domain ? (
+                  <Hint tip={`${crawlPreferenceLabel(site)} · ${scanUrlCountLabel(site)} · starts at ${preferredScanUrl(site)}`}>
+                    {site.domain}
+                  </Hint>
+                ) : (
+                  "No website address"
+                )}
+              </div>
+              {activeScan ? (
+                <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-warn md:hidden">
+                  <StatusDot tone="warn" className="shrink-0 animate-pulse motion-reduce:animate-none" />
+                  <span className="truncate">{scanPhaseLabel(activeScan)}</span>
+                  <span className="shrink-0 text-muted-foreground">· {formatNumber(activeScan.pages_crawled || 0)} pages</span>
+                </div>
+              ) : null}
+            </div>
+          </button>
+        </TableCell>
 
-        <div className="hidden w-64 shrink-0 md:block xl:w-80">
+        <TableCell className="hidden px-2 md:table-cell">
           {activeScan ? (
             <div>
               <button
@@ -939,31 +956,43 @@ export function SitesManager({
               </span>
             </div>
           ) : null}
-        </div>
+        </TableCell>
 
-        <div className="flex shrink-0 items-center gap-1.5">
-          {activeScan ? (
-            <>
-              <Button size="icon" variant="secondary" className="size-11 sm:hidden" aria-label={`Open running scan for ${site.name}`} onClick={openActiveScan}>
-                <FileSearch />
-              </Button>
-              <Button size="sm" variant="secondary" className="hidden w-28 justify-center sm:inline-flex" onClick={openActiveScan}>
+        <TableCell className="px-1.5 text-xs sm:px-3 sm:text-sm">
+          {lastScanTime !== undefined && scanAge !== null ? (
+            <time
+              dateTime={new Date(lastScanTime).toISOString()}
+              title={formatDate(lastScanTime)}
+              className={scanIsStale ? "font-semibold text-bad" : "font-medium"}
+            >
+              {formatScanAge(scanAge)}
+              {scanIsStale && <span className="sr-only"> (over 30 days old)</span>}
+            </time>
+          ) : (
+            <span className="text-muted-foreground">Never</span>
+          )}
+        </TableCell>
+
+        <TableCell className="px-2 sm:px-2.5">
+          <div className="flex flex-wrap items-center justify-end gap-1.5 sm:flex-nowrap">
+            {activeScan ? (
+              <Button size="sm" variant="secondary" className="h-11 w-full justify-center px-1.5 sm:h-8 sm:w-28" onClick={openActiveScan}>
                 <FileSearch /> View scan
               </Button>
-            </>
-          ) : site.domain ? (
-            <Button size="sm" variant="outline" className="hidden w-28 justify-center sm:inline-flex" disabled={starting} onClick={() => scanSite(site)}>
-              <FileSearch /> {starting ? "Starting…" : "Scan"}
+            ) : site.domain ? (
+              <Button size="sm" variant="outline" className="hidden w-28 justify-center sm:inline-flex" disabled={starting} onClick={() => scanSite(site)}>
+                <FileSearch /> {starting ? "Starting…" : "Scan"}
+              </Button>
+            ) : null}
+            <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-foreground sm:size-8" aria-label={`Edit ${site.name}`} onClick={() => setEditing(site)}>
+              <Pencil />
             </Button>
-          ) : null}
-          <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-foreground sm:size-8" aria-label={`Edit ${site.name}`} onClick={() => setEditing(site)}>
-            <Pencil />
-          </Button>
-          <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-destructive sm:size-8" aria-label={`Delete ${site.name}`} onClick={() => setDeleting(site)}>
-            <Trash2 />
-          </Button>
-        </div>
-      </div>
+            <Button size="icon" variant="ghost" className="size-11 text-muted-foreground/70 hover:text-destructive sm:size-8" aria-label={`Delete ${site.name}`} onClick={() => setDeleting(site)}>
+              <Trash2 />
+            </Button>
+          </div>
+        </TableCell>
+      </TableRow>
     );
   }
 
@@ -1061,8 +1090,18 @@ export function SitesManager({
       {sites.length === 0 ? (
         onboarding
       ) : (
-        <div className="divide-y divide-border/70 overflow-hidden rounded-xl border border-border bg-card">
-          {sites.map((site) => renderSiteRow(site))}
+        <div className="overflow-hidden rounded-xl border border-border bg-card">
+          <Table aria-label="Sites" className="table-fixed">
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead scope="col" className="pl-3 sm:pl-4">Site</TableHead>
+                <TableHead scope="col" className="hidden w-[17rem] px-2 md:table-cell xl:w-[21rem]">Scan health</TableHead>
+                <TableHead scope="col" className="w-24 px-1.5 whitespace-nowrap sm:w-32 sm:px-3">Last scan</TableHead>
+                <TableHead scope="col" className="w-28 sm:w-52"><span className="sr-only">Actions</span></TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>{sites.map((site) => renderSiteRow(site))}</TableBody>
+          </Table>
         </div>
       )}
       {addDialog}
