@@ -3,18 +3,21 @@ import { useSearchParams } from "react-router-dom";
 import { Bot, RefreshCw, Settings } from "lucide-react";
 import { api, isNotFoundError, type AiJob, type Site } from "../../api";
 import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
-import { EmptyState, Field, InfoTip, JobTable, PageHeader, ReportSection, StatusDot, StatusEvidenceTable, cleanSiteDomain, crawlHostOptions, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlMaxPagesFromConfig, defaultCrawlProtocolFromConfig, defaultCrawlSpeedFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatNumber, languageOptions, marketOptions, preferredScanUrl, serpProviderStatus } from "../shared";
+import { EmptyState, Field, InfoTip, JobTable, PageHeader, ReportSection, StatusEvidenceTable, cleanSiteDomain, crawlHostOptions, crawlProtocolOptions, crawlSpeedOptions, defaultCrawlHostFromConfig, defaultCrawlMaxPagesFromConfig, defaultCrawlProtocolFromConfig, defaultCrawlSpeedFromConfig, defaultKeywordLanguageCode, defaultKeywordLocationCode, defaultLanguageCodeFromConfig, defaultLocationCodeFromConfig, formatDate, formatNumber, languageOptions, marketOptions, preferredScanUrl, serpProviderStatus } from "../shared";
+import { AI_JOB_POLL_MS, AiJobOutput, aiJobActive } from "../ai-job-output";
 
-const AI_POLL_MS = 1500;
-
-function aiJobActive(job?: AiJob | null) {
-  return job?.status === "queued" || job?.status === "running";
-}
+const workflowHelp: Record<string, string> = {
+  "seo.coach": "Paste your goal and recent Search Console findings to get five SEO priorities.",
+  "keywords.cluster": "Paste a keyword list to group phrases by intent and pick a target page for each group.",
+  "scan.prioritize": "Rank technical fixes by impact and effort. Use Prioritise with Codex on a scan to include its findings automatically.",
+  "competitor.gaps": "Paste what competing pages cover and what your page offers to find gaps worth addressing.",
+  "ai.visibility": "Paste a question, a real AI answer, and relevant site evidence to see what would make your brand easier to cite.",
+};
 
 export function AiPage({ site }: { site: Site }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const jobParam = searchParams.get("job") || "";
-  const [prompts, setPrompts] = useState<any[]>([]);
+  const [prompts, setPrompts] = useState<{ key: string; label: string }[]>([]);
   const [jobs, setJobs] = useState<AiJob[]>([]);
   // A job named in ?job= that the site-filtered list does not include.
   const [linkedJob, setLinkedJob] = useState<{ id: string; job?: AiJob; error?: string } | null>(null);
@@ -27,6 +30,11 @@ export function AiPage({ site }: { site: Site }) {
   const listedJob = jobParam ? jobs.find((job) => job.id === jobParam) : undefined;
   const linked = linkedJob?.id === jobParam ? linkedJob : null;
   const activeJob = jobParam ? listedJob || linked?.job || null : jobs[0] || null;
+  const help = workflowHelp[type];
+
+  function workflowLabel(key: string) {
+    return prompts.find((prompt) => prompt.key === key)?.label ?? (key === "prompt.explorer" ? "Saved prompt analysis" : key);
+  }
 
   // Jobs are refreshed on their own so polling never refetches the prompts.
   async function loadJobs() {
@@ -66,9 +74,9 @@ export function AiPage({ site }: { site: Site }) {
     let timer = 0;
     const poll = async () => {
       await loadJobs().catch(console.error);
-      if (!cancelled) timer = window.setTimeout(poll, AI_POLL_MS);
+      if (!cancelled) timer = window.setTimeout(poll, AI_JOB_POLL_MS);
     };
-    timer = window.setTimeout(poll, AI_POLL_MS);
+    timer = window.setTimeout(poll, AI_JOB_POLL_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
@@ -108,20 +116,23 @@ export function AiPage({ site }: { site: Site }) {
         description="SEO coach, keyword clustering, scan prioritization, competitor gaps, and AI visibility through local Codex medium jobs."
         meta={`${formatNumber(jobs.length)} saved ${jobs.length === 1 ? "job" : "jobs"} for ${site.name} and jobs saved without a site`}
       />
-      <div className="grid gap-6 2xl:grid-cols-[460px_minmax(0,1fr)]">
-        <ReportSection title="Run Codex" description="Jobs are queued in SQLite, saved with this site, and run through your local Codex CLI.">
+      <div className="grid items-start gap-6 2xl:grid-cols-[460px_minmax(0,1fr)]">
+        <ReportSection title="New job" description="Run a Codex workflow and save the result with this site.">
           <form className="space-y-4" onSubmit={submit}>
-            <Field label="Workflow">
-              <Select value={type} onValueChange={setType}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>{prompts.map((prompt) => <SelectItem key={prompt.key} value={prompt.key}>{prompt.label}</SelectItem>)}</SelectContent>
-              </Select>
-            </Field>
+            <div className="space-y-2">
+              <Field label="Workflow">
+                <Select value={type} onValueChange={setType}>
+                  <SelectTrigger aria-describedby={help ? "ai-workflow-help" : undefined}><SelectValue /></SelectTrigger>
+                  <SelectContent>{prompts.map((prompt) => <SelectItem key={prompt.key} value={prompt.key}>{prompt.label}</SelectItem>)}</SelectContent>
+                </Select>
+              </Field>
+              {help && <p id="ai-workflow-help" className="text-sm leading-5 text-muted-foreground">{help}</p>}
+            </div>
             <Field label="Context"><Textarea className="min-h-48" value={context} onChange={(e) => setContext(e.target.value)} /></Field>
             <Button disabled={starting || !context.trim()}><Bot /> {starting ? "Starting job" : "Start job"}</Button>
           </form>
         </ReportSection>
-        <div className="space-y-6">
+        <div className="min-w-0 space-y-6">
           <ReportSection
             title="Jobs"
             meta="Saved local Codex runs from SQLite."
@@ -131,7 +142,7 @@ export function AiPage({ site }: { site: Site }) {
               </Button>
             }
           >
-            {jobs.length ? <JobTable rows={jobs} selectedId={activeJob?.id || ""} onSelect={selectJob} /> : <EmptyState title="No jobs" text="Start a local Codex workflow." />}
+            {jobs.length ? <JobTable rows={jobs} selectedId={activeJob?.id || ""} onSelect={selectJob} workflowLabel={workflowLabel} /> : <EmptyState title="No jobs" text="Start a local Codex workflow." />}
           </ReportSection>
           {jobParam && !activeJob ? (
             <ReportSection title="Job output">
@@ -146,52 +157,13 @@ export function AiPage({ site }: { site: Site }) {
               )}
             </ReportSection>
           ) : (
-            <AiJobOutput job={activeJob} />
+            <ReportSection title="Job output" meta={activeJob ? `${workflowLabel(activeJob.type)} · ${formatDate(activeJob.created_at)}` : undefined}>
+              {activeJob ? <AiJobOutput job={activeJob} /> : <EmptyState title="No job selected" text="Start or select a local Codex job to read the complete output here." />}
+            </ReportSection>
           )}
         </div>
       </div>
     </>
-  );
-}
-
-function AiJobOutput({ job }: { job: AiJob | null }) {
-  return (
-    <ReportSection
-      title="Job output"
-      meta={job ? `${job.type} · ${formatDate(job.created_at)}` : undefined}
-    >
-      {job ? (
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-            <span className="inline-flex items-center gap-2 font-medium">
-              <StatusDot tone={job.status === "completed" ? "good" : job.status === "failed" ? "bad" : "warn"} />
-              {job.status || "-"}
-            </span>
-            <span className="text-muted-foreground">
-              {job.started_at ? `· started ${formatDate(job.started_at)}` : "· not started"}
-              {job.finished_at ? ` · finished ${formatDate(job.finished_at)}` : ""}
-            </span>
-          </div>
-          {job.error ? (
-            <pre className="max-h-[520px] overflow-auto rounded-lg bg-bad-soft/40 p-4 text-sm leading-6 text-destructive whitespace-pre-wrap">{job.error}</pre>
-          ) : job.result_text ? (
-            <pre className="max-h-[520px] overflow-auto rounded-lg bg-muted/45 p-4 text-sm leading-6 whitespace-pre-wrap">{job.result_text}</pre>
-          ) : (
-            <EmptyState title={aiJobActive(job) ? "Codex is working" : "No output yet"} text={job.message || "The saved job has not produced text yet."} />
-          )}
-          {job.prompt ? (
-            <details className="group rounded-lg border border-border/60">
-              <summary className="cursor-pointer select-none px-3.5 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground">
-                Prompt sent to Codex
-              </summary>
-              <pre className="max-h-[420px] overflow-auto border-t border-border/60 p-3.5 text-xs leading-5 whitespace-pre-wrap text-foreground/80">{job.prompt}</pre>
-            </details>
-          ) : null}
-        </div>
-      ) : (
-        <EmptyState title="No job selected" text="Start or select a local Codex job to read the complete output here." />
-      )}
-    </ReportSection>
   );
 }
 

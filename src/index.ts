@@ -91,7 +91,6 @@ import {
   listSavedKeywords,
   listKeywordMetricImports,
   listSerpRuns,
-  promptExplorer,
   siteSummary,
   querySavedKeywords,
   researchKeywords,
@@ -710,13 +709,10 @@ app.post(
   "/api/brand-lookup",
   safe(async (c) => c.json(await brandLookup((await readSiteScopedJson(c)) as any))),
 );
+// Read-only compatibility for saved runs from before the feature was removed.
 app.get(
   "/api/sites/:id/prompt-explorer",
   safe((c) => c.json(listPromptExplorerRuns(c.req.param("id")))),
-);
-app.post(
-  "/api/prompt-explorer",
-  safe(async (c) => c.json(await promptExplorer((await readSiteScopedJson(c)) as any))),
 );
 
 const listSiteScansHandler = safe((c: any) => c.json(listScans(c.req.param("id"))));

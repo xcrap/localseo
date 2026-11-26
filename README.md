@@ -38,10 +38,9 @@ data connectors only when you configure them.
 - **Schedules and notifications:** each site can scan itself and each rank tracker can check its keywords daily, weekly, or monthly while the app is running (`/api/sites/:id/schedule`, `/api/rank-trackers/:id/schedule`). Everything is off until you turn it on. Monthly runs keep the day of the month the schedule was set on (the last day in shorter months). Next run times live in SQLite, so a restart picks them up; a job whose site or tracker is already running skips that slot. Notifications (`/api/notifications`) report scans with page regressions or new high-severity issues against the previous scan, failed scheduled scans, and failed or partial scheduled rank checks; they stay until you delete them.
 - **Client report:** `GET /api/scans/:id/report.html` (add `?download=1` to save it) is a single print-friendly HTML file with the scan summary, open issues by severity and category, issue groups with why/how to fix and example URLs, regressions, and a short Search Console summary when data is stored. `GET /api/scans/:id/ai-context` returns a compact brief for a Codex prioritisation job (`POST /api/ai/jobs` with `type`, `scanId`, and `context`).
 - **Brand lookup:** real web-search evidence without generated answer-model claims. Per-name numbers are raw counts of results returned for an exact-phrase search (first 10 checked), not a share of voice.
-- **Prompt explorer:** local Codex jobs saved in SQLite.
 - **Google Search Console:** OAuth connection, property picker, disconnect, live search analytics queries, full syncs stored in SQLite, CSV imports, and a URL inspection helper. Synced and imported rows are read the same way through `GET /api/sites/:id/gsc/rows`.
-- **Local AI lab:** Codex-backed SEO coach, clustering, scan prioritization, competitor gaps, and AI visibility jobs.
-- **MCP:** local tools for sites, keyword research, saved keywords, organic research, backlinks, SERP, rank trackers, scans and scan issues, GSC performance, syncs, stored GSC rows, Search Console insights, PageSpeed, schedules, notifications, GSC URL inspection, brand lookup, prompt explorer, and Codex jobs.
+- **Local AI lab:** Codex-backed SEO coach, clustering, scan prioritization, competitor gaps, and AI visibility jobs. Saved Prompt Explorer jobs remain visible here. Historical runs are readable at `GET /api/sites/:id/prompt-explorer`.
+- **MCP:** local tools for sites, keyword research, saved keywords, organic research, backlinks, SERP, rank trackers, scans and scan issues, GSC performance, syncs, stored GSC rows, Search Console insights, PageSpeed, schedules, notifications, GSC URL inspection, brand lookup, and Codex jobs.
 
 ## Quickstart
 
@@ -245,7 +244,7 @@ Tools:
 - PageSpeed: `cwv_run`, `cwv_results`
 - Schedules and notifications: `get_schedule`, `set_scan_schedule`,
   `set_tracker_schedule`, `list_notifications`
-- Research and Codex: `brand_lookup`, `prompt_explorer`, `start_ai_job`,
+- Research and Codex: `brand_lookup`, `start_ai_job`,
   `get_ai_job`
 
 ## Verification

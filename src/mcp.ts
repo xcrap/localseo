@@ -23,7 +23,6 @@ import {
   listSites,
   listSavedKeywords,
   querySavedKeywords,
-  promptExplorer,
   siteSummary,
   researchKeywords,
   saveKeywords,
@@ -365,20 +364,6 @@ const coreTools: ToolDefinition[] = [
     },
   },
   {
-    name: "prompt_explorer",
-    description: "Run a prompt through local Codex and save the job in SQLite.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ...siteIdInput,
-        prompt: { type: "string" },
-        highlightBrand: { type: "string" },
-        models: { type: "array", items: { type: "string" } },
-      },
-      required: ["siteId", "prompt"],
-    },
-  },
-  {
     name: "start_ai_job",
     description:
       "Queue a local Codex CLI job; it is saved in SQLite and runs in the background. Jobs of type scan.prioritize, or with context or scanId, run without Codex web search because their prompt carries crawled page text.",
@@ -616,8 +601,6 @@ async function callTool(name: string, args: any) {
       return inspectGscUrls(args);
     case "brand_lookup":
       return brandLookup(args);
-    case "prompt_explorer":
-      return promptExplorer(args);
     case "start_ai_job":
       return createAiJob(args);
     case "get_ai_job": {

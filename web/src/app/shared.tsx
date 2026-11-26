@@ -1,6 +1,6 @@
 import { cloneElement, isValidElement, useEffect, useId, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Activity, BarChart3, Bot, Cable, Check, ChevronDown, FileSearch, Gauge, Globe2, Info, Lightbulb, Link2, Plus, Search, Sparkles, TableProperties, Target, Zap } from "lucide-react";
+import { Activity, BarChart3, Cable, Check, ChevronDown, FileSearch, Gauge, Globe2, Info, Lightbulb, Link2, Plus, Search, Sparkles, TableProperties, Target, Zap } from "lucide-react";
 import type { Site } from "../api";
 import { Badge, Button, FieldControlIdProvider, Input, Label, Popover, PopoverContent, PopoverTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, SortableTableHead, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -35,7 +35,6 @@ export const navGroups: { label: string; items: { to: string; label: string; ico
     label: "AI & discovery",
     items: [
       { to: "/brand", label: "Brand lookup", icon: Sparkles },
-      { to: "/prompts", label: "Prompt explorer", icon: Bot },
       { to: "/ai", label: "AI lab", icon: Zap },
       { to: "/mcp-tools", label: "MCP", icon: Cable },
     ],
@@ -1548,10 +1547,12 @@ export function JobTable({
   rows,
   selectedId,
   onSelect,
+  workflowLabel,
 }: {
   rows: any[];
   selectedId?: string;
   onSelect?: (id: string) => void;
+  workflowLabel?: (type: string) => string;
 }) {
   return (
     <Table>
@@ -1566,10 +1567,10 @@ export function JobTable({
             <TableCell className="font-medium">
               {onSelect ? (
                 <button type="button" className="text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 rounded-sm" onClick={(event) => { event.stopPropagation(); onSelect(row.id); }}>
-                  {row.type}
+                  {workflowLabel?.(row.type) ?? row.type}
                 </button>
               ) : (
-                row.type
+                workflowLabel?.(row.type) ?? row.type
               )}
             </TableCell>
             <TableCell><Badge variant={row.status === "completed" ? "good" : row.status === "failed" ? "bad" : "warn"}>{row.status}</Badge></TableCell>

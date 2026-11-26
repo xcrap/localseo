@@ -558,9 +558,6 @@ export const api = {
   brandLookupRuns: (siteId: string) => request<any[]>(`/api/sites/${siteId}/brand-lookup`),
   brandLookup: (body: any) =>
     request<any>("/api/brand-lookup", { method: "POST", body: JSON.stringify(body) }),
-  promptExplorerRuns: (siteId: string) => request<any[]>(`/api/sites/${siteId}/prompt-explorer`),
-  promptExplorer: (body: any) =>
-    request<any>("/api/prompt-explorer", { method: "POST", body: JSON.stringify(body) }),
   allScans: () => request<ScanRow[]>("/api/scans"),
   scans: (siteId: string) => request<ScanRow[]>(`/api/sites/${siteId}/scans`),
   scan: (id: string) => request<any>(`/api/scans/${id}`).then(withPageIssues),

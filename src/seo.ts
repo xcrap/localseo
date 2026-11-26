@@ -2,7 +2,7 @@ import { storedGscTotals } from "./gsc-store";
 import * as cheerio from "cheerio";
 import { randomUUID } from "node:crypto";
 import { parse as parseDomain } from "tldts";
-import { createAiJob, recentAiJobs } from "./codex";
+import { recentAiJobs } from "./codex";
 import { type CsvRow, csvHasColumn, csvNumber, csvRow, csvText, normalizeCsvHeader, parseCsvRows } from "./csv";
 import { all, get, jsonParse, nowIso, run, transaction } from "./db";
 import { getConfigValue } from "./config";
@@ -2625,60 +2625,6 @@ export function listBrandLookupRuns(siteId: string) {
     competitors: jsonParse<string[]>(row.competitors, []),
     result: publicBrandLookupResult(jsonParse(row.result_json, {})),
   }));
-}
-
-export async function promptExplorer(input: {
-  siteId: string;
-  prompt: string;
-  highlightBrand?: string;
-  models?: string[];
-}) {
-  const site = getSite(input.siteId);
-  if (!site) throw notFound("Site not found.");
-  const prompt = optionalText(input.prompt, "Prompt") || "";
-  if (!prompt) throw badRequest("Prompt is required.");
-  const highlightBrand = optionalText(input.highlightBrand, "Highlight brand") || site.domain || site.name;
-  const models = ["local_codex"];
-  const source = "codex";
-  const result: any = {
-    prompt,
-    highlightBrand,
-    fetchedAt: nowIso(),
-    results: [],
-  };
-
-  const job = createAiJob({
-    type: "prompt.explorer",
-    siteId: site.id,
-    prompt: [
-      "Analyze this prompt for SEO and AI-answer visibility using only real evidence supplied in the prompt.",
-      "Do not invent rankings, citations, traffic, or model mentions.",
-      `Prompt: ${prompt}`,
-      `Brand/domain to watch: ${highlightBrand}`,
-      `Site domain: ${site.domain || "not set"}`,
-    ].join("\n"),
-  });
-  result.jobId = job.id;
-  result.results = [
-    {
-      model: "local_codex",
-      status: job.status,
-      brandMentioned: null,
-      text: "Queued a local Codex analysis job. Open AI lab to read the result when it completes.",
-      citations: [],
-    },
-  ];
-
-  const id = randomUUID();
-  run(
-    `
-    INSERT INTO prompt_explorer_runs
-      (id, site_id, prompt, highlight_brand, models, source, result_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    `,
-    [id, site.id, prompt, highlightBrand, JSON.stringify(models), source, JSON.stringify(result)],
-  );
-  return { id, source, ...result };
 }
 
 // Older runs stored fixed template strings as "fanOutQueries", which read like

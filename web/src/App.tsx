@@ -12,6 +12,7 @@ import {
 import {
 	BrowserRouter,
 	Link,
+	Navigate,
 	NavLink,
 	Route,
 	Routes,
@@ -94,11 +95,6 @@ const LinksPage = lazy(() =>
 );
 const BrandLookupPage = lazy(() =>
 	import("./app/pages/discovery").then((m) => ({ default: m.BrandLookupPage })),
-);
-const PromptExplorerPage = lazy(() =>
-	import("./app/pages/discovery").then((m) => ({
-		default: m.PromptExplorerPage,
-	})),
 );
 const AiPage = lazy(() =>
 	import("./app/pages/integrations").then((m) => ({ default: m.AiPage })),
@@ -538,12 +534,7 @@ function AppShell({ onLogout }: { onLogout: () => void }) {
 								activeSite ? <BrandLookupPage site={activeSite} /> : null,
 							)}
 						/>
-						<Route
-							path="/prompts"
-							element={requireSite(
-								activeSite ? <PromptExplorerPage site={activeSite} /> : null,
-							)}
-						/>
+						<Route path="/prompts" element={<Navigate to="/ai" replace />} />
 						<Route
 							path="/scans/:scanId?"
 							element={requireSite(

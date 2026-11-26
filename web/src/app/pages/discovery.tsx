@@ -1,9 +1,8 @@
 import { useEffect, useState, type SyntheticEvent } from "react";
-import { Link } from "react-router-dom";
-import { Bot, ExternalLink, Sparkles } from "lucide-react";
+import { ExternalLink, Sparkles } from "lucide-react";
 import { api, type Site } from "../../api";
-import { Button, Input, Label, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
-import { EmptyState, Field, HistoryList, PageHeader, ProviderNotice, ReportSection, SourceBadge, StatsBand, StatusDot, StatusEvidenceTable, formatNumber } from "../shared";
+import { Button, Input, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Textarea, toast } from "@/components/ui";
+import { EmptyState, Field, HistoryList, PageHeader, ProviderNotice, ReportSection, SourceBadge, StatsBand, formatNumber } from "../shared";
 
 export function BrandLookupPage({ site }: { site: Site }) {
   const [query, setQuery] = useState(site.domain || site.name);
@@ -210,129 +209,5 @@ function CitationList({ rows }: { rows: any[] }) {
         })}
       </TableBody>
     </Table>
-  );
-}
-
-export function PromptExplorerPage({ site }: { site: Site }) {
-  const [prompt, setPrompt] = useState(`What are the best options for ${site.domain || site.name}?`);
-  const [highlightBrand, setHighlightBrand] = useState(site.domain || site.name);
-  const [result, setResult] = useState<any>(null);
-  const [runs, setRuns] = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  async function load() {
-    const history = await api.promptExplorerRuns(site.id);
-    setRuns(history);
-  }
-  useEffect(() => {
-    setPrompt(`What are the best options for ${site.domain || site.name}?`);
-    setHighlightBrand(site.domain || site.name);
-    setResult(null);
-    load().catch(console.error);
-  }, [site.id, site.domain, site.name]);
-
-  async function submit(event: SyntheticEvent) {
-    event.preventDefault();
-    setLoading(true);
-    try {
-      const data = await api.promptExplorer({ siteId: site.id, prompt, highlightBrand, models: ["local_codex"] });
-      setResult(data);
-      await load();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not run the prompt. Is the local Codex CLI available?");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <>
-      <PageHeader
-        title="Prompt explorer"
-        description="Run prompts through local Codex. The app does not invent model-specific external answer data."
-        meta={`${formatRunCount(runs.length)} saved`}
-      />
-      <div className="grid gap-6 2xl:grid-cols-[480px_minmax(0,1fr)]">
-        <ReportSection title="Prompt">
-          <form className="space-y-4" onSubmit={submit}>
-            <Field label="Prompt"><Textarea className="min-h-32" value={prompt} onChange={(event) => setPrompt(event.target.value)} required /></Field>
-            <Field label="Highlight brand"><Input value={highlightBrand} onChange={(event) => setHighlightBrand(event.target.value)} /></Field>
-            <StatusEvidenceTable
-              rows={[
-                {
-                  title: "Local runner",
-                  status: "Local Codex",
-                  tone: "good",
-                  text: "Queues one local Codex job and saves the run in SQLite.",
-                },
-                {
-                  title: "Reasoning",
-                  status: "Medium",
-                  tone: "outline",
-                  text: "Matches the app AI default; read the full job output in the AI lab.",
-                },
-              ]}
-            />
-            <Button disabled={loading}><Bot /> {loading ? "Exploring" : "Explore prompt"}</Button>
-          </form>
-        </ReportSection>
-        <div className="space-y-6">
-          {result ? <PromptResult result={result} /> : <EmptyState title="No prompt run" text="Run a prompt to queue local Codex analysis." />}
-          <HistoryList title="Prompt history" rows={runs} labelKey="prompt" labelTitle="Prompt" />
-        </div>
-      </div>
-    </>
-  );
-}
-
-function PromptResult({ result }: { result: any }) {
-  return (
-    <div className="space-y-6">
-      {result.warning ? <ProviderNotice title="Prompt warning" text={result.warning} source={result.source} /> : null}
-      <ReportSection
-        title="Run summary"
-        meta={
-          <span className="inline-flex flex-wrap items-center gap-2">
-            <SourceBadge source={result.source} />
-            {result.highlightBrand ? <span>Watching: {result.highlightBrand}</span> : null}
-          </span>
-        }
-      >
-        <div className="space-y-4">
-          <StatusEvidenceTable
-            rows={[
-              { title: "Prompt", status: "Saved", tone: "good", text: result.prompt || "Prompt saved with this run." },
-              { title: "Local job", status: result.jobId ? "Queued" : "None", tone: result.jobId ? "warn" : "good", text: result.jobId ? "Open the AI lab to read the Codex result when it finishes." : "No local Codex job was queued for this run." },
-            ]}
-          />
-          {result.jobId ? <Button asChild variant="secondary"><Link to={`/ai?job=${encodeURIComponent(result.jobId)}`}><Bot /> Open AI lab</Link></Button> : null}
-        </div>
-      </ReportSection>
-      <div className="grid gap-6 xl:grid-cols-2">
-      {(result.results || []).map((row: any) => (
-        <ReportSection
-          key={row.model}
-          title={row.model.replaceAll("_", " ")}
-          meta={row.warning || row.status}
-        >
-          <div className="space-y-4">
-            <span className="inline-flex items-center gap-1.5 text-sm font-medium">
-              <StatusDot tone={row.brandMentioned === true ? "good" : row.brandMentioned === false ? "warn" : "outline"} />
-              {row.brandMentioned === true ? "Mentioned" : row.brandMentioned === false ? "Not mentioned" : "Not checked"}
-            </span>
-            <p className="text-sm leading-6">{row.text}</p>
-            {row.citations?.length ? (
-              <div className="space-y-1">
-                <Label>Citations</Label>
-                {row.citations.map((citation: any) => (
-                  <a key={citation.url || citation.link || citation.title} href={citation.url || citation.link} target="_blank" rel="noreferrer" className="block truncate text-sm text-primary">{citation.title || citation.url || citation.link}</a>
-                ))}
-              </div>
-            ) : null}
-          </div>
-        </ReportSection>
-      ))}
-      </div>
-    </div>
   );
 }

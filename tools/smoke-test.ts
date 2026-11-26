@@ -3665,19 +3665,12 @@ try {
   ) {
     throw new Error(`AI visibility should expose entity fields, not target fields: ${JSON.stringify(brandLookupResult)}`);
   }
-  const promptExplorerResult = await request("/api/prompt-explorer", {
+  const removedPromptExplorer = await requestFailure("/api/prompt-explorer", {
     method: "POST",
     body: JSON.stringify({ siteId: site.id, prompt: "best seo software", highlightBrand: "Example" }),
   });
-  if (
-    promptExplorerResult.source !== "codex" ||
-    promptExplorerResult.results?.length !== 1 ||
-    promptExplorerResult.results?.[0]?.model !== "local_codex"
-  ) {
-    throw new Error(`Local prompt explorer should queue one Codex run instead of external model rows: ${JSON.stringify(promptExplorerResult)}`);
-  }
-  if ("fanOutQueries" in (promptExplorerResult.results?.[0] || {})) {
-    throw new Error("Prompt explorer should not present fixed template strings as AI fan-out queries.");
+  if (removedPromptExplorer.status !== 404) {
+    throw new Error(`The retired prompt creation route should return 404: ${JSON.stringify(removedPromptExplorer)}`);
   }
   if (
     brandLookupResult.platforms?.some((platform: any) => "visibility" in platform) ||
@@ -3827,15 +3820,6 @@ try {
   searxCleanupDb.close();
   const localHistoryDb = openServerDb();
   try {
-    const savedPromptRun = localHistoryDb
-      .query<{ source: string; models: string }, [string]>("SELECT source, models FROM prompt_explorer_runs WHERE site_id = ? ORDER BY created_at DESC LIMIT 1")
-      .get(site.id);
-    if (
-      savedPromptRun?.source !== "codex" ||
-      JSON.stringify(JSON.parse(savedPromptRun.models || "[]")) !== JSON.stringify(["local_codex"])
-    ) {
-      throw new Error(`Local prompt explorer history should store local_codex only: ${JSON.stringify(savedPromptRun)}`);
-    }
     const insertDomainSnapshot = localHistoryDb.prepare(`
       INSERT INTO domain_snapshots (id, site_id, domain, source, result_json, created_at)
       VALUES (?, ?, ?, 'smoke-history', '{}', ?)
@@ -4190,6 +4174,9 @@ try {
   }
   if (toolNames.has("start_audit") || toolNames.has("get_audit")) {
     throw new Error("MCP tools/list should advertise scan-named tools, not audit-named tools.");
+  }
+  if (toolNames.has("prompt_explorer")) {
+    throw new Error("MCP tools/list should omit the retired prompt explorer tool.");
   }
   const startScanTool = (mcp.result?.tools || []).find((tool: any) => tool.name === "start_scan");
   if (!startScanTool?.inputSchema?.required?.includes("siteId") || !startScanTool?.inputSchema?.required?.includes("url")) {
